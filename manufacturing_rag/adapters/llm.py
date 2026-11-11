@@ -117,7 +117,7 @@ class RuleBasedLLMRouter:
                 continue
             bullets.append(f"- {evidence}")
         if not bullets:
-            return "当前检索资料不足，无法基于已入库学科文档形成可靠答案。"
+            raise RuntimeError("当前 AI 模型无法生成澄清问题，请检查模型配置后重试。")
         header = "**根据已检索到的学科文档资料，可确认：**"
         footer = "未在资料中出现的定义、结论、步骤或答案，本系统不作推断。"
         return "\n\n".join([header, "\n".join(bullets), f"> {footer}"])
@@ -488,7 +488,7 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
     answer_system_prompt = (
         "你是学科文档检索问答专属答案生成器。"
         "只能依据提供的OCR结构化图文资料和检索来源作答。"
-        "不得编造文档中不存在的定义、结论、步骤或答案；资料不足时必须明确说明。"
+        "不得编造文档中不存在的定义、结论、步骤或答案；如果资料不足以直接回答，必须提出简短具体的澄清问题，不得输出资料不足或没有依据等兜底说明。"
         "必须先筛选、合并和综合归纳与问题直接相关的资料，再用自己的话组织成直接回答；不要将检索片段改成项目符号后逐条照抄，也不要逐段复述、原样摘抄或拼接原文。"
         "同一主题下存在两项及以上并列条件、学时/数值阈值、等级及对应处理结果时，必须使用Markdown表格，清楚列出情形/条件、标准或学时、对应结果；只有在确实不适合表格时才使用列表。"
         "只保留与用户问题直接相关的信息，将相同或相近条款合并，区分适用条件和处理后果，不照搬资料长句。"
@@ -682,7 +682,7 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
                     "较长答案用小标题；步骤用编号列表；重要结论和数字可适度加粗",
                     "逐条说明可确认事项",
                     "不要显示文档名、页码、块号、来源或引用标记",
-                    "资料不足或未出现的信息必须明确不作推断",
+                    "如果资料不足以直接回答，提出一个简短具体的澄清问题，不要输出资料不足、没有依据或无法回答等兜底说明",
                     "不要输出资料中不存在的定义、结论、步骤或答案",
                 ],
             },
@@ -696,8 +696,22 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
         if not answer:
             self.last_answer_source = "unavailable"
             raise RuntimeError("DeepSeek 未返回有效答案，请检查模型服务后重试。")
+        answer = strip_source_annotations(answer)
+        if self._looks_like_insufficient_answer(answer):
+            return self.generate_clarifying_question(question, contexts, "AI 判断当前资料不足以直接回答")
         self.last_answer_source = "remote_llm"
-        return strip_source_annotations(answer)
+        return answer
+
+    @staticmethod
+    def _looks_like_insufficient_answer(answer: str) -> bool:
+        lead = re.sub(r"\s+", "", strip_source_annotations(answer)).lstrip("#>*-` ")[:100]
+        patterns = (
+            r"^(?:抱歉[,，。]?)?(?:资料|检索资料|现有资料|目前资料|当前资料).{0,24}(?:不足|未找到|没有找到|无法|不能).{0,16}(?:依据|信息|回答|支撑|证据)?",
+            r"^(?:抱歉[,，。]?)?(?:我)?(?:无法|不能)(?:根据|基于|从)(?:现有|当前|检索到的|提供的)?资料.{0,16}(?:回答|确认|找到)",
+            r"^资料中暂时没有找到足够的依据",
+            r"^目前没有足够(?:的)?(?:资料|信息|依据)(?:来|以)?(?:回答|判断|确认)",
+        )
+        return any(re.search(pattern, lead) for pattern in patterns)
 
     def generate_chat_response(self, question: str, conversation_context: str = "") -> str:
         if not self.api_key:
@@ -791,7 +805,7 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
                     "较长答案用小标题；步骤用编号列表；重要结论和数字可适度加粗",
                     "逐条说明可确认事项",
                     "不要显示文档名、页码、块号、来源或引用标记",
-                    "资料不足或未出现的信息必须明确不作推断",
+                    "如果资料不足以直接回答，提出一个简短具体的澄清问题，不要输出资料不足、没有依据或无法回答等兜底说明",
                     "不要输出资料中不存在的定义、结论、步骤或答案",
                 ],
             },
@@ -807,7 +821,6 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
                 enable_thinking=self.config.llm_enable_thinking,
             ):
                 answer_parts.append(token)
-                on_token(token)
         except Exception as exc:  # noqa: BLE001 - never replace a failed model answer with raw retrieval text.
             self.last_answer_source = "unavailable"
             raise RuntimeError("DeepSeek 暂时无法生成答案，请检查模型服务后重试。") from exc
@@ -815,8 +828,14 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
         if not answer:
             self.last_answer_source = "unavailable"
             raise RuntimeError("DeepSeek 未返回有效答案，请检查模型服务后重试。")
-        self.last_answer_source = "remote_llm"
-        return strip_source_annotations(answer)
+        answer = strip_source_annotations(answer)
+        if self._looks_like_insufficient_answer(answer):
+            answer = self.generate_clarifying_question(question, contexts, "AI 判断当前资料不足以直接回答")
+        else:
+            self.last_answer_source = "remote_llm"
+        for start in range(0, len(answer), 36):
+            on_token(answer[start : start + 36])
+        return answer
 
     def repair_answer(
         self,
