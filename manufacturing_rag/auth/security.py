@@ -85,18 +85,10 @@ def validate_new_password(
     compact_password = "".join(
         character for character in unicodedata.normalize("NFKC", password).casefold() if character.isalnum()
     )
-    compact_username = "".join(
-        character for character in unicodedata.normalize("NFKC", username).casefold() if character.isalnum()
-    )
     if compact_password in COMMON_PASSWORDS:
         raise ValueError("该密码过于常见，请换一个更难猜的密码")
-    if (
-        not allow_username_in_password
-        and compact_username
-        and len(compact_username) >= 3
-        and compact_username in compact_password
-    ):
-        raise ValueError("密码不能包含登录账号")
+    # Account text in a password is allowed; minimum length and common-password
+    # checks still apply. Keep the compatibility argument for existing callers.
     if not allow_reserved and username.lower() in RESERVED_USERNAMES:
         raise ValueError("该账号名称不可注册")
     return password

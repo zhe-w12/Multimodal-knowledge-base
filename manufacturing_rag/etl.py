@@ -6,9 +6,11 @@ import base64
 import hashlib
 import re
 import tempfile
+import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import urlsplit
 
 from manufacturing_rag.adapters.ocr import PaddleOCRAdapter
 from manufacturing_rag.adapters.vision import QwenVLAdapter
@@ -308,6 +310,9 @@ class MultimodalETLPipeline:
         if status is None:
             match = re.search(r"\bHTTP Error (\d{3})\b", str(error))
             status = int(match.group(1)) if match else None
+        source_url = getattr(error, "url", None)
+        upstream_host = urlsplit(str(source_url)).hostname if source_url else None
+        frames = traceback.extract_tb(error.__traceback__)
         write_debug_log(
             self.config,
             "document_etl_stage_failed",
@@ -315,6 +320,11 @@ class MultimodalETLPipeline:
             stage=stage,
             error_type=type(error).__name__,
             upstream_status=status,
+            upstream_host=upstream_host,
+            traceback_frames=[
+                {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                for frame in frames[-10:]
+            ],
         )
 
     def _parse_pdf_fallback(self, path: Path, max_pages: Optional[int] = None) -> List[DocumentChunk]:
