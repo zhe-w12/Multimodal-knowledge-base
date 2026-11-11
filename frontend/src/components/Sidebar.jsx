@@ -6,7 +6,7 @@ import Drawer from "antd/es/drawer";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
 import Tooltip from "antd/es/tooltip";
-import { MessageSquare, MoreHorizontal, FolderOpen, PanelLeftClose, PanelLeftOpen, Pencil, Search, Settings2, SquarePen, Trash2, X, Shield, UserRound } from "lucide-react";
+import { MessageSquare, MoreHorizontal, FolderOpen, PanelLeftClose, PanelLeftOpen, Pencil, Search, Settings2, SquarePen, Trash2, X, Shield, UserRound, LockKeyhole } from "lucide-react";
 import styles from "./Sidebar.module.css";
 
 const iconProps = { size: 18, strokeWidth: 1.75, "aria-hidden": true };
@@ -85,14 +85,14 @@ export default function Sidebar({ conversations, activeId, busy, collapsed, onTo
 
   const items = useMemo(() => matchedConversations.map((conversation) => ({
     key: conversation.id,
-    title: conversation.title || "新对话",
+    title: conversation.status === "locked" ? `${conversation.title || "新对话"}（资料权限已变更）` : conversation.title || "新对话",
     label: <Button
       type="text"
       className={styles.conversationTitle}
       title={conversation.title || "新对话"}
       aria-current={activeId === conversation.id ? "page" : undefined}
       onClick={(event) => { event.stopPropagation(); onSelectConversation(conversation.id); }}
-    >{conversation.title || "新对话"}</Button>,
+    >{conversation.title || "新对话"}{conversation.status === "locked" && <LockKeyhole className={styles.conversationLock} size={14} aria-label="资料权限已变更" />}</Button>,
   })), [matchedConversations, activeId, onSelectConversation]);
 
   function beginRename(id) {

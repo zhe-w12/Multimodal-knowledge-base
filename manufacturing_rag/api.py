@@ -33,6 +33,8 @@ from manufacturing_rag.auth.routes import (
     _require_csrf,
     router as auth_router,
 )
+from manufacturing_rag.auth.conversation_routes import router as conversation_router
+from manufacturing_rag.auth.conversation_store import ConversationLocked, ConversationNotFound, ConversationStore
 from manufacturing_rag.auth.store import AuthServiceUnavailable, Principal
 from manufacturing_rag.auth.workspace_store import WorkspaceForbidden, WorkspaceNotFound, WorkspaceStore
 from manufacturing_rag.auth.workspace_routes import admin_router as workspace_admin_router
@@ -266,6 +268,7 @@ class AnswerRequest(BaseModel):
 
     question: str = Field(..., min_length=1, description="User question to answer from indexed OCR/CLIP materials")
     session_id: Optional[str] = Field(None, max_length=128, description="Conversation id cached in Redis and persisted in MySQL")
+    conversation_id: Optional[str] = Field(None, max_length=36, description="Server-owned private conversation id")
     conversation_context: str = Field("", max_length=4000, description="Recent turns from the current chat")
     workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128, description="Knowledge workspace to search")
     scope: Literal["all", "common", "workspace"] = Field(
@@ -1491,6 +1494,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         allow_headers=["*"],
     )
     app.include_router(auth_router, prefix="/api/auth")
+    app.include_router(conversation_router)
     app.include_router(workspace_router)
     app.include_router(workspace_admin_router)
 
@@ -1499,7 +1503,10 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         if request.method == "OPTIONS":
             # Let CORSMiddleware answer browser preflight before requiring a session.
             return None
-        if not auth_enforcement_enabled() or not _legacy_data_endpoint(path):
+        if not _legacy_data_endpoint(path):
+            return None
+        enforcement_enabled = auth_enforcement_enabled()
+        if not enforcement_enabled and path not in {"/answer", "/answer/stream"}:
             return None
 
         try:
@@ -1510,7 +1517,9 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
         if principal is None:
-            return JSONResponse(status_code=401, content={"detail": "请先登录"})
+            if enforcement_enabled:
+                return JSONResponse(status_code=401, content={"detail": "请先登录"})
+            return None
         request.state.auth_principal = principal
         is_platform_admin = principal.user.get("platform_role") == "platform_admin"
         workspace_store = WorkspaceStore(store)
@@ -1829,6 +1838,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     @app.post("/answer")
     async def answer(payload: AnswerRequest, http_request: Request) -> Dict[str, Any]:
         scope = getattr(http_request.state, "auth_workspace_scope", None)
+        principal = getattr(http_request.state, "auth_principal", None)
         answer_options: dict[str, Any] = {}
         if scope is not None:
             answer_options = {
@@ -1837,17 +1847,39 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 "permission_cache_scope": scope["cache_scope"],
                 "strict_workspace_metadata": True,
             }
-        session_id = (
-            authenticated_session_id(scope["user_id"], payload.session_id)
-            if scope is not None
-            else payload.session_id
-        )
+        session_id = payload.session_id
+        conversation_context = payload.conversation_context
+        conversation_store = None
+        conversation_id = payload.conversation_id
+        if scope is not None and principal is not None:
+            if not conversation_id:
+                raise HTTPException(status_code=400, detail="请先创建服务器对话")
+            conversation_store = ConversationStore(_auth_store(http_request))
+            try:
+                conversation_context = await run_in_threadpool(
+                    conversation_store.begin_turn,
+                    scope["user_id"],
+                    conversation_id,
+                    payload.scope,
+                    payload.workspace_id if payload.scope == "workspace" else None,
+                    scope["workspace_ids"],
+                    payload.question.strip(),
+                )
+            except ConversationNotFound as exc:
+                raise HTTPException(status_code=404, detail="对话不存在") from exc
+            except ConversationLocked as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if conversation_context is None:
+                raise HTTPException(status_code=403, detail="资料权限已变更，请新建对话")
+            session_id = authenticated_session_id(scope["user_id"], conversation_id)
         response = await run_in_threadpool(
             kb_state.answer,
             payload.question.strip(),
             session_id,
             payload.rerank_rules.dict(),
-            conversation_context=payload.conversation_context,
+            conversation_context=conversation_context,
             hallucination_threshold=payload.hallucination_threshold,
             workspace_id=payload.workspace_id,
             **answer_options,
@@ -1857,11 +1889,31 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
         if change == "permission_changed":
             raise HTTPException(status_code=403, detail="资料权限已变更，请重新提问")
+        if conversation_store is not None and scope is not None and conversation_id:
+            serialized = response.to_dict()
+            try:
+                await run_in_threadpool(
+                    conversation_store.append_assistant,
+                    scope["user_id"],
+                    conversation_id,
+                    str(serialized.get("answer") or ""),
+                    serialized.get("sources") or [],
+                )
+            except ConversationNotFound as exc:
+                raise HTTPException(status_code=404, detail="对话不存在") from exc
+            except ConversationLocked as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            change = await answer_scope_change(http_request)
+            if change == "session_revoked":
+                raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+            if change == "permission_changed":
+                raise HTTPException(status_code=403, detail="资料权限已变更，请重新提问")
         return response.to_dict()
 
     @app.post("/answer/stream")
     async def answer_stream(payload: AnswerRequest, http_request: Request) -> StreamingResponse:
         scope = getattr(http_request.state, "auth_workspace_scope", None)
+        principal = getattr(http_request.state, "auth_principal", None)
         answer_options: dict[str, Any] = {}
         if scope is not None:
             answer_options = {
@@ -1870,11 +1922,33 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 "permission_cache_scope": scope["cache_scope"],
                 "strict_workspace_metadata": True,
             }
-        session_id = (
-            authenticated_session_id(scope["user_id"], payload.session_id)
-            if scope is not None
-            else payload.session_id
-        )
+        session_id = payload.session_id
+        conversation_context = payload.conversation_context
+        conversation_store = None
+        conversation_id = payload.conversation_id
+        if scope is not None and principal is not None:
+            if not conversation_id:
+                raise HTTPException(status_code=400, detail="请先创建服务器对话")
+            conversation_store = ConversationStore(_auth_store(http_request))
+            try:
+                conversation_context = await run_in_threadpool(
+                    conversation_store.begin_turn,
+                    scope["user_id"],
+                    conversation_id,
+                    payload.scope,
+                    payload.workspace_id if payload.scope == "workspace" else None,
+                    scope["workspace_ids"],
+                    payload.question.strip(),
+                )
+            except ConversationNotFound as exc:
+                raise HTTPException(status_code=404, detail="对话不存在") from exc
+            except ConversationLocked as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if conversation_context is None:
+                raise HTTPException(status_code=403, detail="资料权限已变更，请新建对话")
+            session_id = authenticated_session_id(scope["user_id"], conversation_id)
 
         async def events() -> AsyncIterator[str]:
             yield sse_event("status", {"stage": "intent", "message": "正在识别问题类型…"})
@@ -1896,7 +1970,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     payload.question.strip(),
                     session_id,
                     payload.rerank_rules.dict(),
-                    conversation_context=payload.conversation_context,
+                    conversation_context=conversation_context,
                     on_token=enqueue_token,
                     hallucination_threshold=payload.hallucination_threshold,
                     on_status=enqueue_status,
@@ -1951,6 +2025,22 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 return
             metadata = response.to_dict()
             answer_text = str(metadata.pop("answer", ""))
+            if conversation_store is not None and scope is not None and conversation_id:
+                try:
+                    await run_in_threadpool(
+                        conversation_store.append_assistant,
+                        scope["user_id"],
+                        conversation_id,
+                        answer_text,
+                        metadata.get("sources") or [],
+                    )
+                except ConversationLocked:
+                    yield sse_event("permission_changed", {"message": "资料权限已变更"})
+                    return
+                change = await answer_scope_change(http_request)
+                if change:
+                    yield sse_event(change, {"message": "登录状态或资料权限已变更"})
+                    return
             yield sse_event("metadata", metadata)
             if not streamed:
                 for token_chunk in text_stream_chunks(answer_text):

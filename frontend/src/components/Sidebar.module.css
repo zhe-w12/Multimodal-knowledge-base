@@ -47,6 +47,7 @@
 .conversations :global(.ant-conversations-label) { min-width: 0; }
 .conversationTitle:global(.ant-btn) { display: block; width: 100%; min-height: 42px; padding: 4px 7px; overflow: hidden; border-radius: 8px; background: transparent; color: inherit; font-size: 13px; font-weight: 400; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .conversationTitle:global(.ant-btn):hover:not(:disabled) { background: transparent; color: var(--ink); }
+.conversationLock { margin-left: 6px; vertical-align: -2px; color: #c94e58; }
 .conversations :global(.ant-conversations-item-active) .conversationTitle { color: var(--accent); font-weight: 600; }
 .menuTrigger:global(.ant-btn) { display: grid; width: 30px; height: 34px; min-width: 30px; flex: none; place-items: center; padding: 0; color: var(--muted); opacity: 0; pointer-events: none; }
 .conversations :global(.ant-conversations-item):is(:hover, :focus-within) .menuTrigger { opacity: 1; pointer-events: auto; }

@@ -157,3 +157,39 @@ class AuditLog(Base):
     target_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     details: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class Conversation(Base):
+    __tablename__ = "auth_conversations"
+    __table_args__ = (
+        CheckConstraint("scope_type IN ('all', 'common', 'workspace')", name="ck_auth_conversations_scope"),
+        CheckConstraint("status IN ('active', 'locked')", name="ck_auth_conversations_status"),
+        Index("ix_auth_conversations_owner_updated", "user_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    workspace_id: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_workspaces.id", ondelete="SET NULL"), nullable=True)
+    title: Mapped[str] = mapped_column(String(120), nullable=False, default="新对话")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    locked_reason: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class ConversationMessage(Base):
+    __tablename__ = "auth_conversation_messages"
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="ck_auth_conversation_messages_role"),
+        UniqueConstraint("conversation_id", "sequence", name="uq_auth_conversation_messages_sequence"),
+        Index("ix_auth_conversation_messages_conversation", "conversation_id", "sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("auth_conversations.id", ondelete="CASCADE"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    sources_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)

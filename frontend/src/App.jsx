@@ -23,7 +23,6 @@ const API_DEFAULT = import.meta.env.VITE_API_BASE_URL || (
     ? "http://127.0.0.1:8000"
     : `${window.location.protocol}//${window.location.hostname}:3000`
 );
-const STORAGE_KEY = "zhixu-rag-conversations-v1";
 const ACTIVE_WORKSPACE_KEY = "zhixu-rag-active-workspace-v1";
 const ACTIVE_CONVERSATIONS_KEY = "kujie-rag-active-conversations-v1";
 const SIDEBAR_COLLAPSED_KEY = "kujie-rag-sidebar-collapsed-v1";
@@ -44,42 +43,28 @@ function userStorageKey(key, userId) {
   return userId ? `${key}:${userId}` : key;
 }
 
-function readConversations(userId) {
-  if (!userId) return [];
-  try {
-    const saved = JSON.parse(localStorage.getItem(userStorageKey(STORAGE_KEY, userId)) || "[]");
-    if (Array.isArray(saved)) return saved.map((item) => ({ ...item, workspaceId: item.workspaceId || DEFAULT_WORKSPACE_ID }));
-  } catch {
-    // Start with an empty history if browser storage is unavailable.
-  }
-  return [];
-}
-
 function hasConversationContent(conversation) {
-  return conversation.messages?.some((message) => message.role === "user" && message.text?.trim());
+  return conversation.status === "locked"
+    || Number(conversation.messageCount || 0) > 0
+    || conversation.messages?.some((message) => message.role === "user" && message.text?.trim());
 }
 
-function conversationContextForRequest(messages = []) {
-  return messages
-    .filter((message) =>
-      ["user", "assistant"].includes(message.role)
-      && !message.pending
-      && !message.error
-      && typeof message.text === "string"
-      && message.text.trim(),
-    )
-    .slice(-8)
-    .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.text.trim()}`)
-    .join("\n")
-    .slice(-4000);
+function mapConversation(conversation, messages = []) {
+  return {
+    ...conversation,
+    workspaceId: conversation.scope_type === "workspace" ? conversation.workspace_id : `scope:${conversation.scope_type}`,
+    updatedAt: Date.parse(conversation.updated_at) || Date.now(),
+    messageCount: Number(conversation.message_count || messages.length),
+    customTitle: conversation.title !== "新对话",
+    messages,
+  };
 }
 
-function readActiveConversationId(userId, workspaceId = DEFAULT_WORKSPACE_ID) {
-  if (!userId) return null;
-  const available = readConversations(userId).filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
+function readActiveConversationId(userId, workspaceId = "scope:all", conversations = []) {
+  const available = conversations.filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
   try {
     const selected = JSON.parse(localStorage.getItem(userStorageKey(ACTIVE_CONVERSATIONS_KEY, userId)) || "{}");
-    if (Object.hasOwn(selected, workspaceId)) return available.some((item) => item.id === selected[workspaceId]) ? selected[workspaceId] : null;
+    if (Object.hasOwn(selected, workspaceId) && available.some((item) => item.id === selected[workspaceId])) return selected[workspaceId];
   } catch { /* Use the most recent conversation when old preferences cannot be read. */ }
   return available.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0]?.id || null;
 }
@@ -218,12 +203,34 @@ function App() {
           const nextWorkspaceId = nextWorkspaces.some((item) => item.id === savedId)
             ? savedId
             : nextWorkspaces.find((item) => item.workspace_type === "general")?.id || nextWorkspaces[0]?.id || DEFAULT_WORKSPACE_ID;
-          setConversations(readConversations(user.id));
+          let nextConversations = [];
+          let historyLoadError = "";
+          try {
+            const history = await apiFetch(joinApi(apiBase, "/api/conversations")).then(parseResponse);
+            nextConversations = (history.conversations || []).map((item) => mapConversation(item));
+          } catch (error) {
+            historyLoadError = error.message || "暂时无法读取服务器对话";
+          }
+          setConversations(nextConversations);
           setActiveWorkspaceId(nextWorkspaceId);
-          setActiveId(readActiveConversationId(user.id, "scope:all"));
+          const selectedConversationId = readActiveConversationId(user.id, "scope:all", nextConversations);
+          setActiveId(selectedConversationId);
           setSearchScope("all");
           setQuestion("");
-          setStatus({ kind: "idle", text: "" });
+          if (selectedConversationId) {
+            try {
+              const detail = await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(selectedConversationId)}`)).then(parseResponse);
+              const selectedConversation = mapConversation(detail.conversation, detail.conversation?.messages || []);
+              setConversations((items) => items.map((item) => item.id === selectedConversationId ? selectedConversation : item));
+              setStatus(selectedConversation.status === "locked"
+                ? { kind: "error", text: "这段对话引用的资料权限已变更，请新建对话继续提问。" }
+                : { kind: "idle", text: "" });
+            } catch (error) {
+              setStatus({ kind: "error", text: error.message || "暂时无法读取这段对话" });
+            }
+          } else {
+            setStatus(historyLoadError ? { kind: "error", text: historyLoadError } : { kind: "idle", text: "" });
+          }
         }
         setAuthUser(user);
         setCsrfToken(session.csrf_token || "");
@@ -363,10 +370,6 @@ function App() {
   const showWelcome = activeView === "chat" && visibleMessages.length === 0;
 
   useEffect(() => {
-    if (authUser) localStorage.setItem(userStorageKey(STORAGE_KEY, authUser.id), JSON.stringify(conversations));
-  }, [conversations, authUser]);
-
-  useEffect(() => {
     if (authUser) localStorage.setItem(userStorageKey(ACTIVE_WORKSPACE_KEY, authUser.id), activeWorkspaceId);
   }, [activeWorkspaceId, authUser]);
 
@@ -450,18 +453,41 @@ function App() {
     window.setTimeout(focusComposer, 0);
   }, [busy, focusComposer]);
 
-  const selectConversation = useCallback((conversationId) => {
+  const selectConversation = useCallback(async (conversationId) => {
     if (!conversations.some((item) => item.id === conversationId && item.workspaceId === conversationScopeId)) return;
     setActiveView("chat");
-    setActiveId(conversationId);
     setQuestion("");
     setMobileNav(false);
-  }, [conversations, conversationScopeId]);
+    setStatus({ kind: "working", text: "正在读取对话…" });
+    try {
+      const result = await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`)).then(parseResponse);
+      const conversation = mapConversation(result.conversation, result.conversation?.messages || []);
+      setConversations((items) => items.map((item) => item.id === conversationId ? conversation : item));
+      setActiveId(conversationId);
+      setStatus(conversation.status === "locked"
+        ? { kind: "error", text: "这段对话引用的资料权限已变更，请新建对话继续提问。" }
+        : { kind: "idle", text: "" });
+    } catch (error) {
+      setStatus({ kind: "error", text: error.message || "暂时无法读取这段对话" });
+    }
+  }, [apiBase, conversations, conversationScopeId]);
 
-  const renameConversation = useCallback((conversationId, title) => {
+  const renameConversation = useCallback(async (conversationId, title) => {
     if (busy || !title.trim()) return;
-    setConversations((items) => items.map((item) => item.id === conversationId ? { ...item, title: title.trim(), customTitle: true } : item));
-  }, [busy]);
+    try {
+      const result = await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim() }),
+      }, csrfToken).then(parseResponse);
+      setConversations((items) => items.map((item) => item.id === conversationId
+        ? { ...item, ...mapConversation(result.conversation, item.messages || []), customTitle: true }
+        : item,
+      ));
+    } catch (error) {
+      setStatus({ kind: "error", text: error.message || "重命名对话失败" });
+    }
+  }, [apiBase, busy, csrfToken]);
 
   const deleteConversation = useCallback((conversationId) => {
     if (busy) return;
@@ -476,7 +502,7 @@ function App() {
     setConversations(remaining);
     if (activeId === conversationId) {
       const remainingInWorkspace = remaining
-        .filter((item) => item.workspaceId === activeWorkspaceId && hasConversationContent(item))
+        .filter((item) => item.workspaceId === conversationScopeId && hasConversationContent(item))
         .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
       setActiveId(remainingInWorkspace[0]?.id || null);
       setQuestion("");
@@ -491,7 +517,7 @@ function App() {
     setActiveWorkspaceId(workspaceId);
     setSummary(null);
     setSearchScope("workspace");
-    setActiveId(readActiveConversationId(authUser?.id, workspaceId));
+    setActiveId(readActiveConversationId(authUser?.id, workspaceId, conversations));
     setQuestion("");
     setStatus({ kind: "idle", text: "" });
     setWorkspaceCreateOpen(false);
@@ -510,7 +536,7 @@ function App() {
     if (busy || !["all", "common"].includes(scope)) return;
     setSearchScope(scope);
     setActiveView("chat");
-    setActiveId(readActiveConversationId(authUser?.id, `scope:${scope}`));
+    setActiveId(readActiveConversationId(authUser?.id, `scope:${scope}`, conversations));
     setQuestion("");
     setStatus({ kind: "idle", text: "" });
   }
@@ -564,34 +590,33 @@ function App() {
     refreshStatus();
   }
 
-  function confirmDeletion() {
+  async function confirmDeletion() {
     if (!deleteConfirmation) return;
-    setDeleteConfirmation(null);
-    removeConversation(deleteConfirmation.conversationId);
+    const conversationId = deleteConfirmation.conversationId;
+    setBusy(true);
+    try {
+      await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`), {
+        method: "DELETE",
+      }, csrfToken).then(parseResponse);
+      setDeleteConfirmation(null);
+      removeConversation(conversationId);
+    } catch (error) {
+      setStatus({ kind: "error", text: error.message || "删除对话失败" });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function submitQuestion(event, submittedText) {
     event?.preventDefault();
     const text = (typeof submittedText === "string" ? submittedText : question).trim();
     if (!text || busy) return;
-    const conversationId = activeId || makeId();
-    const conversationContext = activeConversation?.id === conversationId
-      ? conversationContextForRequest(activeConversation.messages || [])
-      : "";
-    if (!activeId) {
-      setActiveId(conversationId);
-      setConversations((items) => [{ id: conversationId, title: "新对话", messages: [], updatedAt: Date.now(), workspaceId: conversationScopeId }, ...items]);
-    } else {
-      window.requestAnimationFrame(() => {
-        scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
-      });
+    if (activeConversation?.status === "locked") {
+      setStatus({ kind: "error", text: "这段对话的资料权限已变更，请新建对话后继续提问。" });
+      return;
     }
+    let conversationId = activeId;
     const answerId = makeId();
-    updateMessages(conversationId, (items) => [
-      ...items,
-      { id: makeId(), role: "user", text },
-      { id: answerId, role: "assistant", text: "", sources: [], notices: [], pending: true, status: "正在识别问题类型…" },
-    ]);
     setQuestion("");
     setBusy(true);
     setStatus({ kind: "working", text: "正在识别问题类型…" });
@@ -599,6 +624,29 @@ function App() {
     activeAnswerControllerRef.current = answerController;
     let cancelQueuedAnswerUpdate = () => {};
     try {
+      if (!conversationId) {
+        const created = await apiFetch(joinApi(apiBase, "/api/conversations"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            scope_type: searchScope,
+            workspace_id: searchScope === "workspace" ? activeWorkspaceId : null,
+          }),
+        }, csrfToken).then(parseResponse);
+        const conversation = mapConversation(created.conversation);
+        conversationId = conversation.id;
+        setActiveId(conversationId);
+        setConversations((items) => [conversation, ...items.filter((item) => item.id !== conversationId)]);
+      } else {
+        window.requestAnimationFrame(() => {
+          scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
+        });
+      }
+      updateMessages(conversationId, (items) => [
+        ...items,
+        { id: makeId(), role: "user", text },
+        { id: answerId, role: "assistant", text: "", sources: [], notices: [], pending: true, status: "正在识别问题类型…" },
+      ]);
       const response = await apiFetch(joinApi(apiBase, "/answer/stream"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -606,7 +654,7 @@ function App() {
         body: JSON.stringify({
           question: text,
           session_id: conversationId,
-          conversation_context: conversationContext,
+          conversation_id: conversationId,
           workspace_id: activeWorkspaceId,
           scope: searchScope,
           rerank_rules: {
@@ -661,6 +709,10 @@ function App() {
           if (event === "session_revoked") throw new Error("登录状态已失效，请重新登录。");
           if (event === "permission_changed") {
             await refreshAuthSession().catch(() => {});
+            setConversations((items) => items.map((item) => item.id === conversationId
+              ? { ...item, status: "locked", messages: [], messageCount: Math.max(1, item.messageCount || 0) }
+              : item,
+            ));
             throw new Error("资料权限已变更，请刷新工作区后重新提问。");
           }
           if (event === "error") failure = payload.reason || "问答服务暂时不可用";
@@ -674,12 +726,14 @@ function App() {
       setStatus({ kind: "idle", text: "" });
     } catch (error) {
       cancelQueuedAnswerUpdate();
-      if (error?.name !== "AbortError") {
+      if (error?.name !== "AbortError" && conversationId) {
         updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
           ? { ...message, text: `暂时无法完成回答：${error.message}`, error: true, pending: false }
           : message,
         ));
         setStatus({ kind: "error", text: error.message });
+      } else if (error?.name !== "AbortError") {
+        setStatus({ kind: "error", text: error.message || "无法创建对话" });
       }
     } finally {
       if (activeAnswerControllerRef.current === answerController) activeAnswerControllerRef.current = null;
