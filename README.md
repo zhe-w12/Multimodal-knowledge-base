@@ -62,6 +62,13 @@ Copy-Item .env.example .env
 NLTK_DATA=/home/www/nltk_data /www/server/pyporject_evn/versions/3.11.18/bin/python3.11 scripts/install_nltk_data.py
 ```
 
+### Office 文档导入排查
+
+- `POST /kb/document` 返回 HTTP 400 只表示接口拒绝或处理失败；需查看响应正文中的错误详情，并按请求 ID 检查 API 日志，单看状态码无法判断失败阶段。
+- 若错误详情含 `HTTP Error 403: Forbidden`，且堆栈位于 Unstructured/NLTK 分词初始化，原因可能是运行时缺少 `punkt_tab` 或英文词性标注数据，Unstructured 随后尝试从外部地址下载资源但被拒绝。这不是工作区权限 403。
+- 用 API 服务实际使用的 Python、运行账号和环境变量执行上面的安装命令。安装后可在同一运行环境确认 `nltk.data.path` 包含目标目录，并能找到 `tokenizers/punkt_tab` 与 `taggers/averaged_perceptron_tagger_eng`。仅安装到 root 的家目录不一定对以其他用户运行的 API 生效。
+- 上传进度达到 100% 仅代表文件已传完，不代表解析、切片和向量入库完成；应以任务状态和资料列表为准。若仍返回 400，保存响应正文及对应 API 堆栈继续定位，不能据此断定 NLTK 问题仍未解决。
+
 在 `.env` 中分别设置新的 `DEEPSEEK_API_KEY`、`BAILIAN_API_KEY` 和 `BAILIAN_WORKSPACE_ID`。若已有旧 `.env`，将 `.env.example` 中模型配置段合并到本地文件；不要把密钥写入或提交到代码仓库。离线开发可临时使用：
 
 向量库使用本机 Docker Milvus。仅启动向量数据库及其 etcd、MinIO 依赖（无需读取 `.env`）：
@@ -156,7 +163,7 @@ docker compose ps
 - `RAG_BM25_WEIGHT`、`RAG_SPARSE_WEIGHT`、`RAG_DENSE_WEIGHT` 作为 RRF 路由权重使用。
 - PDF 文本提取疑似乱码时优先转 OCR；OCR 不可用的异常页面会降置信度并标记 `needs_review`。
 - 低于 `RAG_MIN_ETL_CONFIDENCE` 的内容保留并标记 `needs_review`，不会静默混入高质量语料。
-- 生成只能使用检索来源；定义、公式、结论、步骤或答案缺少资料支撑时明确拒绝推断。
+- 回答以当前检索资料为依据；资料不足时由模型继续追问以补足问题信息，不使用固定的“没有足够依据”兜底答复，也不编造结论。对话正文按 SSE 增量流式显示。
 - 输出保留来源、页码、块号、模态、父块 ID 和相关性得分。
 - Token、API Key、Secret、密码及未授权数据请求会被拦截或脱敏。
 
