@@ -232,12 +232,16 @@ class ManufacturingRAGPipeline:
             clarification_generator = getattr(self.llm_router, "generate_clarifying_question", None)
             if not callable(clarification_generator):
                 raise RuntimeError("当前 AI 模型无法生成澄清问题，请检查模型配置后重试。")
-            clarification = clarification_generator(question, contexts, sufficiency_reason)
+            clarification_streamer = getattr(self.llm_router, "generate_clarifying_question_stream", None)
+            if on_token and callable(clarification_streamer):
+                clarification = clarification_streamer(question, contexts, sufficiency_reason, on_token)
+            else:
+                clarification = clarification_generator(question, contexts, sufficiency_reason)
+                if on_token:
+                    for start in range(0, len(clarification), 24):
+                        on_token(clarification[start : start + 24])
             if not str(clarification or "").strip():
                 raise RuntimeError("AI 未能生成澄清问题，请稍后重试。")
-            if on_token:
-                for start in range(0, len(clarification), 24):
-                    on_token(clarification[start : start + 24])
             return RAGResponse(
                 question=question,
                 answer=clarification,
