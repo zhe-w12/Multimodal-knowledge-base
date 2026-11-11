@@ -18,8 +18,39 @@ const switcherTheme = {
   components: { Button: { defaultShadow: "none", controlHeight: 40 } },
 };
 
-export default function WorkspaceSwitcher({ busy, onSelectScope, onCreateWorkspace }) {
-  const selectedName = "通用知识库";
+export default function WorkspaceSwitcher({
+  busy,
+  workspaces = [],
+  activeWorkspaceId,
+  searchScope,
+  onSelectScope,
+  onSelectWorkspace,
+  onCreateWorkspace,
+  onRefreshSession,
+}) {
+  const readableWorkspaces = workspaces.filter((workspace) =>
+    workspace.workspace_type === "authorized" && workspace.status === "active" && workspace.can_read,
+  );
+  const selectedWorkspace = searchScope === "workspace"
+    ? readableWorkspaces.find((workspace) => workspace.id === activeWorkspaceId)
+    : null;
+  const selectedName = selectedWorkspace?.name || "通用知识库";
+  const menuItems = [
+    { key: "scope-common", label: "通用知识库", icon: <LibraryBig size={16} /> },
+    ...(readableWorkspaces.length
+      ? [
+          { type: "divider" },
+          ...readableWorkspaces.map((workspace) => ({
+            key: `workspace:${workspace.id}`,
+            label: workspace.name,
+            icon: <LibraryBig size={16} />,
+          })),
+        ]
+      : []),
+    { type: "divider" },
+    { key: "create", label: "创建授权工作区", icon: <Plus size={16} /> },
+  ];
+  const selectedKey = selectedWorkspace ? `workspace:${selectedWorkspace.id}` : "scope-common";
 
   return (
     <ConfigProvider theme={switcherTheme}>
@@ -27,17 +58,17 @@ export default function WorkspaceSwitcher({ busy, onSelectScope, onCreateWorkspa
         trigger={["click"]}
         placement="bottomLeft"
         disabled={busy}
+        onOpenChange={(open) => {
+          if (open && onRefreshSession) onRefreshSession().catch(() => {});
+        }}
         classNames={{ root: styles.dropdownRoot, menu: styles.dropdownMenu, item: styles.dropdownItem }}
         menu={{
-          selectedKeys: ["scope-common"],
-          items: [
-            { key: "scope-common", label: "通用知识库", icon: <LibraryBig size={16} /> },
-            { type: "divider" },
-            { key: "create", label: "创建授权工作区", icon: <Plus size={16} /> },
-          ],
+          selectedKeys: [selectedKey],
+          items: menuItems,
           onClick: ({ key }) => {
             if (key === "create") onCreateWorkspace();
             else if (key === "scope-common") onSelectScope("common");
+            else if (key.startsWith("workspace:")) onSelectWorkspace(key.slice("workspace:".length));
           },
         }}
       >

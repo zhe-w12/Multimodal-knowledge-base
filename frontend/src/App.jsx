@@ -528,6 +528,22 @@ function App() {
     setMobileNav(false);
   }
 
+  function selectWorkspace(workspaceId) {
+    if (busy) return;
+    const workspace = workspaces.find((item) => item.id === workspaceId && item.can_read);
+    if (!workspace) return;
+    setActiveWorkspaceId(workspace.id);
+    setSearchScope("workspace");
+    setActiveView("chat");
+    setActiveId(readActiveConversationId(authUser?.id, workspace.id, conversations));
+    setQuestion("");
+    setSummary(null);
+    setStatus({ kind: "idle", text: "" });
+    setWorkspaceCreateOpen(false);
+    setWorkspaceName("");
+    setMobileNav(false);
+  }
+
   function returnToCommonChat() {
     const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
     summaryRequestRef.current += 1;
@@ -842,7 +858,12 @@ function App() {
           <Button className="mobile-menu" type="text" aria-label="打开侧栏" icon={<PanelLeft size={20} strokeWidth={1.75} />} onClick={() => setMobileNav(true)} />
           {activeView === "admin" ? <div className="topbar-context">工作区管理</div> : <WorkspaceSwitcher
             busy={busy}
+            workspaces={workspaces}
+            activeWorkspaceId={activeWorkspaceId}
+            searchScope={searchScope}
             onSelectScope={selectSearchScope}
+            onSelectWorkspace={selectWorkspace}
+            onRefreshSession={refreshAuthSession}
             onCreateWorkspace={() => { setWorkspaceName(""); setWorkspaceCreateOpen(true); setMobileNav(false); }}
           />}
         </header>
