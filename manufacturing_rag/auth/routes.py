@@ -165,11 +165,18 @@ def get_session(request: Request, response: Response) -> dict[str, Any]:
     principal = _principal(request, store, required=False)
     if principal is None:
         _clear_session_cookie(response, request)
-        return {"authenticated": False, "user": None, "csrf_token": None}
+        return {"authenticated": False, "user": None, "csrf_token": None, "workspaces": []}
+    from manufacturing_rag.auth.workspace_store import WorkspaceStore
+
+    try:
+        workspaces = WorkspaceStore(store).list_workspaces(principal.user["id"])
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号或工作区权限服务暂不可用") from exc
     return {
         "authenticated": True,
         "user": principal.user,
         "csrf_token": principal.csrf_token,
+        "workspaces": workspaces,
     }
 
 

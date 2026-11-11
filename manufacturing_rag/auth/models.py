@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -72,6 +72,65 @@ class RegistrationSettings(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_by: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class Workspace(Base):
+    __tablename__ = "auth_workspaces"
+    __table_args__ = (
+        CheckConstraint("workspace_type IN ('general', 'authorized')", name="ck_auth_workspaces_type"),
+        CheckConstraint("status IN ('active', 'archived')", name="ck_auth_workspaces_status"),
+        CheckConstraint(
+            "(workspace_type = 'general' AND general_marker = 'general' AND owner_user_id IS NULL) "
+            "OR (workspace_type = 'authorized' AND general_marker IS NULL AND owner_user_id IS NOT NULL)",
+            name="ck_auth_workspaces_general_marker",
+        ),
+        UniqueConstraint("general_marker", name="uq_auth_workspaces_general_marker"),
+        Index("ix_auth_workspaces_owner", "owner_user_id"),
+        Index("ix_auth_workspaces_type_status", "workspace_type", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    description: Mapped[str] = mapped_column(String(1500), nullable=False, default="")
+    workspace_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    general_marker: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_by: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"), nullable=True)
+    owner_user_id: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class WorkspaceMembership(Base):
+    __tablename__ = "auth_workspace_memberships"
+    __table_args__ = (
+        CheckConstraint("role IN ('admin', 'reader', 'blocked')", name="ck_auth_workspace_membership_role"),
+        UniqueConstraint("workspace_id", "user_id", name="uq_auth_workspace_membership_user"),
+        Index("ix_auth_workspace_memberships_user", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("auth_workspaces.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    granted_by: Mapped[str] = mapped_column(ForeignKey("auth_users.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class DepartmentWorkspaceGrant(Base):
+    __tablename__ = "auth_department_workspace_grants"
+    __table_args__ = (
+        UniqueConstraint("department_id", "workspace_id", name="uq_auth_department_workspace_grant"),
+        Index("ix_auth_department_workspace_grants_workspace", "workspace_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    department_id: Mapped[str] = mapped_column(ForeignKey("auth_departments.id", ondelete="CASCADE"), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("auth_workspaces.id", ondelete="CASCADE"), nullable=False)
+    granted_by: Mapped[str] = mapped_column(ForeignKey("auth_users.id", ondelete="RESTRICT"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class LoginAttempt(Base):

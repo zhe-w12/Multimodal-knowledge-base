@@ -28,6 +28,8 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from manufacturing_rag.auth.routes import router as auth_router
+from manufacturing_rag.auth.workspace_routes import admin_router as workspace_admin_router
+from manufacturing_rag.auth.workspace_routes import router as workspace_router
 from manufacturing_rag.adapters.ocr import BaiduOCRAdapter
 from manufacturing_rag.adapters.llm import build_llm_router
 from manufacturing_rag.adapters.embedding import HashEmbeddingAdapter, build_embedding_adapter
@@ -1416,6 +1418,8 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         allow_headers=["*"],
     )
     app.include_router(auth_router, prefix="/api/auth")
+    app.include_router(workspace_router)
+    app.include_router(workspace_admin_router)
 
     @app.middleware("http")
     async def preserve_error_reason_for_browser(request: Request, call_next):
@@ -1433,8 +1437,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
 
         origin = request.headers.get("origin", "")
         if origin and (origin in cors_origins or "*" in cors_origins):
-            allowed_origin = "*" if "*" in cors_origins else origin
-            response.headers.setdefault("Access-Control-Allow-Origin", allowed_origin)
+            response.headers.setdefault("Access-Control-Allow-Origin", origin)
             vary = response.headers.get("Vary", "")
             if "origin" not in {part.strip().lower() for part in vary.split(",")}:
                 response.headers["Vary"] = f"{vary}, Origin" if vary else "Origin"
