@@ -665,6 +665,46 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
         self.last_answer_source = "remote_llm"
         return clarification
 
+    def generate_clarifying_question_stream(
+        self,
+        question: str,
+        contexts: List[RetrievalResult],
+        reason: str,
+        on_token: Callable[[str], None],
+    ) -> str:
+        if not self.api_key:
+            self.last_answer_source = "unavailable"
+            raise RuntimeError("AI 暂时无法提出补充问题，请检查模型服务后重试。")
+        prompt = json.dumps(
+            {
+                "question": question,
+                "insufficient_reason": reason,
+                "available_contexts": format_contexts(contexts),
+                "task": "不要回答原问题，只向用户提出最必要的补充问题，以便继续检索。",
+            },
+            ensure_ascii=False,
+        )
+        parts: List[str] = []
+        try:
+            for token in self.client.chat_stream(
+                system_prompt=self.clarification_system_prompt,
+                user_prompt=prompt,
+                temperature=self.config.llm_temperature,
+                max_tokens=self.config.llm_max_tokens,
+                enable_thinking=self.config.llm_enable_thinking,
+            ):
+                parts.append(token)
+                on_token(token)
+        except Exception as exc:  # noqa: BLE001 - keep model streaming failures visible.
+            self.last_answer_source = "unavailable"
+            raise RuntimeError("AI 暂时无法提出补充问题，请稍后重试。") from exc
+        clarification = strip_source_annotations("".join(parts)).strip()
+        if not clarification:
+            self.last_answer_source = "unavailable"
+            raise RuntimeError("AI 暂时无法提出补充问题，请重试。")
+        self.last_answer_source = "remote_llm"
+        return clarification
+
     def generate_answer(self, question: str, contexts: List[RetrievalResult]) -> str:
         if not self.api_key:
             self.last_answer_source = "unavailable"
@@ -703,15 +743,50 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
         return answer
 
     @staticmethod
-    def _looks_like_insufficient_answer(answer: str) -> bool:
-        lead = re.sub(r"\s+", "", strip_source_annotations(answer)).lstrip("#>*-` ")[:100]
-        patterns = (
-            r"^(?:抱歉[,，。]?)?(?:资料|检索资料|现有资料|目前资料|当前资料).{0,24}(?:不足|未找到|没有找到|无法|不能).{0,16}(?:依据|信息|回答|支撑|证据)?",
-            r"^(?:抱歉[,，。]?)?(?:我)?(?:无法|不能)(?:根据|基于|从)(?:现有|当前|检索到的|提供的)?资料.{0,16}(?:回答|确认|找到)",
-            r"^资料中暂时没有找到足够的依据",
-            r"^目前没有足够(?:的)?(?:资料|信息|依据)(?:来|以)?(?:回答|判断|确认)",
+    def _insufficient_answer_markers() -> Tuple[str, ...]:
+        return (
+            "资料中暂时没有找到足够的依据",
+            "资料中没有找到足够的依据",
+            "资料中未找到足够的依据",
+            "资料里暂时没有找到足够的依据",
+            "目前资料不足以直接回答",
+            "当前资料不足以直接回答",
+            "现有资料不足以直接回答",
+            "资料不足以直接回答",
+            "目前资料不足以回答",
+            "当前资料不足以回答",
+            "现有资料不足以回答",
+            "资料不足以回答",
+            "目前资料不足",
+            "当前资料不足",
+            "现有资料不足",
+            "检索资料不足",
+            "没有足够的依据",
+            "没有找到足够的依据",
+            "根据现有资料无法回答",
+            "根据资料无法回答",
+            "无法根据现有资料回答",
+            "无法基于现有资料回答",
+            "抱歉，资料中暂时没有找到足够的依据",
+            "抱歉，目前资料不足",
         )
-        return any(re.search(pattern, lead) for pattern in patterns)
+
+    @classmethod
+    def _looks_like_insufficient_answer(cls, answer: str) -> bool:
+        lead = re.sub(r"\s+", "", strip_source_annotations(answer)).lstrip("#>*-` ")
+        return any(lead.startswith(marker) for marker in cls._insufficient_answer_markers())
+
+    @classmethod
+    def _insufficient_answer_prefix(cls, answer: str) -> Optional[bool]:
+        lead = re.sub(r"\s+", "", strip_source_annotations(answer)).lstrip("#>*-` ")
+        if not lead:
+            return None
+        markers = cls._insufficient_answer_markers()
+        if any(marker.startswith(lead) for marker in markers):
+            return None
+        if any(lead.startswith(marker) for marker in markers):
+            return True
+        return False
 
     def generate_chat_response(self, question: str, conversation_context: str = "") -> str:
         if not self.api_key:
@@ -812,15 +887,37 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
             ensure_ascii=False,
         )
         answer_parts: List[str] = []
+        prefix_parts: List[str] = []
+        answer_started = False
+        insufficient_prefix = False
+        stream = self.client.chat_stream(
+            system_prompt=self.answer_system_prompt,
+            user_prompt=prompt,
+            temperature=self.config.llm_temperature,
+            max_tokens=self.config.llm_max_tokens,
+            enable_thinking=self.config.llm_enable_thinking,
+        )
         try:
-            for token in self.client.chat_stream(
-                system_prompt=self.answer_system_prompt,
-                user_prompt=prompt,
-                temperature=self.config.llm_temperature,
-                max_tokens=self.config.llm_max_tokens,
-                enable_thinking=self.config.llm_enable_thinking,
-            ):
+            for token in stream:
                 answer_parts.append(token)
+                if insufficient_prefix:
+                    continue
+                if answer_started:
+                    on_token(token)
+                    continue
+                prefix_parts.append(token)
+                prefix_state = self._insufficient_answer_prefix("".join(prefix_parts))
+                if prefix_state is True:
+                    insufficient_prefix = True
+                    close_stream = getattr(stream, "close", None)
+                    if callable(close_stream):
+                        close_stream()
+                    break
+                if prefix_state is False:
+                    answer_started = True
+                    for prefix_token in prefix_parts:
+                        on_token(prefix_token)
+                    prefix_parts.clear()
         except Exception as exc:  # noqa: BLE001 - never replace a failed model answer with raw retrieval text.
             self.last_answer_source = "unavailable"
             raise RuntimeError("DeepSeek 暂时无法生成答案，请检查模型服务后重试。") from exc
@@ -829,12 +926,23 @@ class DeepSeekLLMRouter(RuleBasedLLMRouter):
             self.last_answer_source = "unavailable"
             raise RuntimeError("DeepSeek 未返回有效答案，请检查模型服务后重试。")
         answer = strip_source_annotations(answer)
-        if self._looks_like_insufficient_answer(answer):
-            answer = self.generate_clarifying_question(question, contexts, "AI 判断当前资料不足以直接回答")
+        if insufficient_prefix or self._looks_like_insufficient_answer(answer):
+            if not insufficient_prefix and not answer_started:
+                answer_started = True
+                for prefix_token in prefix_parts:
+                    on_token(prefix_token)
+                prefix_parts.clear()
+            answer = self.generate_clarifying_question_stream(
+                question,
+                contexts,
+                "AI 判断当前资料不足以直接回答",
+                on_token,
+            )
         else:
+            if not answer_started:
+                for prefix_token in prefix_parts:
+                    on_token(prefix_token)
             self.last_answer_source = "remote_llm"
-        for start in range(0, len(answer), 36):
-            on_token(answer[start : start + 36])
         return answer
 
     def repair_answer(
