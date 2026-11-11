@@ -67,6 +67,21 @@ function hasConversationContent(conversation) {
   return conversation.messages?.some((message) => message.role === "user" && message.text?.trim());
 }
 
+function conversationContextForRequest(messages = []) {
+  return messages
+    .filter((message) =>
+      ["user", "assistant"].includes(message.role)
+      && !message.pending
+      && !message.error
+      && typeof message.text === "string"
+      && message.text.trim(),
+    )
+    .slice(-8)
+    .map((message) => `${message.role === "user" ? "用户" : "助手"}：${message.text.trim()}`)
+    .join("\n")
+    .slice(-4000);
+}
+
 function readActiveConversationId(workspaceId = localStorage.getItem(ACTIVE_WORKSPACE_KEY) || DEFAULT_WORKSPACE_ID) {
   const available = readConversations().filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
   try {
@@ -508,6 +523,9 @@ function App() {
     const text = (typeof submittedText === "string" ? submittedText : question).trim();
     if (!text || busy) return;
     const conversationId = activeId || makeId();
+    const conversationContext = activeConversation?.id === conversationId
+      ? conversationContextForRequest(activeConversation.messages || [])
+      : "";
     if (!activeId) {
       setActiveId(conversationId);
       setConversations((items) => [{ id: conversationId, title: "新对话", messages: [], updatedAt: Date.now(), workspaceId: activeWorkspaceId }, ...items]);
@@ -533,6 +551,7 @@ function App() {
         body: JSON.stringify({
           question: text,
           session_id: conversationId,
+          conversation_context: conversationContext,
           workspace_id: activeWorkspaceId,
           rerank_rules: {
             boost_terms: parseRerankTerms(rerankRules.boostTerms),
