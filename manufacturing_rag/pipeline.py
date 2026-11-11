@@ -44,6 +44,8 @@ class ManufacturingRAGPipeline:
         safety_guard: Optional[SafetyGuard] = None,
         remote_cache_callback: Optional[Callable[[List[DocumentChunk]], None]] = None,
         workspace_id: Optional[str] = None,
+        workspace_ids: Optional[Iterable[str]] = None,
+        strict_workspace_metadata: bool = False,
     ) -> None:
         self.config = config
         self.chunks = list(chunks)
@@ -70,6 +72,8 @@ class ManufacturingRAGPipeline:
                 config=config,
                 cache_callback=remote_cache_callback,
                 workspace_id=workspace_id,
+                workspace_ids=workspace_ids,
+                strict_workspace_metadata=strict_workspace_metadata,
             )
         else:
             self.retriever = HybridRetriever(self.chunks, embedding=embedding, config=config)

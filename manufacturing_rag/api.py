@@ -14,8 +14,8 @@ import zlib
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
-from threading import RLock
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional
+from threading import Event, RLock
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Literal, Optional
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -27,7 +27,14 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from manufacturing_rag.auth.routes import router as auth_router
+from manufacturing_rag.auth.routes import (
+    _auth_store,
+    _require_browser_request,
+    _require_csrf,
+    router as auth_router,
+)
+from manufacturing_rag.auth.store import AuthServiceUnavailable, Principal
+from manufacturing_rag.auth.workspace_store import WorkspaceForbidden, WorkspaceNotFound, WorkspaceStore
 from manufacturing_rag.auth.workspace_routes import admin_router as workspace_admin_router
 from manufacturing_rag.auth.workspace_routes import router as workspace_router
 from manufacturing_rag.adapters.ocr import BaiduOCRAdapter
@@ -132,6 +139,13 @@ def workspace_session_id(workspace_id: str, session_id: Optional[str]) -> Option
         return session_id
     session_hash = hashlib.sha256(f"{workspace_id}\0{session_id}".encode("utf-8")).hexdigest()
     return f"ws-{session_hash}"
+
+
+def authenticated_session_id(user_id: str, session_id: Optional[str]) -> Optional[str]:
+    if session_id is None:
+        return None
+    digest = hashlib.sha256(f"{user_id}\0{session_id}".encode("utf-8")).hexdigest()
+    return f"user-{digest}"
 
 
 def tag_chunks_for_workspace(chunks: Iterable[DocumentChunk], workspace_id: str) -> List[DocumentChunk]:
@@ -254,6 +268,10 @@ class AnswerRequest(BaseModel):
     session_id: Optional[str] = Field(None, max_length=128, description="Conversation id cached in Redis and persisted in MySQL")
     conversation_context: str = Field("", max_length=4000, description="Recent turns from the current chat")
     workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128, description="Knowledge workspace to search")
+    scope: Literal["all", "common", "workspace"] = Field(
+        "workspace",
+        description="Requested search scope; the server resolves this to workspaces the signed-in user can read",
+    )
     rerank_rules: RerankRuleRequest = Field(default_factory=RerankRuleRequest)
     hallucination_threshold: float = Field(0.75, ge=0.0, le=0.95, description="Minimum confidence required to accept a source-checked answer")
 
@@ -409,11 +427,24 @@ class KnowledgeBaseState:
         hallucination_threshold: float = 0.75,
         on_status: Optional[Callable[[str], None]] = None,
         workspace_id: str = DEFAULT_WORKSPACE_ID,
+        workspace_ids: Optional[Iterable[str]] = None,
+        principal_user_id: Optional[str] = None,
+        permission_cache_scope: Optional[str] = None,
+        strict_workspace_metadata: bool = False,
     ) -> RAGResponse:
         with self._lock:
-            pipeline = self._workspace_pipeline_locked(workspace_id)
+            if workspace_ids is None:
+                pipeline = self._workspace_pipeline_locked(workspace_id)
+                effective_workspace_ids = [workspace_id]
+            else:
+                effective_workspace_ids = sorted(set(str(value) for value in workspace_ids if value))
+                pipeline = self._workspace_scope_pipeline_locked(
+                    effective_workspace_ids,
+                    strict_workspace_metadata=strict_workspace_metadata,
+                )
             knowledge_version = self._version
-        scoped_session_id = workspace_session_id(workspace_id, session_id)
+        scope_key = ",".join(effective_workspace_ids)
+        scoped_session_id = workspace_session_id(scope_key, session_id)
         stored_context = self.infrastructure.get_session_context(scoped_session_id)
         session_context = str(conversation_context or "").strip()[-4000:] or stored_context
         if on_status:
@@ -424,7 +455,9 @@ class KnowledgeBaseState:
         safe_threshold = min(0.95, max(0.0, float(hallucination_threshold)))
         cache_basis = (
             f"{cache_basis}\n[intent_category:{intent.category}]"
-            f"\n[workspace_id:{workspace_id}]"
+            f"\n[workspace_ids:{','.join(effective_workspace_ids)}]"
+            f"\n[principal_user_id:{principal_user_id or 'anonymous'}]"
+            f"\n[permission_cache_scope:{permission_cache_scope or 'legacy'}]"
             f"\n[rerank_rules:{json.dumps(safe_rerank_rules, ensure_ascii=False, sort_keys=True)}]"
             f"\n[hallucination_threshold:{safe_threshold:.2f}]"
         )
@@ -464,6 +497,33 @@ class KnowledgeBaseState:
             workspace_id=workspace_id,
         )
         self._workspace_pipelines[workspace_id] = (self._version, pipeline)
+        return pipeline
+
+    def _workspace_scope_pipeline_locked(
+        self,
+        workspace_ids: Iterable[str],
+        *,
+        strict_workspace_metadata: bool = False,
+    ) -> ManufacturingRAGPipeline:
+        normalized_ids = tuple(sorted(set(str(value) for value in workspace_ids if value)))
+        if not normalized_ids:
+            raise HTTPException(status_code=403, detail="没有可检索的工作区")
+        if len(normalized_ids) == 1 and not strict_workspace_metadata:
+            return self._workspace_pipeline_locked(normalized_ids[0])
+        cache_key = "scope:" + hashlib.sha256("\0".join(normalized_ids).encode("utf-8")).hexdigest()
+        cached = self._workspace_pipelines.get(cache_key)
+        if cached and cached[0] == self._version:
+            return cached[1]
+        allowed = frozenset(normalized_ids)
+        chunks = [chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) in allowed]
+        pipeline = ManufacturingRAGPipeline(
+            chunks,
+            config=self._config,
+            remote_cache_callback=self._cache_remote_chunks,
+            workspace_ids=normalized_ids,
+            strict_workspace_metadata=strict_workspace_metadata,
+        )
+        self._workspace_pipelines[cache_key] = (self._version, pipeline)
         return pipeline
 
     def chunks_snapshot(self, workspace_id: Optional[str] = None) -> List[DocumentChunk]:
@@ -1397,6 +1457,18 @@ def text_stream_chunks(text: str, size: int = 36) -> Iterable[str]:
         yield text[start : start + size]
 
 
+def auth_enforcement_enabled() -> bool:
+    return os.getenv("RAG_AUTH_ENFORCEMENT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _legacy_data_endpoint(path: str) -> bool:
+    return (
+        path in {"/answer", "/answer/stream", "/vector/status", "/vector/collection", "/vector/ingest", "/vector/search"}
+        or path.startswith("/kb/")
+        or (path.startswith("/workspaces/") and path.count("/") == 2)
+    )
+
+
 def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config: RAGConfig = DEFAULT_CONFIG) -> FastAPI:
     kb_state = KnowledgeBaseState(config=config, initial_chunks=initial_chunks)
     document_delete_jobs: Dict[str, Dict[str, Any]] = {}
@@ -1421,12 +1493,184 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     app.include_router(workspace_router)
     app.include_router(workspace_admin_router)
 
+    async def authorize_legacy_request(request: Request) -> Optional[Response]:
+        path = request.url.path
+        if request.method == "OPTIONS":
+            # Let CORSMiddleware answer browser preflight before requiring a session.
+            return None
+        if not auth_enforcement_enabled() or not _legacy_data_endpoint(path):
+            return None
+
+        try:
+            store = _auth_store(request)
+            principal = await run_in_threadpool(store.current_principal, request.cookies.get("kujie_session"))
+        except AuthServiceUnavailable:
+            return JSONResponse(status_code=503, content={"detail": "账号服务暂不可用"})
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
+        if principal is None:
+            return JSONResponse(status_code=401, content={"detail": "请先登录"})
+        request.state.auth_principal = principal
+        is_platform_admin = principal.user.get("platform_role") == "platform_admin"
+        workspace_store = WorkspaceStore(store)
+
+        def denied(status_code: int, detail: str) -> JSONResponse:
+            return JSONResponse(status_code=status_code, content={"detail": detail})
+
+        global_admin_paths = {"/vector/status", "/vector/collection", "/vector/ingest"}
+        is_legacy_workspace_delete = request.method == "DELETE" and path.startswith("/workspaces/")
+        if path in global_admin_paths or is_legacy_workspace_delete:
+            if not is_platform_admin:
+                return denied(403, "需要平台管理员权限")
+
+        is_write = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        if is_write:
+            try:
+                _require_browser_request(request, require_json=request.method != "DELETE")
+                _require_csrf(request, principal)
+            except HTTPException as exc:
+                return denied(exc.status_code, str(exc.detail))
+
+        payload: dict[str, Any] = {}
+        if request.method in {"POST", "PUT", "PATCH"}:
+            raw_body = await request.body()
+            try:
+                parsed = json.loads(raw_body) if raw_body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return denied(400, "请求体不是有效的 JSON")
+            if not isinstance(parsed, dict):
+                return denied(400, "请求体格式无效")
+            payload = parsed
+
+            async def replay_body():
+                return {"type": "http.request", "body": raw_body, "more_body": False}
+
+            request._receive = replay_body
+
+        if path in {"/answer", "/answer/stream"}:
+            scope = str(payload.get("scope") or "workspace")
+            workspace_id = str(payload.get("workspace_id") or DEFAULT_WORKSPACE_ID)
+            try:
+                resolved = await run_in_threadpool(
+                    workspace_store.resolve_readable_scope,
+                    principal.user["id"],
+                    scope,
+                    workspace_id,
+                )
+            except WorkspaceNotFound as exc:
+                return denied(404, str(exc))
+            except WorkspaceForbidden as exc:
+                return denied(403, str(exc))
+            except ValueError as exc:
+                return denied(422, str(exc))
+            except AuthServiceUnavailable:
+                return denied(503, "账号或工作区权限服务暂不可用")
+            request.state.auth_workspace_scope = {**resolved, "scope": scope}
+            request.state.auth_requested_workspace_id = workspace_id
+        elif path in global_admin_paths or is_legacy_workspace_delete:
+            # The platform administrator may run global maintenance operations.
+            pass
+        elif path == "/kb/documents/delete" or path.startswith("/kb/documents/delete/"):
+            if request.method == "GET":
+                job_id = path.rsplit("/", 1)[-1]
+                with document_delete_jobs_lock:
+                    job = document_delete_jobs.get(job_id)
+                    job_snapshot = dict(job) if job else None
+                if job_snapshot is None:
+                    return denied(404, "删除任务不存在或已过期")
+                if job_snapshot.get("created_by_user_id") != principal.user["id"]:
+                    try:
+                        access = await run_in_threadpool(
+                            workspace_store.get_workspace,
+                            principal.user["id"],
+                            str(job_snapshot.get("workspace_id") or ""),
+                        )
+                    except (WorkspaceNotFound, WorkspaceForbidden):
+                        return denied(404, "删除任务不存在或已过期")
+                    if not access.get("can_manage_content"):
+                        return denied(404, "删除任务不存在或已过期")
+                request.state.auth_workspace_id = str(job_snapshot.get("workspace_id") or "")
+            else:
+                workspace_id = str(payload.get("workspace_id") or DEFAULT_WORKSPACE_ID)
+                try:
+                    access = await run_in_threadpool(
+                        workspace_store.get_workspace,
+                        principal.user["id"],
+                        workspace_id,
+                    )
+                except WorkspaceNotFound as exc:
+                    return denied(404, str(exc))
+                except WorkspaceForbidden as exc:
+                    return denied(403, str(exc))
+                except AuthServiceUnavailable:
+                    return denied(503, "账号或工作区权限服务暂不可用")
+                if not access.get("can_manage_content"):
+                    return denied(403, "需要本工作区管理权限")
+                request.state.auth_workspace_id = workspace_id
+        else:
+            workspace_id = str(
+                payload.get("workspace_id")
+                or request.query_params.get("workspace_id")
+                or DEFAULT_WORKSPACE_ID
+            )
+            try:
+                access = await run_in_threadpool(
+                    workspace_store.get_workspace,
+                    principal.user["id"],
+                    workspace_id,
+                )
+            except WorkspaceNotFound as exc:
+                return denied(404, str(exc))
+            except WorkspaceForbidden as exc:
+                return denied(403, str(exc))
+            except AuthServiceUnavailable:
+                return denied(503, "账号或工作区权限服务暂不可用")
+            if is_write and not access.get("can_manage_content"):
+                return denied(403, "需要本工作区管理权限")
+            if not is_write and not access.get("can_read"):
+                return denied(403, "无权读取该工作区")
+            request.state.auth_workspace_id = workspace_id
+            request.state.auth_permission_cache_scope = (
+                f"u{principal.user.get('permissions_version', 0)}:"
+                f"{workspace_id}={access.get('version')}:{access.get('role')}"
+            )
+
+        return None
+
+    async def answer_scope_change(request: Request) -> str | None:
+        original_scope = getattr(request.state, "auth_workspace_scope", None)
+        if original_scope is None:
+            return None
+        try:
+            store = _auth_store(request)
+            current = await run_in_threadpool(store.current_principal, request.cookies.get("kujie_session"))
+            if current is None or current.user.get("id") != original_scope.get("user_id"):
+                return "session_revoked"
+            if current.user.get("permissions_version") != original_scope.get("user_permissions_version"):
+                return "permission_changed"
+            resolved = await run_in_threadpool(
+                WorkspaceStore(store).resolve_readable_scope,
+                current.user["id"],
+                str(original_scope.get("scope") or "workspace"),
+                request.state.auth_requested_workspace_id,
+            )
+            if resolved.get("cache_scope") != original_scope.get("cache_scope"):
+                return "permission_changed"
+            return None
+        except AuthServiceUnavailable:
+            return "permission_changed"
+        except (WorkspaceForbidden, WorkspaceNotFound, ValueError):
+            return "permission_changed"
+
     @app.middleware("http")
     async def preserve_error_reason_for_browser(request: Request, call_next):
         """Keep API errors readable by browsers from configured frontend origins."""
 
         try:
-            response = await call_next(request)
+            auth_response = await authorize_legacy_request(request)
+            response = auth_response if auth_response is not None else await call_next(request)
+        except HTTPException as exc:
+            response = JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
         except Exception as exc:  # noqa: BLE001 - final API safety net.
             error = explain_api_error(exc, 500, type(exc).__name__)
             write_debug_log(config, "unhandled_api_error", error_type=type(exc).__name__, error=error["technical_detail"])
@@ -1556,57 +1800,114 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         )
 
     @app.post("/answer")
-    async def answer(request: AnswerRequest) -> Dict[str, Any]:
+    async def answer(payload: AnswerRequest, http_request: Request) -> Dict[str, Any]:
+        scope = getattr(http_request.state, "auth_workspace_scope", None)
+        answer_options: dict[str, Any] = {}
+        if scope is not None:
+            answer_options = {
+                "workspace_ids": scope["workspace_ids"],
+                "principal_user_id": scope["user_id"],
+                "permission_cache_scope": scope["cache_scope"],
+                "strict_workspace_metadata": True,
+            }
+        session_id = (
+            authenticated_session_id(scope["user_id"], payload.session_id)
+            if scope is not None
+            else payload.session_id
+        )
         response = await run_in_threadpool(
             kb_state.answer,
-            request.question.strip(),
-            request.session_id,
-            request.rerank_rules.dict(),
-            conversation_context=request.conversation_context,
-            hallucination_threshold=request.hallucination_threshold,
-            workspace_id=request.workspace_id,
+            payload.question.strip(),
+            session_id,
+            payload.rerank_rules.dict(),
+            conversation_context=payload.conversation_context,
+            hallucination_threshold=payload.hallucination_threshold,
+            workspace_id=payload.workspace_id,
+            **answer_options,
         )
+        change = await answer_scope_change(http_request)
+        if change == "session_revoked":
+            raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+        if change == "permission_changed":
+            raise HTTPException(status_code=403, detail="资料权限已变更，请重新提问")
         return response.to_dict()
 
     @app.post("/answer/stream")
-    async def answer_stream(request: AnswerRequest) -> StreamingResponse:
+    async def answer_stream(payload: AnswerRequest, http_request: Request) -> StreamingResponse:
+        scope = getattr(http_request.state, "auth_workspace_scope", None)
+        answer_options: dict[str, Any] = {}
+        if scope is not None:
+            answer_options = {
+                "workspace_ids": scope["workspace_ids"],
+                "principal_user_id": scope["user_id"],
+                "permission_cache_scope": scope["cache_scope"],
+                "strict_workspace_metadata": True,
+            }
+        session_id = (
+            authenticated_session_id(scope["user_id"], payload.session_id)
+            if scope is not None
+            else payload.session_id
+        )
+
         async def events() -> AsyncIterator[str]:
             yield sse_event("status", {"stage": "intent", "message": "正在识别问题类型…"})
             event_queue: Queue[tuple[str, Dict[str, Any]]] = Queue()
             streamed = False
+            stop_stream = Event()
 
             def enqueue_token(token: str) -> None:
-                if token:
+                if token and not stop_stream.is_set():
                     event_queue.put(("token", {"text": token}))
 
             def enqueue_status(message: str) -> None:
-                if message:
+                if message and not stop_stream.is_set():
                     event_queue.put(("status", {"message": message}))
 
             worker = asyncio.create_task(
                 run_in_threadpool(
                     kb_state.answer,
-                    request.question.strip(),
-                    request.session_id,
-                    request.rerank_rules.dict(),
-            conversation_context=request.conversation_context,
+                    payload.question.strip(),
+                    session_id,
+                    payload.rerank_rules.dict(),
+                    conversation_context=payload.conversation_context,
                     on_token=enqueue_token,
-                    hallucination_threshold=request.hallucination_threshold,
+                    hallucination_threshold=payload.hallucination_threshold,
                     on_status=enqueue_status,
-                    workspace_id=request.workspace_id,
+                    workspace_id=payload.workspace_id,
+                    **answer_options,
                 )
             )
+            loop = asyncio.get_running_loop()
+            last_permission_check = loop.time()
             try:
                 while not worker.done() or not event_queue.empty():
+                    if scope is not None and loop.time() - last_permission_check >= 2.0:
+                        last_permission_check = loop.time()
+                        change = await answer_scope_change(http_request)
+                        if change:
+                            stop_stream.set()
+                            while not event_queue.empty():
+                                try:
+                                    event_queue.get_nowait()
+                                except Empty:
+                                    break
+                            worker.cancel()
+                            await asyncio.gather(worker, return_exceptions=True)
+                            yield sse_event(change, {"message": "登录状态或资料权限已变更"})
+                            return
                     try:
-                        event_name, payload = event_queue.get_nowait()
+                        event_name, event_payload = event_queue.get_nowait()
                     except Empty:
                         await asyncio.sleep(0.015)
                         continue
                     if event_name == "token":
                         streamed = True
-                    yield sse_event(event_name, payload)
+                    yield sse_event(event_name, event_payload)
                 response = await worker
+                change = await answer_scope_change(http_request)
+                if change:
+                    yield sse_event(change, {"message": "登录状态或资料权限已变更"})
+                    return
             except Exception as exc:  # noqa: BLE001 - keep failures visible in an SSE stream.
                 error = explain_api_error(exc, 500, type(exc).__name__)
                 write_debug_log(
@@ -1717,17 +2018,23 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         )
 
     @app.post("/kb/documents/delete")
-    def begin_document_delete(request: DocumentDeleteRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    def begin_document_delete(
+        request: DocumentDeleteRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+    ) -> Dict[str, Any]:
         source = request.source.strip()
         if not source:
             raise HTTPException(status_code=400, detail="资料名称不能为空")
         if not kb_state.document_chunk_ids(source, request.workspace_id):
             raise HTTPException(status_code=404, detail=f"知识库中不存在资料：{source}")
         job_id = uuid4().hex
+        principal = getattr(http_request.state, "auth_principal", None)
         job = {
             "job_id": job_id,
             "source": source,
             "workspace_id": request.workspace_id,
+            "created_by_user_id": principal.user["id"] if principal else None,
             "status": "queued",
             "progress": 0,
             "phase": "等待删除",
@@ -1862,16 +2169,16 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/vector/search")
-    def search_vector_collection(request: VectorSearchRequest) -> Dict[str, Any]:
+    def search_vector_collection(payload: VectorSearchRequest, http_request: Request) -> Dict[str, Any]:
         try:
             processor = AdaptiveQueryOptimizer(build_llm_router(config), config)
-            intent = processor.classify_intent(request.query)
-            entities = processor.extract_entities(request.query)
-            query_variants = processor.expand_queries(request.query, intent, entities)
+            intent = processor.classify_intent(payload.query)
+            entities = processor.extract_entities(payload.query)
+            query_variants = processor.expand_queries(payload.query, intent, entities)
             if not query_variants:
-                query_variants = [request.query]
+                query_variants = [payload.query]
             optimized_query = query_variants[1] if len(query_variants) > 1 else query_variants[0]
-            workspace_chunks = kb_state.chunks_snapshot(request.workspace_id)
+            workspace_chunks = kb_state.chunks_snapshot(payload.workspace_id)
             if config.vector_store_provider == "memory":
                 retriever = HybridRetriever(
                     workspace_chunks,
@@ -1889,26 +2196,28 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     workspace_chunks,
                     embedding=local_embedding,
                     config=config,
-                    workspace_id=request.workspace_id,
+                    workspace_id=payload.workspace_id,
+                    workspace_ids=(payload.workspace_id,) if auth_enforcement_enabled() else None,
+                    strict_workspace_metadata=auth_enforcement_enabled(),
                 )
             results = retrieve_with_query_variants(
                 retriever,
                 query_variants,
                 entities,
-                limit=request.limit,
+                limit=payload.limit,
                 rrf_k=config.rrf_k,
             )
             write_debug_log(
                 config,
                 "vector_search_results",
-                query=request.query,
+                query=payload.query,
                 optimized_query=optimized_query,
                 query_variants=query_variants,
                 result_count=len(results),
                 results=retrieval_results_for_debug(results, text_chars=config.debug_log_text_chars),
             )
             return {
-                "query": request.query,
+                "query": payload.query,
                 "optimized_query": optimized_query,
                 "query_variants": query_variants,
                 "entities": entities.to_dict(),

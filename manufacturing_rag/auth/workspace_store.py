@@ -216,6 +216,50 @@ class WorkspaceStore:
             return visible
 
     @_database_operation
+    def resolve_readable_scope(
+        self,
+        user_id: str,
+        scope: str,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a browser-provided scope to server-authorized workspace IDs."""
+
+        self.auth.ensure_schema()
+        if scope not in {"all", "common", "workspace"}:
+            raise ValueError("检索范围无效")
+        with self.auth.Session() as db:
+            user = self._load_user(db, user_id)
+            workspaces = db.scalars(select(Workspace).order_by(Workspace.id)).all()
+            selected: list[Workspace] = []
+            if scope == "all":
+                selected = workspaces
+            elif scope == "common":
+                selected = [workspace for workspace in workspaces if workspace.general_marker == "general"]
+            else:
+                resolved_id = workspace_id or "campus-default"
+                selected = [workspace for workspace in workspaces if workspace.id == resolved_id]
+                if not selected:
+                    raise WorkspaceNotFound("工作区不存在")
+
+            resolved = []
+            for workspace in selected:
+                access = self._access_in_session(db, user, workspace)
+                if access["can_read"]:
+                    resolved.append({**self._workspace_dict(workspace), **access})
+                elif scope != "all":
+                    raise WorkspaceForbidden("无权检索该工作区")
+            return {
+                "user_id": user.id,
+                "user_permissions_version": user.permissions_version,
+                "workspaces": resolved,
+                "workspace_ids": [workspace["id"] for workspace in resolved],
+                "cache_scope": ":".join(
+                    [f"u{user.permissions_version}"]
+                    + [f"{workspace['id']}={workspace['version']}:{workspace['role']}" for workspace in resolved]
+                ),
+            }
+
+    @_database_operation
     def create_workspace(self, actor_user_id: str, name: str, description: str = "") -> dict[str, Any]:
         self.auth.ensure_schema()
         normalized_name, normalized_description = self._validate_name_and_description(name, description)

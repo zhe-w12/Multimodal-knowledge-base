@@ -194,6 +194,8 @@ class MilvusHybridRetriever:
         config: RAGConfig,
         cache_callback: Optional[Callable[[List[DocumentChunk]], None]] = None,
         workspace_id: Optional[str] = None,
+        workspace_ids: Optional[Iterable[str]] = None,
+        strict_workspace_metadata: bool = False,
     ) -> None:
         self.remote = remote
         self.cache_callback = cache_callback
@@ -210,7 +212,11 @@ class MilvusHybridRetriever:
         }
         self.local = HybridRetriever(active_chunks, embedding=embedding, config=config)
         self.config = config
-        self.workspace_id = workspace_id
+        resolved_workspace_ids = set(workspace_ids or ())
+        if workspace_id is not None:
+            resolved_workspace_ids.add(workspace_id)
+        self.workspace_ids = frozenset(resolved_workspace_ids)
+        self.strict_workspace_metadata = strict_workspace_metadata
 
     def search(self, query: str, entities: EntityExtractionResult, limit: int = 20) -> List[RetrievalResult]:
         local_results = self.local.search(query, entities, limit=max(limit, self.config.candidate_k))
@@ -225,16 +231,27 @@ class MilvusHybridRetriever:
         ):
             return local_results[:limit]
         try:
-            remote_results = self.remote.search(query, entities, limit=max(limit, self.config.candidate_k))
+            if self.strict_workspace_metadata:
+                remote_results = self.remote.search(
+                    query,
+                    entities,
+                    limit=max(limit, self.config.candidate_k),
+                    workspace_ids=self.workspace_ids,
+                )
+            else:
+                remote_results = self.remote.search(query, entities, limit=max(limit, self.config.candidate_k))
         except Exception:
             if local_results:
                 return local_results[:limit]
             raise
-        if self.workspace_id is not None:
+        if self.workspace_ids:
             remote_results = [
                 result
                 for result in remote_results
-                if str(result.chunk.metadata.get("workspace_id") or DEFAULT_WORKSPACE_ID) == self.workspace_id
+                if (
+                    (not self.strict_workspace_metadata or result.chunk.metadata.get("workspace_id"))
+                    and str(result.chunk.metadata.get("workspace_id") or DEFAULT_WORKSPACE_ID) in self.workspace_ids
+                )
             ]
         # When local state was rebuilt after a restart, the persistent vector
         # collection can contain valid uploaded documents that are not yet in

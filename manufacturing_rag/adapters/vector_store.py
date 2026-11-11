@@ -13,7 +13,7 @@ from manufacturing_rag.adapters.embedding import EmbeddingAdapter, build_embeddi
 from manufacturing_rag.config import DEFAULT_CONFIG, RAGConfig
 from manufacturing_rag.query import split_terms
 from manufacturing_rag.adapters.retriever import rrf_fuse_results
-from manufacturing_rag.schemas import DocumentChunk, EntityExtractionResult, RetrievalResult
+from manufacturing_rag.schemas import DEFAULT_WORKSPACE_ID, DocumentChunk, EntityExtractionResult, RetrievalResult
 
 
 @dataclass(frozen=True)
@@ -150,7 +150,8 @@ class MilvusVectorStore:
         collection = Collection(self.collection_name, using=self.config.zilliz_alias)
         ids = [chunk.id for chunk in chunk_list]
         self._delete_existing(collection, ids)
-        rows = self._chunks_to_rows(chunk_list)
+        schema_fields = {getattr(field, "name", "") for field in getattr(collection.schema, "fields", [])}
+        rows = self._chunks_to_rows(chunk_list, include_workspace_id="workspace_id" in schema_fields)
         mutation = collection.insert(rows)
         collection.flush()
         return {
@@ -198,22 +199,41 @@ class MilvusVectorStore:
                 progress_callback(min(offset + len(batch), total), total)
         return {"status": "ok", "deleted": total, "collection_name": self.collection_name}
 
-    def search(self, query: str, entities: EntityExtractionResult, limit: int = 10) -> List[RetrievalResult]:
+    def search(
+        self,
+        query: str,
+        entities: EntityExtractionResult,
+        limit: int = 10,
+        workspace_ids: Optional[Iterable[str]] = None,
+    ) -> List[RetrievalResult]:
         _, Collection = self._connect_and_import()
         self.ensure_collection(drop_existing=False)
         collection = Collection(self.collection_name, using=self.config.zilliz_alias)
         collection.load()
+        schema_fields = {getattr(field, "name", "") for field in getattr(collection.schema, "fields", [])}
+        filter_expression = None
+        if workspace_ids is not None:
+            allowed_workspace_ids = sorted({str(value) for value in workspace_ids if value})
+            if not allowed_workspace_ids:
+                return []
+            if "workspace_id" not in schema_fields:
+                return []
+            values = ", ".join(json.dumps(value, ensure_ascii=False) for value in allowed_workspace_ids)
+            filter_expression = f"workspace_id in [{values}]"
         vector = self.embedding.embed_text(query)
         query_terms = terms_for_vector_search(query, entities)
         search_params = {"metric_type": self.config.zilliz_metric_type, "params": {}}
         candidate_limit = hybrid_candidate_limit(limit)
         output_fields = ["text", "source", "page", "block_id", "modality", "metadata_json", "image_path"]
+        if "workspace_id" in schema_fields:
+            output_fields.append("workspace_id")
         sparse_vector = self._sparse_vector(query)
         dense_hits = collection.search(
             data=[vector],
             anns_field=self.vector_field,
             param=search_params,
             limit=candidate_limit,
+            expr=filter_expression,
             output_fields=output_fields,
             consistency_level=self.config.zilliz_consistency_level,
         )
@@ -225,6 +245,7 @@ class MilvusVectorStore:
                     anns_field=self.sparse_vector_field,
                     param={"metric_type": "IP", "params": {}},
                     limit=candidate_limit,
+                    expr=filter_expression,
                     output_fields=output_fields,
                     consistency_level=self.config.zilliz_consistency_level,
                 )
@@ -247,6 +268,9 @@ class MilvusVectorStore:
         for rank, hit in enumerate(hit_rows, start=1):
             entity = hit.entity
             metadata = parse_metadata(entity.get("metadata_json"))
+            workspace_id = entity.get("workspace_id")
+            if workspace_id:
+                metadata["workspace_id"] = str(workspace_id)
             chunk = DocumentChunk(
                 id=str(hit.id),
                 text=str(entity.get("text") or ""),
@@ -298,6 +322,7 @@ class MilvusVectorStore:
             self._FieldSchema(name="id", dtype=self._DataType.VARCHAR, is_primary=True, auto_id=False, max_length=256),
             self._FieldSchema(name="text", dtype=self._DataType.VARCHAR, max_length=8192),
             self._FieldSchema(name="source", dtype=self._DataType.VARCHAR, max_length=1024),
+            self._FieldSchema(name="workspace_id", dtype=self._DataType.VARCHAR, max_length=128),
             self._FieldSchema(name="page", dtype=self._DataType.INT64),
             self._FieldSchema(name="block_id", dtype=self._DataType.VARCHAR, max_length=256),
             self._FieldSchema(name="modality", dtype=self._DataType.VARCHAR, max_length=64),
@@ -341,7 +366,7 @@ class MilvusVectorStore:
         expression = "id in [" + ", ".join(f'"{item}"' for item in escaped) + "]"
         collection.delete(expression)
 
-    def _chunks_to_rows(self, chunks: List[DocumentChunk]) -> List[Dict[str, Any]]:
+    def _chunks_to_rows(self, chunks: List[DocumentChunk], *, include_workspace_id: bool = False) -> List[Dict[str, Any]]:
         vector_texts = [vector_index_text(chunk) for chunk in chunks]
         batch_method = getattr(self.embedding, "embed_texts", None)
         embed_chunk = getattr(self.embedding, "embed_chunk", None)
@@ -361,9 +386,18 @@ class MilvusVectorStore:
         complete_vectors = [vector or [] for vector in vectors]
         if len(complete_vectors) != len(chunks):
             raise RuntimeError("embedding response count does not match knowledge chunk count")
-        return [self._chunk_to_row(chunk, vector=vector) for chunk, vector in zip(chunks, complete_vectors)]
+        return [
+            self._chunk_to_row(chunk, vector=vector, include_workspace_id=include_workspace_id)
+            for chunk, vector in zip(chunks, complete_vectors)
+        ]
 
-    def _chunk_to_row(self, chunk: DocumentChunk, vector: Optional[List[float]] = None) -> Dict[str, Any]:
+    def _chunk_to_row(
+        self,
+        chunk: DocumentChunk,
+        vector: Optional[List[float]] = None,
+        *,
+        include_workspace_id: bool = False,
+    ) -> Dict[str, Any]:
         metadata = dict(chunk.metadata or {})
         metadata.update(
             {
@@ -373,7 +407,7 @@ class MilvusVectorStore:
                 "needs_review": chunk.needs_review,
             }
         )
-        return {
+        row = {
             "id": chunk.id[:256],
             "text": truncate(chunk.text, 8192),
             "source": truncate(chunk.source, 1024),
@@ -387,6 +421,9 @@ class MilvusVectorStore:
                 vector_index_text(chunk)
             ),
         }
+        if include_workspace_id:
+            row["workspace_id"] = truncate(str(metadata.get("workspace_id") or DEFAULT_WORKSPACE_ID), 128)
+        return row
 
     def _sparse_vector(self, text: str) -> Dict[int, float]:
         method = getattr(self.embedding, "embed_sparse", None)
