@@ -8,8 +8,8 @@ from manufacturing_rag.api import create_app
 
 
 ORIGIN = "http://testserver"
-ADMIN_PASSWORD = "A secure passphrase 2026!"
-USER_PASSWORD = "Distinct phrase! 2026 account"
+ADMIN_PASSWORD = "Admin!2026abc"
+USER_PASSWORD = "User!2026abc"
 
 
 @pytest.fixture
@@ -68,14 +68,14 @@ def test_register_login_session_and_password_change(auth_client):
     missing_csrf = client.post(
         "/api/auth/change-password",
         headers=browser_headers(),
-        json={"current_password": USER_PASSWORD, "new_password": "New strong phrase! 2026 account"},
+        json={"current_password": USER_PASSWORD, "new_password": "NewPass!2026abc"},
     )
     assert missing_csrf.status_code == 403
 
     changed = client.post(
         "/api/auth/change-password",
         headers=browser_headers(csrf),
-        json={"current_password": USER_PASSWORD, "new_password": "New strong phrase! 2026 account"},
+        json={"current_password": USER_PASSWORD, "new_password": "NewPass!2026abc"},
     )
     assert changed.status_code == 200
     assert client.get("/api/auth/session").json()["authenticated"] is False
@@ -83,7 +83,7 @@ def test_register_login_session_and_password_change(auth_client):
     login = client.post(
         "/api/auth/login",
         headers=browser_headers(),
-        json={"username": "STUDENT_01", "password": "New strong phrase! 2026 account"},
+        json={"username": "STUDENT_01", "password": "NewPass!2026abc"},
     )
     assert login.status_code == 200
     assert login.json()["user"]["id"] == registration.json()["user"]["id"]
@@ -300,11 +300,30 @@ def test_password_normalization_and_rules():
     from manufacturing_rag.auth.security import normalize_password, validate_new_password
 
     assert normalize_password("e\u0301" * 15) == "é" * 15
+    assert normalize_password("12345678") == "12345678"
     with pytest.raises(ValueError):
         normalize_password("short")
     with pytest.raises(ValueError):
+        normalize_password("1234567")
+    with pytest.raises(ValueError):
+        normalize_password("12345678901234567")
+    with pytest.raises(ValueError):
         normalize_password("valid password 123\n")
     with pytest.raises(ValueError):
-        validate_new_password("Student_01 secure phrase 2026!", "student_01")
+        validate_new_password("student_01Xy!", "student_01")
     with pytest.raises(ValueError):
-        validate_new_password("a strong password 2026!", "admin")
+        validate_new_password("adminXYZ", "admin")
+    assert validate_new_password(
+        "adminXYZ", "admin", allow_reserved=True, allow_username_in_password=True
+    ) == "adminXYZ"
+
+
+def test_initial_admin_can_use_eight_character_bootstrap_password(auth_client):
+    client, store = auth_client
+    store.create_initial_platform_admin("admin", "adminXYZ")
+    login = client.post(
+        "/api/auth/login",
+        headers=browser_headers(),
+        json={"username": "admin", "password": "adminXYZ"},
+    )
+    assert login.status_code == 200

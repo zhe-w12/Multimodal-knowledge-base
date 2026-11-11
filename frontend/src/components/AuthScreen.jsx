@@ -29,8 +29,9 @@ export default function AuthScreen({
       return;
     }
     if (registering) {
-      if (password.length < 15 || password.length > 128) {
-        setLocalError("密码长度须为 15～128 个字符。");
+      const passwordLength = Array.from(password.normalize("NFC")).length;
+      if (passwordLength < 8 || passwordLength > 16) {
+        setLocalError("密码长度须为 8～16 个字符。");
         return;
       }
       if (password !== passwordConfirm) {
@@ -100,8 +101,7 @@ export default function AuthScreen({
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           autoComplete={registering ? "new-password" : "current-password"}
-          maxLength={128}
-          placeholder={registering ? "至少 15 个字符" : "请输入密码"}
+          placeholder={registering ? "8～16 个字符" : "请输入密码"}
           required
         />
         {registering && <>
@@ -111,7 +111,6 @@ export default function AuthScreen({
             value={passwordConfirm}
             onChange={(event) => setPasswordConfirm(event.target.value)}
             autoComplete="new-password"
-            maxLength={128}
             placeholder="再次输入密码"
             required
           />
@@ -140,7 +139,7 @@ export default function AuthScreen({
         </button>}
         {error && <button type="button" onClick={onRetry}>重试连接</button>}
       </div>
-      {registering && <p className="auth-rules">账号 3～32 位；密码 15～128 个字符。显示名称可在注册时填写。</p>}
+      {registering && <p className="auth-rules">账号 3～32 位；密码 8～16 个字符。显示名称可在注册时填写。</p>}
     </section>
     <div className="auth-page-caption">让每份资料，都能成为答案</div>
   </main>;

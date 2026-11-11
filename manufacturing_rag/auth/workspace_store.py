@@ -339,6 +339,17 @@ class WorkspaceStore:
             ).all()
             result = []
             for membership, user in rows:
+                access = self._access_in_session(db, user, workspace)
+                if user.id == workspace.owner_user_id:
+                    permission_source = "负责人"
+                elif user.platform_role == "platform_admin":
+                    permission_source = "平台管理员"
+                elif membership.role is not None:
+                    permission_source = "个人设置"
+                elif access["role"] == "department_reader":
+                    permission_source = "部门授权"
+                else:
+                    permission_source = "无权限"
                 result.append(
                     {
                         "user_id": user.id,
@@ -347,6 +358,10 @@ class WorkspaceStore:
                         "department_id": user.department_id,
                         "status": user.status,
                         "role": membership.role,
+                        "effective_role": access["role"],
+                        "permission_source": permission_source,
+                        "can_read": access["can_read"],
+                        "can_manage": access["can_manage"],
                         "is_owner": user.id == workspace.owner_user_id,
                     }
                 )
@@ -403,12 +418,84 @@ class WorkspaceStore:
         return admin_ids
 
     @_database_operation
+    def preview_member_role(
+        self,
+        actor_user_id: str,
+        workspace_id: str,
+        target_user_id: str,
+        role: str | None,
+        expected_workspace_version: int | None = None,
+    ) -> dict[str, Any]:
+        if role not in {None, "reader", "admin", "blocked"}:
+            raise ValueError("成员角色无效")
+        self.auth.ensure_schema()
+        with self.auth.Session() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id)
+            self._require_active_authorized(workspace)
+            self._require_access(db, actor, workspace, manage=True)
+            if expected_workspace_version is not None and workspace.version != expected_workspace_version:
+                raise WorkspaceConflict("工作区权限已被其他管理员修改，请刷新后重试")
+            target = self._load_user(db, target_user_id)
+            membership = db.scalar(
+                select(WorkspaceMembership).where(
+                    WorkspaceMembership.workspace_id == workspace.id,
+                    WorkspaceMembership.user_id == target.id,
+                )
+            )
+            old_role = membership.role if membership else None
+            if role == "admin" and actor.platform_role != "platform_admin" and actor.id != workspace.owner_user_id:
+                raise WorkspaceForbidden("只有本区负责人或平台管理员可以增加、撤销本区管理员")
+            if target.id == workspace.owner_user_id and role != "admin":
+                raise WorkspaceConflict("请先转交工作区负责人，不能移除或禁止负责人")
+            if old_role == "admin" and role != "admin":
+                active_admins = self._active_admin_ids(db, workspace)
+                if target.id in active_admins and len(active_admins - {target.id}) < 1:
+                    raise WorkspaceConflict("工作区至少保留一名启用管理员")
+
+            department_granted = False
+            if target.department_id:
+                department = db.get(Department, target.department_id)
+                if department is not None and department.is_active:
+                    department_granted = bool(
+                        db.scalar(
+                            select(DepartmentWorkspaceGrant.id).where(
+                                DepartmentWorkspaceGrant.department_id == department.id,
+                                DepartmentWorkspaceGrant.workspace_id == workspace.id,
+                            )
+                        )
+                    )
+            before = self._access_for(target, workspace, old_role, department_granted)
+            after = self._access_for(target, workspace, role, department_granted)
+            return {
+                "workspace_id": workspace.id,
+                "workspace_name": workspace.name,
+                "workspace_version": workspace.version,
+                "user_id": target.id,
+                "username": target.username,
+                "display_name": target.display_name,
+                "current_role": old_role,
+                "new_role": role,
+                "before": {
+                    "role": before["role"],
+                    "can_read": before["can_read"],
+                    "can_manage": before["can_manage"],
+                },
+                "after": {
+                    "role": after["role"],
+                    "can_read": after["can_read"],
+                    "can_manage": after["can_manage"],
+                },
+            }
+
+    @_database_operation
     def set_member_role(
         self,
         actor_user_id: str,
         workspace_id: str,
         target_user_id: str,
         role: str | None,
+        expected_workspace_version: int | None = None,
     ) -> dict[str, Any]:
         if role not in {None, "reader", "admin", "blocked"}:
             raise ValueError("成员角色无效")
@@ -419,6 +506,8 @@ class WorkspaceStore:
                 workspace = self._workspace_or_404(db, workspace_id, lock=True)
                 self._require_active_authorized(workspace)
                 self._require_access(db, actor, workspace, manage=True)
+                if expected_workspace_version is not None and workspace.version != expected_workspace_version:
+                    raise WorkspaceConflict("工作区权限已被其他管理员修改，请刷新后重试")
                 target = self._load_user(db, target_user_id)
                 is_platform_admin = actor.platform_role == "platform_admin"
                 is_owner = actor.id == workspace.owner_user_id
@@ -523,6 +612,15 @@ class WorkspaceStore:
                     "name": department.name,
                     "is_active": department.is_active,
                     "enabled": department.id in grants,
+                    "active_user_count": int(
+                        db.scalar(
+                            select(func.count(User.id)).where(
+                                User.department_id == department.id,
+                                User.status == "active",
+                            )
+                        )
+                        or 0
+                    ),
                 }
                 for department in departments
             ]
@@ -534,6 +632,7 @@ class WorkspaceStore:
         workspace_id: str,
         department_id: str,
         enabled: bool,
+        expected_workspace_version: int | None = None,
     ) -> dict[str, Any]:
         self.auth.ensure_schema()
         try:
@@ -542,6 +641,8 @@ class WorkspaceStore:
                 workspace = self._workspace_or_404(db, workspace_id, lock=True)
                 self._require_active_authorized(workspace)
                 self._require_access(db, actor, workspace, manage=True)
+                if expected_workspace_version is not None and workspace.version != expected_workspace_version:
+                    raise WorkspaceConflict("工作区权限已被其他管理员修改，请刷新后重试")
                 department = db.get(Department, department_id)
                 if department is None:
                     raise WorkspaceNotFound("部门不存在")

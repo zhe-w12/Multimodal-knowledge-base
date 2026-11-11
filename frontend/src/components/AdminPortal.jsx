@@ -24,6 +24,13 @@ function permissionLabel(access) {
   return "无权限";
 }
 
+function directRoleLabel(role) {
+  if (role === "admin") return "管理员";
+  if (role === "reader") return "阅读者";
+  if (role === "blocked") return "禁止访问";
+  return "跟随部门";
+}
+
 const AUDIT_ACTION_LABELS = {
   platform_admin_bootstrapped: "初始化平台管理员",
   login_succeeded: "登录",
@@ -147,6 +154,8 @@ export default function AdminPortal({
   const [memberQuery, setMemberQuery] = useState("");
   const [memberCandidate, setMemberCandidate] = useState(null);
   const [memberMessage, setMemberMessage] = useState("");
+  const [memberPreview, setMemberPreview] = useState(null);
+  const [memberSaving, setMemberSaving] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceDescription, setWorkspaceDescription] = useState("");
   const [workspaceSaving, setWorkspaceSaving] = useState(false);
@@ -319,32 +328,68 @@ export default function AdminPortal({
     }
   }
 
-  async function setMemberRole(userId, role) {
+  async function previewMemberRole(userId, role) {
+    if (!workspace) return;
     setMemberMessage("");
     try {
-      await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}/members/${encodeURIComponent(userId)}`), {
+      const preview = await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}/members/${encodeURIComponent(userId)}/preview`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role, expected_workspace_version: workspace.version }),
+      }, csrfToken).then(apiResponse);
+      setMemberPreview(preview);
+    } catch (error) {
+      setMemberMessage(apiError(error, "读取成员权限预览失败。"));
+      await onRefreshSession();
+      await refreshWorkspace();
+    }
+  }
+
+  async function confirmMemberRole() {
+    if (!workspace || !memberPreview) return;
+    setMemberSaving(true);
+    setMemberMessage("");
+    try {
+      await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}/members/${encodeURIComponent(memberPreview.user_id)}`), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: role === "remove" ? null : role }),
+        body: JSON.stringify({
+          role: memberPreview.new_role,
+          expected_workspace_version: memberPreview.workspace_version,
+        }),
       }, csrfToken).then(apiResponse);
-      await refreshWorkspace();
+      setMemberPreview(null);
       setMemberCandidate(null);
       setMemberQuery("");
+      await onRefreshSession();
+      await refreshWorkspace();
     } catch (error) {
-      setMemberMessage(apiError(error, "成员权限保存失败。"));
+      setMemberMessage(apiError(error, "成员权限保存失败，请刷新后重试。"));
+      setMemberPreview(null);
+      await onRefreshSession();
+      await refreshWorkspace();
+    } finally {
+      setMemberSaving(false);
     }
   }
 
   async function toggleDepartment(departmentId, enabled) {
+    const department = departmentOptions.find((item) => item.department_id === departmentId);
+    const activeCount = department?.active_user_count || 0;
+    const change = enabled ? "授予" : "撤销";
+    if (!window.confirm(`确认${change}部门“${department?.name || ""}”对“${workspace.name}”的阅读权限？影响 ${activeCount} 名启用成员的部门继承权限，个人禁止设置仍保持优先。`)) return;
     try {
       await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}/departments/${encodeURIComponent(departmentId)}`), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
+        body: JSON.stringify({ enabled, expected_workspace_version: workspace.version }),
       }, csrfToken).then(apiResponse);
+      await onRefreshSession();
       await refreshWorkspace();
     } catch (error) {
-      setMemberMessage(apiError(error, "部门授权保存失败。"));
+      setMemberMessage(apiError(error, "部门授权保存失败，请刷新后重试。"));
+      await onRefreshSession();
+      await refreshWorkspace();
     }
   }
 
@@ -626,17 +671,20 @@ export default function AdminPortal({
           <section className="admin-card">
             <div className="admin-card-heading"><div><h2>个人授权</h2><p>按准确账号添加启用用户。</p></div></div>
             <div className="admin-member-search"><Input value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} onPressEnter={() => void findMember()} placeholder="输入完整账号" aria-label="查找用户账号" /><Button icon={<Search size={16} />} onClick={() => void findMember()}>查找</Button></div>
-            {memberCandidate && <div className="admin-candidate"><div><strong>{memberCandidate.display_name}</strong><span>{memberCandidate.username}</span></div><div className="admin-candidate-actions"><Button type="primary" onClick={() => void setMemberRole(memberCandidate.user_id, "reader")}>设为阅读者</Button>{canManageAdminRole && <Button onClick={() => void transferOwner(memberCandidate.user_id)}>转交负责人</Button>}</div></div>}
+            {memberCandidate && <div className="admin-candidate"><div><strong>{memberCandidate.display_name}</strong><span>{memberCandidate.username}</span></div><div className="admin-candidate-actions"><Button type="primary" onClick={() => void previewMemberRole(memberCandidate.user_id, "reader")}>设为阅读者</Button>{canManageAdminRole && <Button onClick={() => void transferOwner(memberCandidate.user_id)}>转交负责人</Button>}</div></div>}
             {memberMessage && <div className="admin-error" role="alert">{memberMessage}</div>}
             <div className="admin-member-list">
               {members.map((member) => <div className="admin-member-row" key={member.user_id}>
                 <div className="admin-member-identity"><strong>{member.display_name || member.username}</strong><span>{member.username}{member.is_owner ? " · 负责人" : ""}</span></div>
-                <div className="admin-member-state">{member.status !== "active" ? "已停用" : member.department_id ? "部门成员" : "个人授权"}</div>
+                <div className="admin-member-state">
+                  <span>{member.status !== "active" ? "已停用" : member.permission_source}</span>
+                  <span>最终权限：{permissionLabel({ can_manage: member.can_manage, can_read: member.can_read })}</span>
+                </div>
                 <Select
                   size="small"
-                  value={member.role}
+                  value={member.role || "remove"}
                   disabled={member.is_owner}
-                  onChange={(role) => void setMemberRole(member.user_id, role)}
+                  onChange={(role) => void previewMemberRole(member.user_id, role === "remove" ? null : role)}
                   options={[
                     { value: "reader", label: "阅读者" },
                     { value: "blocked", label: "禁止访问" },
@@ -735,6 +783,22 @@ export default function AdminPortal({
             <strong>{change.workspace_name}</strong>：{permissionLabel(change.before)} → {permissionLabel(change.after)}
           </li>)}
         </ul> : <div className="admin-inline-empty">此部门变更不会改变该账号当前的工作区权限。</div>}
+      </div>}
+    </Modal>
+    <Modal
+      title="成员权限变更预览"
+      open={Boolean(memberPreview)}
+      confirmLoading={memberSaving}
+      okText="确认保存"
+      cancelText="取消"
+      onCancel={() => setMemberPreview(null)}
+      onOk={() => void confirmMemberRole()}
+    >
+      {memberPreview && <div className="admin-permission-preview">
+        <p><strong>{memberPreview.display_name || memberPreview.username}</strong> · {memberPreview.workspace_name}</p>
+        <p>个人设置：{directRoleLabel(memberPreview.current_role)} → {directRoleLabel(memberPreview.new_role)}</p>
+        <p>最终权限：{permissionLabel(memberPreview.before)} → {permissionLabel(memberPreview.after)}</p>
+        <p>工作区权限版本：{memberPreview.workspace_version}。提交时版本变化会拒绝保存并要求刷新。</p>
       </div>}
     </Modal>
   </section>;

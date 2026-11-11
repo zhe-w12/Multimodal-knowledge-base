@@ -335,7 +335,13 @@ class AuthStore:
     def create_initial_platform_admin(self, username: str, password: str) -> dict[str, Any]:
         try:
             normalized_username = normalize_username(username)
-            normalized_password = validate_new_password(password, normalized_username, allow_reserved=True)
+            # The server-only bootstrap flow may intentionally use the operator's chosen account phrase.
+            normalized_password = validate_new_password(
+                password,
+                normalized_username,
+                allow_reserved=True,
+                allow_username_in_password=True,
+            )
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
         password_hash = hash_password(normalized_password)

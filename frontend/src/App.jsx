@@ -328,8 +328,9 @@ function App() {
       setAccountError("两次输入的新密码不一致。");
       return;
     }
-    if (newPassword.length < 15 || newPassword.length > 128) {
-      setAccountError("新密码长度须为 15～128 个字符。");
+    const newPasswordLength = Array.from(newPassword.normalize("NFC")).length;
+    if (newPasswordLength < 8 || newPasswordLength > 16) {
+      setAccountError("新密码长度须为 8～16 个字符。");
       return;
     }
     setAccountBusy(true);
@@ -1000,10 +1001,10 @@ function App() {
           <label htmlFor="current-password">当前密码</label>
           <Input.Password id="current-password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required />
           <label htmlFor="new-password">新密码</label>
-          <Input.Password id="new-password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={15} maxLength={128} required />
+          <Input.Password id="new-password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required />
           <label htmlFor="new-password-confirm">确认新密码</label>
-          <Input.Password id="new-password-confirm" autoComplete="new-password" value={newPasswordConfirm} onChange={(event) => setNewPasswordConfirm(event.target.value)} minLength={15} maxLength={128} required />
-          <small>新密码长度为 15～128 个字符。修改后需要重新登录。</small>
+          <Input.Password id="new-password-confirm" autoComplete="new-password" value={newPasswordConfirm} onChange={(event) => setNewPasswordConfirm(event.target.value)} required />
+          <small>新密码长度为 8～16 个字符。修改后需要重新登录。</small>
           {accountError && <div className="auth-error" role="alert">{accountError}</div>}
           <Button type="primary" htmlType="submit" loading={accountBusy}>保存新密码</Button>
         </form>

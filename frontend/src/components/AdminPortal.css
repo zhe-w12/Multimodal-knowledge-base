@@ -53,7 +53,7 @@
 .admin-candidate-actions, .admin-department-actions, .admin-user-actions { display: flex; align-items: center; gap: 4px; }
 .admin-member-list, .admin-department-list, .admin-user-list { display: grid; }
 .admin-member-row { display: grid; grid-template-columns: minmax(110px, 1fr) auto 120px; align-items: center; gap: 10px; min-height: 57px; border-bottom: 1px solid #f0edf3; }
-.admin-member-state { color: #8a8695; font-size: 11px; white-space: nowrap; }
+.admin-member-state { display: grid; gap: 3px; color: #8a8695; font-size: 11px; }
 .admin-member-row .ant-select { width: 120px; }
 .admin-department-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; border-bottom: 1px solid #f0edf3; }
 .admin-department-row > div { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -104,9 +104,9 @@
   .admin-workspace-select { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 13px; }
   .admin-workspace-meta { justify-self: start; }
   .admin-card { padding: 15px; }
-  .admin-member-row { grid-template-columns: minmax(0, 1fr) 105px; }
-  .admin-member-state { display: none; }
-  .admin-member-row .ant-select { width: 105px; }
+  .admin-member-row { grid-template-columns: minmax(0, 1fr) 105px; row-gap: 5px; padding: 8px 0; }
+  .admin-member-state { grid-column: 1 / -1; grid-row: 2; white-space: normal; }
+  .admin-member-row .ant-select { grid-column: 2; grid-row: 1; width: 105px; }
   .admin-user-row { grid-template-columns: minmax(0, 1fr) 125px; gap: 8px; padding: 10px 0; }
   .admin-user-row .ant-select:nth-of-type(2), .admin-user-row .ant-select:nth-of-type(3), .admin-user-actions { grid-column: 2; }
   .admin-registration-row, .admin-invite-row { align-items: flex-start; }

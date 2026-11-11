@@ -7,8 +7,8 @@ from manufacturing_rag.api import create_app
 
 
 ORIGIN = "http://testserver"
-ADMIN_PASSWORD = "A secure passphrase 2026!"
-USER_PASSWORD = "Distinct phrase! 2026 account"
+ADMIN_PASSWORD = "Admin!2026abc"
+USER_PASSWORD = "User!2026abc"
 
 
 def _headers(csrf_token: str | None = None) -> dict[str, str]:
@@ -158,6 +158,62 @@ def test_any_active_user_can_create_an_authorized_workspace(monkeypatch):
         )
         assert blocked.status_code == 200
         assert all(item["id"] != workspace["id"] for item in user_b.get("/api/workspaces").json()["workspaces"])
+    finally:
+        store.engine.dispose()
+
+
+def test_member_role_preview_and_stale_workspace_version(monkeypatch):
+    (
+        _app,
+        store,
+        owner,
+        _owner_id,
+        owner_csrf,
+        reader,
+        reader_id,
+        _reader_csrf,
+        _other_id,
+        _admin_client,
+        _admin_csrf,
+    ) = _setup(monkeypatch)
+    try:
+        workspace = owner.post(
+            "/api/workspaces",
+            headers=_headers(owner_csrf),
+            json={"name": "权限预览测试区"},
+        ).json()
+        workspace_url = f"/api/workspaces/{workspace['id']}"
+        expected_version = workspace["version"]
+
+        preview = owner.post(
+            f"{workspace_url}/members/{reader_id}/preview",
+            headers=_headers(owner_csrf),
+            json={"role": "reader", "expected_workspace_version": expected_version},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["before"]["can_read"] is False
+        assert preview.json()["after"]["can_read"] is True
+
+        saved = owner.put(
+            f"{workspace_url}/members/{reader_id}",
+            headers=_headers(owner_csrf),
+            json={"role": "reader", "expected_workspace_version": expected_version},
+        )
+        assert saved.status_code == 200
+        member = next(
+            item for item in owner.get(f"{workspace_url}/members").json()["members"]
+            if item["user_id"] == reader_id
+        )
+        assert member["permission_source"] == "个人设置"
+        assert member["can_read"] is True
+
+        stale = owner.put(
+            f"{workspace_url}/members/{reader_id}",
+            headers=_headers(owner_csrf),
+            json={"role": "blocked", "expected_workspace_version": expected_version},
+        )
+        assert stale.status_code == 409
+        assert reader.get(f"{workspace_url}/members").status_code == 403
     finally:
         store.engine.dispose()
 

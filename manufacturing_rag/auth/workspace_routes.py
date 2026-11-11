@@ -36,10 +36,12 @@ class UpdateWorkspacePayload(StrictPayload):
 
 class MemberRolePayload(StrictPayload):
     role: Literal["admin", "reader", "blocked"] | None
+    expected_workspace_version: int | None = Field(default=None, ge=1)
 
 
 class DepartmentGrantPayload(StrictPayload):
     enabled: bool
+    expected_workspace_version: int | None = Field(default=None, ge=1)
 
 
 class TransferOwnerPayload(StrictPayload):
@@ -165,6 +167,25 @@ def find_member_candidate(workspace_id: str, username: str, request: Request) ->
     return {"user": user}
 
 
+@router.post("/{workspace_id}/members/{target_user_id}/preview")
+def preview_member_role(
+    workspace_id: str,
+    target_user_id: str,
+    payload: MemberRolePayload,
+    request: Request,
+) -> dict[str, Any]:
+    principal = _write_principal(request)
+    return _run(
+        lambda: _workspace_store(request).preview_member_role(
+            principal.user["id"],
+            workspace_id,
+            target_user_id,
+            payload.role,
+            payload.expected_workspace_version,
+        )
+    )
+
+
 @router.put("/{workspace_id}/members/{target_user_id}")
 def set_member_role(
     workspace_id: str,
@@ -175,7 +196,7 @@ def set_member_role(
     principal = _write_principal(request)
     return _run(
         lambda: _workspace_store(request).set_member_role(
-            principal.user["id"], workspace_id, target_user_id, payload.role
+            principal.user["id"], workspace_id, target_user_id, payload.role, payload.expected_workspace_version
         )
     )
 
@@ -210,7 +231,7 @@ def set_workspace_department(
     principal = _write_principal(request)
     return _run(
         lambda: _workspace_store(request).set_department_grant(
-            principal.user["id"], workspace_id, department_id, payload.enabled
+            principal.user["id"], workspace_id, department_id, payload.enabled, payload.expected_workspace_version
         )
     )
 

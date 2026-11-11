@@ -68,14 +68,20 @@ def normalize_password(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("密码格式无效")
     password = unicodedata.normalize("NFC", value)
-    if not 15 <= len(password) <= 128:
-        raise ValueError("密码长度须为 15～128 个字符")
+    if not 8 <= len(password) <= 16:
+        raise ValueError("密码长度须为 8～16 个字符")
     if any(not character.isprintable() for character in password):
         raise ValueError("密码不能包含换行、制表符或不可见控制字符")
     return password
 
 
-def validate_new_password(value: str, username: str, *, allow_reserved: bool = False) -> str:
+def validate_new_password(
+    value: str,
+    username: str,
+    *,
+    allow_reserved: bool = False,
+    allow_username_in_password: bool = False,
+) -> str:
     password = normalize_password(value)
     compact_password = "".join(
         character for character in unicodedata.normalize("NFKC", password).casefold() if character.isalnum()
@@ -85,7 +91,12 @@ def validate_new_password(value: str, username: str, *, allow_reserved: bool = F
     )
     if compact_password in COMMON_PASSWORDS:
         raise ValueError("该密码过于常见，请换一个更难猜的密码")
-    if compact_username and len(compact_username) >= 3 and compact_username in compact_password:
+    if (
+        not allow_username_in_password
+        and compact_username
+        and len(compact_username) >= 3
+        and compact_username in compact_password
+    ):
         raise ValueError("密码不能包含登录账号")
     if not allow_reserved and username.lower() in RESERVED_USERNAMES:
         raise ValueError("该账号名称不可注册")

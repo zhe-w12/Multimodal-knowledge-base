@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     username = input("平台管理员账号：").strip()
-    password = getpass.getpass("设置密码（15～128 个字符）：")
+    password = getpass.getpass("设置密码（8～16 个字符）：")
     confirmation = getpass.getpass("再次输入密码：")
     if password != confirmation:
         print("两次输入的密码不一致。", file=sys.stderr)
