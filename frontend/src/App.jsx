@@ -21,7 +21,7 @@ const DeferredSpin = lazy(() => import("antd/es/spin"));
 const API_DEFAULT = import.meta.env.VITE_API_BASE_URL || (
   ["localhost", "127.0.0.1"].includes(window.location.hostname)
     ? "http://127.0.0.1:8000"
-    : `${window.location.protocol}//${window.location.hostname}:3000`
+    : window.location.origin
 );
 const ACTIVE_WORKSPACE_KEY = "zhixu-rag-active-workspace-v1";
 const ACTIVE_CONVERSATIONS_KEY = "kujie-rag-active-conversations-v1";
