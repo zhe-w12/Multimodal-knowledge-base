@@ -1603,8 +1603,15 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 return denied(400, "请求体格式无效")
             payload = parsed
 
+            original_receive = request._receive
+            body_pending = True
+
             async def replay_body():
-                return {"type": "http.request", "body": raw_body, "more_body": False}
+                nonlocal body_pending
+                if body_pending:
+                    body_pending = False
+                    return {"type": "http.request", "body": raw_body, "more_body": False}
+                return await original_receive()
 
             request._receive = replay_body
 

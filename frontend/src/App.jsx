@@ -721,7 +721,8 @@ function App() {
       }
       if (failure) throw new Error(failure);
       cancelQueuedAnswerUpdate();
-      apply({ text: answer || "资料中暂时没有找到足够的依据。", ...metadata, pending: false, status: "" });
+      if (!answer.trim()) throw new Error("没有收到有效回答，请重试。");
+      apply({ text: answer, ...metadata, pending: false, status: "" });
       setStatus({ kind: "idle", text: "" });
     } catch (error) {
       cancelQueuedAnswerUpdate();

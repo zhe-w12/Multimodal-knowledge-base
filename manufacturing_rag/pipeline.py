@@ -228,8 +228,12 @@ class ManufacturingRAGPipeline:
         )
         if not sufficient:
             if on_status:
-                on_status("正在整理需要确认的信息…")
-            clarification = build_insufficient_follow_up(question, contexts, sufficiency_reason)
+                on_status("正在请 AI 确认缺少的信息…")
+            clarification_generator = getattr(self.llm_router, "generate_clarifying_question", None)
+            if callable(clarification_generator):
+                clarification = clarification_generator(question, contexts, sufficiency_reason)
+            else:
+                clarification = build_insufficient_follow_up(question, contexts, sufficiency_reason)
             if on_token:
                 for start in range(0, len(clarification), 24):
                     on_token(clarification[start : start + 24])
