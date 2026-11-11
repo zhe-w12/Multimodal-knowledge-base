@@ -1,14 +1,17 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Bubble from "@ant-design/x/es/bubble/index.js";
 import Sender from "@ant-design/x/es/sender/index.js";
-import { DeleteOutlined, PaperClipOutlined, SettingOutlined, UploadOutlined, SendOutlined } from "@ant-design/icons";
+import { SettingOutlined, UploadOutlined, SendOutlined } from "@ant-design/icons";
 import { PanelLeft } from "lucide-react";
 import Button from "antd/es/button";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
 import Sidebar from "./components/Sidebar.jsx";
+import AuthScreen from "./components/AuthScreen.jsx";
+import AdminPortal from "./components/AdminPortal.jsx";
 import WorkspaceSwitcher from "./components/WorkspaceSwitcher.jsx";
 import DocumentLibrary from "./components/DocumentLibrary.jsx";
+import { apiFetch, apiResponse } from "./api.js";
 
 const MarkdownRenderer = lazy(() => import("./MarkdownRenderer.jsx"));
 const ConfidenceSlider = lazy(() => import("antd/es/slider"));
@@ -21,13 +24,10 @@ const API_DEFAULT = import.meta.env.VITE_API_BASE_URL || (
     : `${window.location.protocol}//${window.location.hostname}:3000`
 );
 const STORAGE_KEY = "zhixu-rag-conversations-v1";
-const WORKSPACES_KEY = "zhixu-rag-workspaces-v1";
 const ACTIVE_WORKSPACE_KEY = "zhixu-rag-active-workspace-v1";
 const ACTIVE_CONVERSATIONS_KEY = "kujie-rag-active-conversations-v1";
 const SIDEBAR_COLLAPSED_KEY = "kujie-rag-sidebar-collapsed-v1";
 const DEFAULT_WORKSPACE_ID = "campus-default";
-const DEFAULT_WORKSPACE = { id: DEFAULT_WORKSPACE_ID, name: "校园知识库" };
-const API_KEY = "zhixu-rag-api-base-v1";
 const RERANK_RULES_KEY = "zhixu-rag-rerank-rules-v1";
 const HALLUCINATION_THRESHOLD_KEY = "zhixu-rag-hallucination-threshold-v1";
 const HALLUCINATION_THRESHOLD_MIGRATION_KEY = "zhixu-rag-hallucination-threshold-default-v1";
@@ -40,27 +40,19 @@ function nextUpdatedAt(conversations) {
   return Math.max(Date.now(), ...conversations.map((item) => Number(item.updatedAt) || 0)) + 1;
 }
 
-function readConversations() {
+function userStorageKey(key, userId) {
+  return userId ? `${key}:${userId}` : key;
+}
+
+function readConversations(userId) {
+  if (!userId) return [];
   try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    const saved = JSON.parse(localStorage.getItem(userStorageKey(STORAGE_KEY, userId)) || "[]");
     if (Array.isArray(saved)) return saved.map((item) => ({ ...item, workspaceId: item.workspaceId || DEFAULT_WORKSPACE_ID }));
   } catch {
     // Start with an empty history if browser storage is unavailable.
   }
   return [];
-}
-
-function readWorkspaces() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(WORKSPACES_KEY) || "[]");
-    if (Array.isArray(saved)) {
-      const custom = saved.filter((item) => item && typeof item.id === "string" && typeof item.name === "string");
-      return [DEFAULT_WORKSPACE, ...custom.filter((item) => item.id !== DEFAULT_WORKSPACE_ID)];
-    }
-  } catch {
-    // Keep the default workspace if browser storage is unavailable.
-  }
-  return [DEFAULT_WORKSPACE];
 }
 
 function hasConversationContent(conversation) {
@@ -82,10 +74,11 @@ function conversationContextForRequest(messages = []) {
     .slice(-4000);
 }
 
-function readActiveConversationId(workspaceId = localStorage.getItem(ACTIVE_WORKSPACE_KEY) || DEFAULT_WORKSPACE_ID) {
-  const available = readConversations().filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
+function readActiveConversationId(userId, workspaceId = DEFAULT_WORKSPACE_ID) {
+  if (!userId) return null;
+  const available = readConversations(userId).filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
   try {
-    const selected = JSON.parse(localStorage.getItem(ACTIVE_CONVERSATIONS_KEY) || "{}");
+    const selected = JSON.parse(localStorage.getItem(userStorageKey(ACTIVE_CONVERSATIONS_KEY, userId)) || "{}");
     if (Object.hasOwn(selected, workspaceId)) return available.some((item) => item.id === selected[workspaceId]) ? selected[workspaceId] : null;
   } catch { /* Use the most recent conversation when old preferences cannot be read. */ }
   return available.sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0]?.id || null;
@@ -117,12 +110,6 @@ function readHallucinationThreshold() {
   return Number.isFinite(saved) ? Math.max(0, Math.min(95, Math.round(saved / 5) * 5)) : 75;
 }
 
-function readApiBase() {
-  const saved = localStorage.getItem(API_KEY)?.trim();
-  const oldDefaults = ["http://127.0.0.1:8000", "http://localhost:8000"];
-  return !saved || (oldDefaults.includes(saved) && saved !== API_DEFAULT) ? API_DEFAULT : saved;
-}
-
 function parseRerankTerms(value) {
   return [...new Set(String(value || "").split(/[\n,，;；]+/).map((term) => term.trim()).filter(Boolean))].slice(0, 20);
 }
@@ -131,21 +118,15 @@ function joinApi(base, path) {
   return `${base.replace(/\/+$/, "")}${path}`;
 }
 
-async function parseResponse(response) {
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = payload?.detail;
-    const message = typeof detail === "string" ? detail : detail?.reason || payload?.message;
-    throw new Error(message || `请求失败（${response.status}）`);
-  }
-  return payload;
-}
+const parseResponse = apiResponse;
 
-function postJsonWithProgress(url, body, onProgress, onUploaded) {
+function postJsonWithProgress(url, body, onProgress, onUploaded, csrfToken = "") {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open("POST", url);
+    request.withCredentials = true;
     request.setRequestHeader("Content-Type", "application/json");
+    if (csrfToken) request.setRequestHeader("X-CSRF-Token", csrfToken);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
     });
@@ -175,21 +156,21 @@ function sourceTitle(source) {
   return source.source_path || source.source || source.filename || source.document_id || "资料来源";
 }
 
-function documentDisplayName(source) {
-  return String(source || "").split(/[\\/]/).pop() || String(source || "未命名资料");
-}
-
 function App() {
-  const [apiBase, setApiBase] = useState(readApiBase);
+  const [apiBase] = useState(API_DEFAULT);
+  const [authUser, setAuthUser] = useState(null);
+  const [csrfToken, setCsrfToken] = useState("");
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState("");
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
   const [rerankRules, setRerankRules] = useState(readRerankRules);
   const [hallucinationThreshold, setHallucinationThreshold] = useState(readHallucinationThreshold);
-  const [conversations, setConversations] = useState(readConversations);
-  const [activeId, setActiveId] = useState(readActiveConversationId);
-  const [workspaces, setWorkspaces] = useState(readWorkspaces);
-  const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => {
-    const savedId = localStorage.getItem(ACTIVE_WORKSPACE_KEY);
-    return readWorkspaces().some((workspace) => workspace.id === savedId) ? savedId : DEFAULT_WORKSPACE_ID;
-  });
+  const [conversations, setConversations] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [workspaces, setWorkspaces] = useState([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState(DEFAULT_WORKSPACE_ID);
+  const [searchScope, setSearchScope] = useState("all");
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
   const [question, setQuestion] = useState("");
@@ -197,26 +178,168 @@ function App() {
   const [status, setStatus] = useState({ kind: "idle", text: "" });
   const [uploadProgress, setUploadProgress] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [workspaceDeleting, setWorkspaceDeleting] = useState(false);
   const [documentListVersion, setDocumentListVersion] = useState(0);
-  const [docs, setDocs] = useState([]);
-  const [docsLoading, setDocsLoading] = useState(false);
-  const [docsError, setDocsError] = useState("");
   const [isConversationScrolling, setIsConversationScrolling] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true");
   const [showSettings, setShowSettings] = useState(false);
+  const [showAccount, setShowAccount] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newPasswordConfirm, setNewPasswordConfirm] = useState("");
+  const [accountError, setAccountError] = useState("");
+  const [accountBusy, setAccountBusy] = useState(false);
   const [activeView, setActiveView] = useState("chat");
-  const [documentDelete, setDocumentDelete] = useState(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState(null);
   const fileInput = useRef(null);
   const textInput = useRef(null);
   const scrollArea = useRef(null);
   const summaryRequestRef = useRef(0);
-  const documentsRequestRef = useRef(0);
   const scrollIdleTimerRef = useRef(null);
+  const authUserIdRef = useRef(null);
+  const activeAnswerControllerRef = useRef(null);
   const closeMobileNav = useCallback(() => setMobileNav(false), []);
+
+  const refreshAuthSession = useCallback(async () => {
+    setAuthError("");
+    try {
+      const session = await apiFetch(joinApi(apiBase, "/api/auth/session")).then(parseResponse);
+      const registration = await apiFetch(joinApi(apiBase, "/api/auth/registration"))
+        .then(parseResponse)
+        .catch(() => ({ registration_enabled: false }));
+      setRegistrationEnabled(Boolean(registration.registration_enabled));
+      if (session.authenticated && session.user) {
+        const user = session.user;
+        const nextWorkspaces = Array.isArray(session.workspaces) ? session.workspaces : [];
+        if (authUserIdRef.current !== user.id) {
+          authUserIdRef.current = user.id;
+          const savedId = localStorage.getItem(userStorageKey(ACTIVE_WORKSPACE_KEY, user.id));
+          const nextWorkspaceId = nextWorkspaces.some((item) => item.id === savedId)
+            ? savedId
+            : nextWorkspaces.find((item) => item.workspace_type === "general")?.id || nextWorkspaces[0]?.id || DEFAULT_WORKSPACE_ID;
+          setConversations(readConversations(user.id));
+          setActiveWorkspaceId(nextWorkspaceId);
+          setActiveId(readActiveConversationId(user.id, "scope:all"));
+          setSearchScope("all");
+          setQuestion("");
+          setStatus({ kind: "idle", text: "" });
+        }
+        setAuthUser(user);
+        setCsrfToken(session.csrf_token || "");
+        setWorkspaces(nextWorkspaces);
+        setAuthLoading(false);
+        return session;
+      }
+      if (authUserIdRef.current) activeAnswerControllerRef.current?.abort();
+      authUserIdRef.current = null;
+      setAuthUser(null);
+      setCsrfToken("");
+      setConversations([]);
+      setActiveId(null);
+      setWorkspaces([]);
+      setActiveWorkspaceId(DEFAULT_WORKSPACE_ID);
+      setSearchScope("all");
+      setAuthLoading(false);
+      return session;
+    } catch (error) {
+      setAuthError(error.message || "暂时无法连接账号服务");
+      setAuthLoading(false);
+      throw error;
+    }
+  }, [apiBase]);
+
+  useEffect(() => {
+    void refreshAuthSession().catch(() => {});
+  }, [refreshAuthSession]);
+
+  async function submitAuth(mode, payload) {
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const endpoint = mode === "register" ? "/api/auth/register" : "/api/auth/login";
+      await apiFetch(joinApi(apiBase, endpoint), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(parseResponse);
+      const session = await refreshAuthSession();
+      if (!session.authenticated) throw new Error("登录状态未能建立，请重新登录。");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function clearLocalSession() {
+    authUserIdRef.current = null;
+    setAuthUser(null);
+    setCsrfToken("");
+    setConversations([]);
+    setActiveId(null);
+    setWorkspaces([]);
+    setActiveWorkspaceId(DEFAULT_WORKSPACE_ID);
+    setSearchScope("all");
+    setQuestion("");
+    setStatus({ kind: "idle", text: "" });
+    setActiveView("chat");
+    setShowAccount(false);
+    setCurrentPassword("");
+    setNewPassword("");
+    setNewPasswordConfirm("");
+    setAccountError("");
+  }
+
+  async function logout() {
+    activeAnswerControllerRef.current?.abort();
+    try {
+      if (authUser) {
+        await apiFetch(joinApi(apiBase, "/api/auth/logout"), { method: "POST" }, csrfToken).then(parseResponse);
+      }
+    } catch { /* Clear the local view even when the server is temporarily unreachable. */ }
+    clearLocalSession();
+  }
+
+  async function logoutAll() {
+    if (!authUser) return;
+    setAccountBusy(true);
+    setAccountError("");
+    try {
+      await apiFetch(joinApi(apiBase, "/api/auth/logout-all"), { method: "POST" }, csrfToken).then(parseResponse);
+      activeAnswerControllerRef.current?.abort();
+      clearLocalSession();
+    } catch (error) {
+      setAccountError(error.message || "退出其他设备失败。");
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function changePassword(event) {
+    event.preventDefault();
+    setAccountError("");
+    if (newPassword !== newPasswordConfirm) {
+      setAccountError("两次输入的新密码不一致。");
+      return;
+    }
+    if (newPassword.length < 15 || newPassword.length > 128) {
+      setAccountError("新密码长度须为 15～128 个字符。");
+      return;
+    }
+    setAccountBusy(true);
+    try {
+      await apiFetch(joinApi(apiBase, "/api/auth/change-password"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+      }, csrfToken).then(parseResponse);
+      activeAnswerControllerRef.current?.abort();
+      clearLocalSession();
+    } catch (error) {
+      setAccountError(error.message || "修改密码失败。");
+    } finally {
+      setAccountBusy(false);
+    }
+  }
 
   useEffect(() => () => window.clearTimeout(scrollIdleTimerRef.current), []);
 
@@ -229,40 +352,36 @@ function App() {
     }, 650);
   }
 
+  const conversationScopeId = searchScope === "workspace" ? activeWorkspaceId : `scope:${searchScope}`;
   const activeConversation = useMemo(
-    () => conversations.find((item) => item.id === activeId && item.workspaceId === activeWorkspaceId) || null,
-    [conversations, activeId, activeWorkspaceId],
+    () => conversations.find((item) => item.id === activeId && item.workspaceId === conversationScopeId) || null,
+    [conversations, activeId, conversationScopeId],
   );
+  const activeWorkspace = workspaces.find((item) => item.id === activeWorkspaceId) || null;
   const messages = activeConversation?.messages || [];
   const visibleMessages = messages.filter((message) => !message.fileProgress);
   const showWelcome = activeView === "chat" && visibleMessages.length === 0;
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
-  }, [conversations]);
+    if (authUser) localStorage.setItem(userStorageKey(STORAGE_KEY, authUser.id), JSON.stringify(conversations));
+  }, [conversations, authUser]);
 
   useEffect(() => {
-    localStorage.setItem(WORKSPACES_KEY, JSON.stringify(workspaces));
-  }, [workspaces]);
+    if (authUser) localStorage.setItem(userStorageKey(ACTIVE_WORKSPACE_KEY, authUser.id), activeWorkspaceId);
+  }, [activeWorkspaceId, authUser]);
 
   useEffect(() => {
-    localStorage.setItem(ACTIVE_WORKSPACE_KEY, activeWorkspaceId);
-  }, [activeWorkspaceId]);
-
-  useEffect(() => {
+    if (!authUser) return;
     try {
-      const selected = JSON.parse(localStorage.getItem(ACTIVE_CONVERSATIONS_KEY) || "{}");
-      localStorage.setItem(ACTIVE_CONVERSATIONS_KEY, JSON.stringify({ ...selected, [activeWorkspaceId]: activeId }));
+      const storageKey = userStorageKey(ACTIVE_CONVERSATIONS_KEY, authUser.id);
+      const selected = JSON.parse(localStorage.getItem(storageKey) || "{}");
+      localStorage.setItem(storageKey, JSON.stringify({ ...selected, [conversationScopeId]: activeId }));
     } catch { /* Keep navigation usable if browser preferences are unavailable. */ }
-  }, [activeId, activeWorkspaceId]);
+  }, [activeId, conversationScopeId, authUser]);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(sidebarCollapsed));
   }, [sidebarCollapsed]);
-
-  useEffect(() => {
-    localStorage.setItem(API_KEY, apiBase);
-  }, [apiBase]);
 
   useEffect(() => {
     localStorage.setItem(RERANK_RULES_KEY, JSON.stringify(rerankRules));
@@ -273,17 +392,18 @@ function App() {
   }, [hallucinationThreshold]);
 
   const refreshStatus = useCallback(async () => {
+    if (!authUser) return;
     const api = apiBase.trim();
     if (!api) return;
     const requestId = ++summaryRequestRef.current;
     try {
       const workspace = encodeURIComponent(activeWorkspaceId);
-      const nextSummary = await fetch(joinApi(api, `/kb/summary?workspace_id=${workspace}`)).then(parseResponse);
+      const nextSummary = await apiFetch(joinApi(api, `/kb/summary?workspace_id=${workspace}`)).then(parseResponse);
       if (requestId === summaryRequestRef.current) setSummary(nextSummary);
     } catch {
       if (requestId === summaryRequestRef.current) setSummary(null);
     }
-  }, [apiBase, activeWorkspaceId]);
+  }, [apiBase, activeWorkspaceId, authUser?.id]);
 
   useEffect(() => {
     refreshStatus();
@@ -291,41 +411,12 @@ function App() {
     return () => window.clearInterval(timer);
   }, [refreshStatus]);
 
-  async function refreshDocuments() {
-    const requestId = ++documentsRequestRef.current;
-    const api = apiBase.trim();
-    if (!api) {
-      setDocs([]);
-      setDocsError("请先设置后端 API 地址");
-      setDocsLoading(false);
-      return;
-    }
-
-    setDocs([]);
-    setDocsLoading(true);
-    setDocsError("");
-    try {
-      const workspace = encodeURIComponent(activeWorkspaceId);
-      const payload = await fetch(joinApi(api, `/kb/documents?workspace_id=${workspace}`)).then(parseResponse);
-      const documents = Array.isArray(payload.documents) ? payload.documents : [];
-      if (requestId === documentsRequestRef.current) {
-        setDocs(documents.map((document) => (typeof document === "string" ? document : document?.source)).filter(Boolean));
-      }
-    } catch (error) {
-      if (requestId === documentsRequestRef.current) setDocsError(error.message || "读取资料列表失败，请稍后重试");
-    } finally {
-      if (requestId === documentsRequestRef.current) setDocsLoading(false);
-    }
-  }
-
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeId, activeConversation?.messages]);
-
-  const isDeletingDocument = ["queued", "running"].includes(documentDelete?.status);
 
   function updateMessages(conversationId, transform) {
     setConversations((items) => {
@@ -360,12 +451,12 @@ function App() {
   }, [busy, focusComposer]);
 
   const selectConversation = useCallback((conversationId) => {
-    if (!conversations.some((item) => item.id === conversationId && item.workspaceId === activeWorkspaceId)) return;
+    if (!conversations.some((item) => item.id === conversationId && item.workspaceId === conversationScopeId)) return;
     setActiveView("chat");
     setActiveId(conversationId);
     setQuestion("");
     setMobileNav(false);
-  }, [conversations, activeWorkspaceId]);
+  }, [conversations, conversationScopeId]);
 
   const renameConversation = useCallback((conversationId, title) => {
     if (busy || !title.trim()) return;
@@ -399,7 +490,8 @@ function App() {
     summaryRequestRef.current += 1;
     setActiveWorkspaceId(workspaceId);
     setSummary(null);
-    setActiveId(readActiveConversationId(workspaceId));
+    setSearchScope("workspace");
+    setActiveId(readActiveConversationId(authUser?.id, workspaceId));
     setQuestion("");
     setStatus({ kind: "idle", text: "" });
     setWorkspaceCreateOpen(false);
@@ -407,62 +499,46 @@ function App() {
     setMobileNav(false);
   }
 
-  function createWorkspace(event) {
+  function selectAdminWorkspace(workspaceId) {
+    if (busy) return;
+    setActiveWorkspaceId(workspaceId);
+    setSearchScope("workspace");
+    setSummary(null);
+  }
+
+  function selectSearchScope(scope) {
+    if (busy || !["all", "common"].includes(scope)) return;
+    setSearchScope(scope);
+    setActiveView("chat");
+    setActiveId(readActiveConversationId(authUser?.id, `scope:${scope}`));
+    setQuestion("");
+    setStatus({ kind: "idle", text: "" });
+  }
+
+  async function createWorkspace(event) {
     event?.preventDefault();
     const name = workspaceName.trim();
-    if (!name) return;
-    const existing = workspaces.find((workspace) => workspace.name.toLocaleLowerCase() === name.toLocaleLowerCase());
-    if (existing) {
-      selectWorkspace(existing.id);
-      return;
-    }
-    const workspace = { id: makeId(), name };
-    setWorkspaces((items) => [...items, workspace]);
-    selectWorkspace(workspace.id);
-  }
-
-  function requestWorkspaceDelete(workspaceId) {
-    if (!workspaceId || workspaceId === DEFAULT_WORKSPACE_ID || busy || workspaceDeleting) return;
-    const workspace = workspaces.find((item) => item.id === workspaceId);
-    if (workspace) setDeleteConfirmation({ type: "workspace", workspaceId, title: workspace.name });
-  }
-
-  async function executeWorkspaceDelete(workspaceId) {
-    const workspace = workspaces.find((item) => item.id === workspaceId);
-    if (!workspace || workspaceId === DEFAULT_WORKSPACE_ID || busy) return;
-
-    setWorkspaceDeleting(true);
+    if (!name || !authUser) return;
     setBusy(true);
-    setStatus({ kind: "working", text: `正在删除“${workspace.name}”…` });
+    setStatus({ kind: "working", text: "正在创建授权工作区…" });
     try {
-      await fetch(joinApi(apiBase, `/workspaces/${encodeURIComponent(workspaceId)}`), {
-        method: "DELETE",
-      }).then(parseResponse);
-
-      setWorkspaces((items) => items.filter((item) => item.id !== workspaceId));
-      setConversations((items) => items.filter((item) => item.workspaceId !== workspaceId));
-      try {
-        const selected = JSON.parse(localStorage.getItem(ACTIVE_CONVERSATIONS_KEY) || "{}");
-        delete selected[workspaceId];
-        localStorage.setItem(ACTIVE_CONVERSATIONS_KEY, JSON.stringify(selected));
-      } catch {
-        localStorage.removeItem(ACTIVE_CONVERSATIONS_KEY);
-      }
-
-      if (activeWorkspaceId === workspaceId) {
-        summaryRequestRef.current += 1;
-        setActiveView("chat");
-        setActiveWorkspaceId(DEFAULT_WORKSPACE_ID);
-        setActiveId(readActiveConversationId(DEFAULT_WORKSPACE_ID));
-        setSummary(null);
-        setQuestion("");
-      }
-      setStatus({ kind: "success", text: `“${workspace.name}”已删除` });
+      const created = await apiFetch(joinApi(apiBase, "/api/workspaces"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      }, csrfToken).then(parseResponse);
+      await refreshAuthSession();
+      setActiveWorkspaceId(created.id);
+      setSearchScope("workspace");
+      setActiveId(null);
+      setActiveView("admin");
+      setWorkspaceCreateOpen(false);
+      setWorkspaceName("");
+      setStatus({ kind: "success", text: `“${created.name}”已创建，你现在是本区管理员。` });
     } catch (error) {
-      setStatus({ kind: "error", text: error.message || "工作区删除失败，请稍后重试" });
+      setStatus({ kind: "error", text: error.message || "创建工作区失败，请稍后重试" });
     } finally {
       setBusy(false);
-      setWorkspaceDeleting(false);
     }
   }
 
@@ -472,50 +548,26 @@ function App() {
     refreshStatus();
   }
 
+  function openAdmin() {
+    if (busy) return;
+    const manageable = workspaces.find((item) => item.can_manage);
+    if (!manageable) return;
+    setActiveWorkspaceId(manageable.id);
+    setSearchScope("workspace");
+    setActiveView("admin");
+    setMobileNav(false);
+  }
+
   function openSettings() {
-    if (["completed", "failed"].includes(documentDelete?.status)) setDocumentDelete(null);
     setShowSettings(true);
     setMobileNav(false);
     refreshStatus();
-    void refreshDocuments();
-  }
-
-  async function deleteDocument(source) {
-    if (busy || isDeletingDocument) return;
-    setDeleteConfirmation({ type: "document", source, workspaceId: activeWorkspaceId, title: documentDisplayName(source) });
-  }
-
-  async function executeDocumentDelete(source, workspaceId) {
-    setDocumentDelete({ source, status: "queued", progress: 0, phase: "等待删除", error: "" });
-    try {
-      let job = await fetch(joinApi(apiBase, "/kb/documents/delete"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, workspace_id: workspaceId }),
-      }).then(parseResponse);
-      setDocumentDelete(job);
-
-      while (["queued", "running"].includes(job.status)) {
-        await new Promise((resolve) => window.setTimeout(resolve, 400));
-        job = await fetch(joinApi(apiBase, `/kb/documents/delete/${encodeURIComponent(job.job_id)}`)).then(parseResponse);
-        setDocumentDelete(job);
-      }
-      if (job.status === "failed") throw new Error(job.error || "删除失败，请稍后重试");
-      await refreshStatus();
-      await refreshDocuments();
-      setDocumentListVersion((version) => version + 1);
-    } catch (error) {
-      setDocumentDelete({ source, status: "failed", progress: 0, phase: "删除失败", error: error.message });
-    }
   }
 
   function confirmDeletion() {
     if (!deleteConfirmation) return;
-    const confirmation = deleteConfirmation;
     setDeleteConfirmation(null);
-    if (confirmation.type === "conversation") removeConversation(confirmation.conversationId);
-    else if (confirmation.type === "workspace") void executeWorkspaceDelete(confirmation.workspaceId);
-    else void executeDocumentDelete(confirmation.source, confirmation.workspaceId);
+    removeConversation(deleteConfirmation.conversationId);
   }
 
   async function submitQuestion(event, submittedText) {
@@ -528,7 +580,7 @@ function App() {
       : "";
     if (!activeId) {
       setActiveId(conversationId);
-      setConversations((items) => [{ id: conversationId, title: "新对话", messages: [], updatedAt: Date.now(), workspaceId: activeWorkspaceId }, ...items]);
+      setConversations((items) => [{ id: conversationId, title: "新对话", messages: [], updatedAt: Date.now(), workspaceId: conversationScopeId }, ...items]);
     } else {
       window.requestAnimationFrame(() => {
         scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
@@ -543,23 +595,27 @@ function App() {
     setQuestion("");
     setBusy(true);
     setStatus({ kind: "working", text: "正在识别问题类型…" });
+    const answerController = new AbortController();
+    activeAnswerControllerRef.current = answerController;
     let cancelQueuedAnswerUpdate = () => {};
     try {
-      const response = await fetch(joinApi(apiBase, "/answer/stream"), {
+      const response = await apiFetch(joinApi(apiBase, "/answer/stream"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        signal: answerController.signal,
         body: JSON.stringify({
           question: text,
           session_id: conversationId,
           conversation_context: conversationContext,
           workspace_id: activeWorkspaceId,
+          scope: searchScope,
           rerank_rules: {
             boost_terms: parseRerankTerms(rerankRules.boostTerms),
             exclude_terms: parseRerankTerms(rerankRules.excludeTerms),
           },
           hallucination_threshold: hallucinationThreshold / 100,
         }),
-      });
+      }, csrfToken);
       if (!response.ok || !response.body) await parseResponse(response);
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -602,6 +658,11 @@ function App() {
             answer += payload.text || "";
             scheduleAnswerRender();
           }
+          if (event === "session_revoked") throw new Error("登录状态已失效，请重新登录。");
+          if (event === "permission_changed") {
+            await refreshAuthSession().catch(() => {});
+            throw new Error("资料权限已变更，请刷新工作区后重新提问。");
+          }
           if (event === "error") failure = payload.reason || "问答服务暂时不可用";
           if (event === "done") answer = payload.answer || answer;
         }
@@ -613,17 +674,24 @@ function App() {
       setStatus({ kind: "idle", text: "" });
     } catch (error) {
       cancelQueuedAnswerUpdate();
-      updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
-        ? { ...message, text: `暂时无法完成回答：${error.message}`, error: true, pending: false }
-        : message,
-      ));
-      setStatus({ kind: "error", text: error.message });
+      if (error?.name !== "AbortError") {
+        updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
+          ? { ...message, text: `暂时无法完成回答：${error.message}`, error: true, pending: false }
+          : message,
+        ));
+        setStatus({ kind: "error", text: error.message });
+      }
     } finally {
+      if (activeAnswerControllerRef.current === answerController) activeAnswerControllerRef.current = null;
       setBusy(false);
     }
   }
 
   async function uploadFiles(fileList) {
+    if (!activeWorkspace?.can_manage_content) {
+      setStatus({ kind: "error", text: "请在你有管理权限的工作区中上传资料。" });
+      return;
+    }
     const files = Array.from(fileList || []);
     if (!files.length || busy) return;
     setBusy(true);
@@ -645,15 +713,16 @@ function App() {
           { filename: file.name, content_base64: encoded, mode: "append", workspace_id: activeWorkspaceId, max_pages: 0, render_dpi: 150 },
           (percent) => updateFileProgress({ phase: "上传文件", percent, indeterminate: false }),
           () => updateFileProgress({ phase: "后端解析文档", percent: 100, indeterminate: true }),
+          csrfToken,
         );
         let finalProgress = { phase: "导入完成", percent: 100, indeterminate: false, kind: "success" };
         updateFileProgress({ phase: "建立向量索引", percent: 0, indeterminate: true });
         try {
-          await fetch(joinApi(apiBase, "/vector/ingest"), {
+          await apiFetch(joinApi(apiBase, "/vector/ingest"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: "append" }),
-          }).then(parseResponse);
+            body: JSON.stringify({ mode: "append", workspace_id: activeWorkspaceId }),
+          }, csrfToken).then(parseResponse);
         } catch {
           finalProgress = { phase: "资料已保存，向量待同步", percent: 100, indeterminate: false, kind: "warning" };
         }
@@ -676,12 +745,21 @@ function App() {
 
   const sortedConversations = useMemo(
     () => conversations
-      .filter((item) => item.workspaceId === activeWorkspaceId && hasConversationContent(item))
+      .filter((item) => item.workspaceId === conversationScopeId && hasConversationContent(item))
       .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0)),
-    [conversations, activeWorkspaceId],
+    [conversations, conversationScopeId],
   );
+  const canManageWorkspace = workspaces.some((item) => item.can_manage_content);
+  if (authLoading) return <main className="auth-loading" role="status">正在检查登录状态…</main>;
+  if (!authUser) return <AuthScreen
+    registrationEnabled={registrationEnabled}
+    loading={authBusy}
+    error={authError}
+    onSubmit={submitAuth}
+    onRetry={() => { setAuthLoading(true); void refreshAuthSession().catch(() => {}); }}
+  />;
   return (
-    <div className={`app-shell ${sidebarCollapsed && !mobileNav ? "sidebar-collapsed" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); uploadFiles(event.dataTransfer.files); }}>
+    <div className={`app-shell ${sidebarCollapsed && !mobileNav ? "sidebar-collapsed" : ""}`} onDragOver={(event) => { event.preventDefault(); if (activeView === "admin" && activeWorkspace?.can_manage_content) setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); if (activeView === "admin" && activeWorkspace?.can_manage_content) uploadFiles(event.dataTransfer.files); }}>
       <Sidebar
         conversations={sortedConversations}
         activeId={activeId}
@@ -697,34 +775,51 @@ function App() {
         activeWorkspaceId={activeWorkspaceId}
         onOpenSettings={openSettings}
         onOpenDocuments={openDocuments}
+        onOpenAdmin={openAdmin}
+        onOpenAccount={() => { setAccountError(""); setShowAccount(true); setMobileNav(false); }}
+        canManageWorkspace={canManageWorkspace}
       />
 
       <main className={`main-panel ${showWelcome ? "is-welcome" : ""}`}>
         <header className="topbar">
           <Button className="mobile-menu" type="text" aria-label="打开侧栏" icon={<PanelLeft size={20} strokeWidth={1.75} />} onClick={() => setMobileNav(true)} />
-          <WorkspaceSwitcher
+          {activeView === "admin" ? <div className="topbar-context">工作区管理</div> : <WorkspaceSwitcher
             workspaces={workspaces}
             activeWorkspaceId={activeWorkspaceId}
+            searchScope={searchScope}
             busy={busy}
-            workspaceDeleting={workspaceDeleting}
             defaultWorkspaceId={DEFAULT_WORKSPACE_ID}
             onSelectWorkspace={selectWorkspace}
+            onSelectScope={selectSearchScope}
             onCreateWorkspace={() => { setWorkspaceName(""); setWorkspaceCreateOpen(true); setMobileNav(false); }}
-            onDeleteWorkspace={requestWorkspaceDelete}
-          />
+          />}
         </header>
 
-        <input ref={fileInput} type="file" className="visually-hidden" multiple accept={ACCEPTED_FILES} onChange={(event) => uploadFiles(event.target.files)} />
-        {dragging && <div className="drop-overlay"><div><UploadOutlined /><strong>松开即可添加资料</strong></div></div>}
+        {activeView === "admin" && activeWorkspace?.can_manage_content && <input ref={fileInput} type="file" className="visually-hidden" multiple accept={ACCEPTED_FILES} onChange={(event) => uploadFiles(event.target.files)} />}
+        {dragging && activeView === "admin" && <div className="drop-overlay"><div><UploadOutlined /><strong>松开即可添加资料</strong></div></div>}
 
         <section className={`conversation-stage ${activeView === "chat" && visibleMessages.length ? "has-messages" : ""} ${isConversationScrolling ? "is-scrolling" : ""}`} onScrollCapture={handleConversationScroll}>
-          {activeView === "documents" ? (
+          {activeView === "admin" ? (
+            <AdminPortal
+              apiBase={apiBase}
+              csrfToken={csrfToken}
+              user={authUser}
+              workspaces={workspaces}
+              activeWorkspaceId={activeWorkspaceId}
+              onWorkspaceChange={selectAdminWorkspace}
+              onRefreshSession={refreshAuthSession}
+              onReturnToChat={() => setActiveView("chat")}
+              onUpload={() => fileInput.current?.click()}
+              uploadProgress={uploadProgress}
+              documentReloadToken={documentListVersion}
+            />
+          ) : activeView === "documents" ? (
             <DocumentLibrary
               apiBase={apiBase}
               workspaceId={activeWorkspaceId}
+              workspaces={workspaces}
+              scope={searchScope}
               reloadToken={documentListVersion}
-              busy={busy}
-              onUpload={() => fileInput.current?.click()}
             />
           ) : showWelcome ? null : (
             <>
@@ -764,12 +859,10 @@ function App() {
               void submitQuestion(null, event.currentTarget.value);
               return false;
             }}
-            onPasteFile={(files) => uploadFiles(files)}
             placeholder="向你的知识库提问…"
             submitType="enter"
             autoSize={{ minRows: 1, maxRows: 6 }}
             disabled={busy}
-            prefix={<Button type="text" className="attach-button" title="添加资料" aria-label="添加资料" onClick={() => fileInput.current?.click()} disabled={busy}><PaperClipOutlined /></Button>}
             suffix={<Button className="send-button" type="primary" shape="circle" aria-label="发送问题" disabled={!question.trim() || busy} icon={busy ? <Suspense fallback={<SendOutlined />}><DeferredSpin size="small" /></Suspense> : <SendOutlined />} onClick={() => void submitQuestion(null, question)} />}
           />
         </div>}
@@ -782,53 +875,9 @@ function App() {
         width={820}
         title={<div className="settings-modal-title"><span><SettingOutlined /></span><h2>服务设置</h2></div>}
         footer={null}
-        closable={!isDeletingDocument}
-        mask={{ closable: !isDeletingDocument }}
-        onCancel={() => { if (!isDeletingDocument) setShowSettings(false); }}
+        onCancel={() => setShowSettings(false)}
       >
             <div className="settings-modal-body">
-              <section className="settings-section">
-                <div className="settings-section-heading">
-                  <h3>知识库资料</h3>
-                  <Button className="settings-add-document" onClick={() => { setShowSettings(false); fileInput.current?.click(); }} disabled={busy || isDeletingDocument}><UploadOutlined /> 添加资料</Button>
-                </div>
-                <div className="settings-stats">
-                  <div><strong>{docs.length}</strong><span>份资料</span></div>
-                  <div><strong>{summary?.chunk_count ?? 0}</strong><span>个知识片段</span></div>
-                </div>
-                {docsLoading ? <div className="managed-documents-empty" role="status">正在读取资料列表…</div>
-                  : docsError ? <div className="managed-documents-empty settings-documents-error" role="alert">{docsError}</div>
-                    : docs.length ? (
-                  <div className="managed-document-list">
-                    {docs.map((source) => (
-                      <div className="managed-document" key={source}>
-                        <span className="managed-document-icon">▤</span>
-                        <span className="managed-document-name" title={source}>{documentDisplayName(source)}</span>
-                        <Button type="text" danger className="managed-document-delete" onClick={() => deleteDocument(source)} disabled={busy || isDeletingDocument}>
-                          {isDeletingDocument && documentDelete.source === source ? "删除中…" : "删除"}
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                ) : <div className="managed-documents-empty">知识库中还没有资料</div>}
-
-                {documentDelete && (
-                  <div className={`document-delete-progress ${documentDelete.status}`} role="status" aria-live="polite">
-                    <div className="document-delete-progress-label"><span>{documentDelete.phase}{documentDelete.source ? ` · ${documentDisplayName(documentDelete.source)}` : ""}</span><span>{Math.max(0, Math.min(100, Number(documentDelete.progress) || 0))}%</span></div>
-                    <Suspense fallback={<div className="library-progress-placeholder" role="progressbar" aria-label="正在更新进度" />}>
-                      <DeferredProgress percent={Math.max(0, Math.min(100, Number(documentDelete.progress) || 0))} showInfo={false} status={documentDelete.status === "failed" ? "exception" : documentDelete.status === "completed" ? "success" : "active"} />
-                    </Suspense>
-                    {documentDelete.error && <small>{documentDelete.error}</small>}
-                  </div>
-                )}
-              </section>
-
-              <section className="settings-section">
-                <div className="settings-section-heading"><h3>服务连接</h3></div>
-                <label className="settings-api-label" htmlFor="api-base">后端 API 地址</label>
-                <Input className="settings-api-input" id="api-base" value={apiBase} onChange={(event) => setApiBase(event.target.value)} onBlur={() => { refreshStatus(); void refreshDocuments(); }} spellCheck="false" />
-              </section>
-
               <section className="settings-section">
                 <div className="settings-section-heading"><h3>检索重排规则</h3></div>
                 <label className="settings-api-label" htmlFor="rerank-boost-terms">优先匹配关键词</label>
@@ -877,6 +926,38 @@ function App() {
             </div>
       </Modal>}
 
+      {showAccount && <Modal
+        className="account-modal"
+        open
+        centered
+        width={520}
+        title="我的账号"
+        footer={null}
+        onCancel={() => { setShowAccount(false); setAccountError(""); }}
+      >
+        <div className="account-summary">
+          <strong>{authUser.display_name || authUser.username}</strong>
+          <span>@{authUser.username}</span>
+          {authUser.platform_role === "platform_admin" && <span className="account-admin-badge">平台管理员</span>}
+        </div>
+        <form className="account-password-form" onSubmit={changePassword}>
+          <h3>修改密码</h3>
+          <label htmlFor="current-password">当前密码</label>
+          <Input.Password id="current-password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required />
+          <label htmlFor="new-password">新密码</label>
+          <Input.Password id="new-password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={15} maxLength={128} required />
+          <label htmlFor="new-password-confirm">确认新密码</label>
+          <Input.Password id="new-password-confirm" autoComplete="new-password" value={newPasswordConfirm} onChange={(event) => setNewPasswordConfirm(event.target.value)} minLength={15} maxLength={128} required />
+          <small>新密码长度为 15～128 个字符。修改后需要重新登录。</small>
+          {accountError && <div className="auth-error" role="alert">{accountError}</div>}
+          <Button type="primary" htmlType="submit" loading={accountBusy}>保存新密码</Button>
+        </form>
+        <div className="account-actions">
+          <Button onClick={() => void logoutAll()} loading={accountBusy}>退出所有设备</Button>
+          <Button danger onClick={() => void logout()} disabled={accountBusy}>退出当前账号</Button>
+        </div>
+      </Modal>}
+
       {workspaceCreateOpen && <Modal
         className="library-workspace-modal"
         open
@@ -905,7 +986,7 @@ function App() {
         open
         centered
         width={460}
-        title={deleteConfirmation?.type === "workspace" ? "删除这个工作区？" : deleteConfirmation?.type === "document" ? "删除这份资料？" : "删除这段对话？"}
+        title="删除这段对话？"
         onCancel={() => setDeleteConfirmation(null)}
         footer={[
           <Button key="cancel" onClick={() => setDeleteConfirmation(null)}>取消</Button>,
@@ -913,11 +994,7 @@ function App() {
         ]}
       >
         {deleteConfirmation && <p className="confirm-dialog-description">
-          {deleteConfirmation.type === "workspace"
-            ? `将删除“${deleteConfirmation.title}”及其全部会话、原始文档和向量索引，此操作不可撤销。`
-            : deleteConfirmation.type === "document"
-              ? `将从知识库删除“${deleteConfirmation.title}”，对应的知识片段和向量索引也会一起删除。`
-              : `确定删除“${deleteConfirmation.title}”吗？删除后无法恢复。`}
+          确定删除“{deleteConfirmation.title}”吗？删除后无法恢复。
         </p>}
       </Modal>}
     </div>

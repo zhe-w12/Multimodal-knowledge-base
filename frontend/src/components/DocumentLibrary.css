@@ -71,6 +71,7 @@
   color: #6879b7;
 }
 .document-library-name {
+  display: grid;
   min-width: 0;
   flex: 1;
   overflow: hidden;
@@ -78,6 +79,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.document-library-name small { overflow: hidden; color: #92909c; font-size: 11px; text-overflow: ellipsis; }
 .document-library-actions {
   display: flex;
   align-items: center;

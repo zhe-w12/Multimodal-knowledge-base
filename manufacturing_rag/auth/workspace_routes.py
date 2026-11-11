@@ -139,6 +139,17 @@ def list_members(workspace_id: str, request: Request) -> dict[str, Any]:
     return {"members": members}
 
 
+@router.get("/{workspace_id}/users/search")
+def find_member_candidate(workspace_id: str, username: str, request: Request) -> dict[str, Any]:
+    principal = _required_principal(request)
+    user = _run(
+        lambda: _workspace_store(request).find_workspace_member_candidate(
+            principal.user["id"], workspace_id, username
+        )
+    )
+    return {"user": user}
+
+
 @router.put("/{workspace_id}/members/{target_user_id}")
 def set_member_role(
     workspace_id: str,
@@ -159,6 +170,17 @@ def list_workspace_departments(workspace_id: str, request: Request) -> dict[str,
     principal = _required_principal(request)
     departments = _run(
         lambda: _workspace_store(request).list_department_grants(principal.user["id"], workspace_id)
+    )
+    return {"departments": departments}
+
+
+@router.get("/{workspace_id}/department-options")
+def list_workspace_department_options(workspace_id: str, request: Request) -> dict[str, Any]:
+    principal = _required_principal(request)
+    departments = _run(
+        lambda: _workspace_store(request).list_workspace_department_options(
+            principal.user["id"], workspace_id
+        )
     )
     return {"departments": departments}
 

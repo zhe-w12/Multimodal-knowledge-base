@@ -116,6 +116,48 @@ def test_any_active_user_can_create_an_authorized_workspace(monkeypatch):
         store.engine.dispose()
 
 
+def test_workspace_manager_can_find_only_active_user_by_exact_username(monkeypatch):
+    (
+        _app,
+        store,
+        owner,
+        _owner_id,
+        _owner_csrf,
+        reader,
+        reader_id,
+        _reader_csrf,
+        _other_id,
+        _admin_client,
+        _admin_csrf,
+    ) = _setup(monkeypatch)
+    try:
+        created = owner.post(
+            "/api/workspaces",
+            headers=_headers(_owner_csrf),
+            json={"name": "成员查询测试区"},
+        )
+        workspace_id = created.json()["id"]
+
+        found = owner.get(
+            f"/api/workspaces/{workspace_id}/users/search",
+            params={"username": "WORKSPACE_READER"},
+        )
+        assert found.status_code == 200
+        assert found.json()["user"] == {
+            "user_id": reader_id,
+            "username": "workspace_reader",
+            "display_name": "workspace_reader",
+            "department_id": None,
+        }
+        denied = reader.get(
+            f"/api/workspaces/{workspace_id}/users/search",
+            params={"username": "workspace_other"},
+        )
+        assert denied.status_code == 403
+    finally:
+        store.engine.dispose()
+
+
 def test_department_grants_are_read_only_and_direct_block_overrides_them(monkeypatch):
     (
         _app,

@@ -351,6 +351,37 @@ class WorkspaceStore:
             return result
 
     @_database_operation
+    def find_workspace_member_candidate(
+        self,
+        actor_user_id: str,
+        workspace_id: str,
+        username: str,
+    ) -> dict[str, Any] | None:
+        normalized_username = username.strip().casefold()
+        if not normalized_username:
+            raise ValueError("请输入准确账号")
+        self.auth.ensure_schema()
+        with self.auth.Session() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id)
+            self._require_access(db, actor, workspace, manage=True)
+            self._require_active_authorized(workspace)
+            user = db.scalar(
+                select(User).where(
+                    User.username == normalized_username,
+                    User.status == "active",
+                )
+            )
+            if user is None:
+                return None
+            return {
+                "user_id": user.id,
+                "username": user.username,
+                "display_name": user.display_name,
+                "department_id": user.department_id,
+            }
+
+    @_database_operation
     def _active_admin_ids(self, db, workspace: Workspace) -> set[str]:
         admin_ids = set(
             db.scalars(
@@ -467,6 +498,31 @@ class WorkspaceStore:
                     "is_active": department.is_active,
                 }
                 for _grant, department in rows
+            ]
+
+    @_database_operation
+    def list_workspace_department_options(self, actor_user_id: str, workspace_id: str) -> list[dict[str, Any]]:
+        self.auth.ensure_schema()
+        with self.auth.Session() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id)
+            self._require_access(db, actor, workspace, manage=True)
+            grants = set(
+                db.scalars(
+                    select(DepartmentWorkspaceGrant.department_id).where(
+                        DepartmentWorkspaceGrant.workspace_id == workspace.id
+                    )
+                ).all()
+            )
+            departments = db.scalars(select(Department).order_by(Department.name)).all()
+            return [
+                {
+                    "department_id": department.id,
+                    "name": department.name,
+                    "is_active": department.is_active,
+                    "enabled": department.id in grants,
+                }
+                for department in departments
             ]
 
     @_database_operation

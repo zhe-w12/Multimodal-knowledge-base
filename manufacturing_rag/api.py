@@ -340,6 +340,7 @@ class VectorIngestRequest(BaseModel):
     """Vector synchronization mode sent after a knowledge-base upload."""
 
     mode: str = Field("append", description="append or replace; append preserves existing remote rows")
+    workspace_id: Optional[str] = Field(None, min_length=1, max_length=128)
 
 
 class VectorSearchRequest(BaseModel):
@@ -1517,7 +1518,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         def denied(status_code: int, detail: str) -> JSONResponse:
             return JSONResponse(status_code=status_code, content={"detail": detail})
 
-        global_admin_paths = {"/vector/status", "/vector/collection", "/vector/ingest"}
+        global_admin_paths = {"/vector/status", "/vector/collection"}
         is_legacy_workspace_delete = request.method == "DELETE" and path.startswith("/workspaces/")
         if path in global_admin_paths or is_legacy_workspace_delete:
             if not is_platform_admin:
@@ -1567,6 +1568,32 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 return denied(503, "账号或工作区权限服务暂不可用")
             request.state.auth_workspace_scope = {**resolved, "scope": scope}
             request.state.auth_requested_workspace_id = workspace_id
+        elif path == "/vector/ingest":
+            workspace_id = str(payload.get("workspace_id") or "").strip()
+            mode = str(payload.get("mode") or "append").strip().lower()
+            if mode == "replace":
+                if workspace_id:
+                    return denied(422, "向量索引替换仅支持平台级操作")
+                if not is_platform_admin:
+                    return denied(403, "全量重建向量索引需要平台管理员权限")
+            elif workspace_id:
+                try:
+                    access = await run_in_threadpool(
+                        workspace_store.get_workspace,
+                        principal.user["id"],
+                        workspace_id,
+                    )
+                except WorkspaceNotFound as exc:
+                    return denied(404, str(exc))
+                except WorkspaceForbidden as exc:
+                    return denied(403, str(exc))
+                except AuthServiceUnavailable:
+                    return denied(503, "账号或工作区权限服务暂不可用")
+                if not access.get("can_manage_content"):
+                    return denied(403, "需要本工作区管理权限")
+                request.state.auth_workspace_id = workspace_id
+            elif not is_platform_admin:
+                return denied(403, "全库向量同步需要平台管理员权限")
         elif path in global_admin_paths or is_legacy_workspace_delete:
             # The platform administrator may run global maintenance operations.
             pass
@@ -2143,16 +2170,18 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     @app.post("/vector/ingest")
     def ingest_vector_collection(request: VectorIngestRequest = VectorIngestRequest()) -> Dict[str, Any]:
         normalized_mode = validate_mode(request.mode)
+        if normalized_mode == "replace" and request.workspace_id:
+            raise HTTPException(status_code=422, detail="向量索引替换仅支持平台级操作")
+        chunks = kb_state.chunks_snapshot(request.workspace_id) if request.workspace_id else kb_state.chunks_snapshot()
         if config.vector_store_provider == "memory":
             return {
                 "status": "ok",
-                "inserted": kb_state.chunk_count,
+                "inserted": len(chunks),
                 "collection_name": "in_memory_hybrid_index",
                 "mode": normalized_mode,
                 "provider": "memory",
             }
         try:
-            chunks = kb_state.chunks_snapshot()
             store = MilvusVectorStore(config=config)
             if normalized_mode == "replace":
                 log_chunks_for_ingest(config, "vector_replace_payload", chunks, mode=normalized_mode)

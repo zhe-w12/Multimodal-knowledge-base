@@ -16,6 +16,7 @@ from manufacturing_rag.auth.store import (
     CurrentPasswordIncorrect,
     InvalidCredentials,
     InvalidInvitation,
+    LastPlatformAdminError,
     LoginTemporarilyLimited,
     NewPasswordUnchanged,
     PlatformAdminRequired,
@@ -61,6 +62,14 @@ class RegistrationTogglePayload(StrictPayload):
 class ClearLoginLimitPayload(StrictPayload):
     username: str = Field(min_length=1, max_length=128)
     confirm: bool
+
+
+class PlatformRolePayload(StrictPayload):
+    platform_role: str = Field(pattern="^(user|platform_admin)$")
+
+
+class UserStatusPayload(StrictPayload):
+    status: str = Field(pattern="^(active|suspended)$")
 
 
 def _auth_store(request: Request) -> AuthStore:
@@ -178,6 +187,14 @@ def get_session(request: Request, response: Response) -> dict[str, Any]:
         "csrf_token": principal.csrf_token,
         "workspaces": workspaces,
     }
+
+
+@router.get("/registration")
+def registration_status(request: Request) -> dict[str, Any]:
+    try:
+        return _auth_store(request).registration_status()
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
 
 
 @router.post("/register", status_code=201)
@@ -351,3 +368,82 @@ def clear_login_limits(payload: ClearLoginLimitPayload, request: Request) -> dic
     except AuthServiceUnavailable as exc:
         raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
     return {"removed_bucket_count": removed_count}
+
+
+@router.get("/admin/users")
+def list_platform_users(request: Request, q: str = "", limit: int = 100) -> dict[str, Any]:
+    store = _auth_store(request)
+    principal = _principal(request, store)
+    assert principal is not None
+    _require_platform_admin(principal)
+    try:
+        return {"users": store.list_users(principal.user["id"], q, limit)}
+    except PlatformAdminRequired as exc:
+        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
+
+
+@router.patch("/admin/users/{target_user_id}/platform-role")
+def change_platform_role(
+    target_user_id: str,
+    payload: PlatformRolePayload,
+    request: Request,
+) -> dict[str, Any]:
+    _require_browser_request(request)
+    store = _auth_store(request)
+    principal = _principal(request, store)
+    assert principal is not None
+    _require_csrf(request, principal)
+    _require_platform_admin(principal)
+    try:
+        return store.set_platform_role(principal.user["id"], target_user_id, payload.platform_role)
+    except PlatformAdminRequired as exc:
+        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
+    except LastPlatformAdminError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
+
+
+@router.patch("/admin/users/{target_user_id}/status")
+def change_user_status(
+    target_user_id: str,
+    payload: UserStatusPayload,
+    request: Request,
+) -> dict[str, Any]:
+    _require_browser_request(request)
+    store = _auth_store(request)
+    principal = _principal(request, store)
+    assert principal is not None
+    _require_csrf(request, principal)
+    _require_platform_admin(principal)
+    try:
+        return store.set_user_status(principal.user["id"], target_user_id, payload.status)
+    except PlatformAdminRequired as exc:
+        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
+    except LastPlatformAdminError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
+
+
+@router.post("/admin/users/{target_user_id}/sessions/revoke")
+def revoke_user_sessions(target_user_id: str, request: Request) -> dict[str, bool]:
+    _require_browser_request(request)
+    store = _auth_store(request)
+    principal = _principal(request, store)
+    assert principal is not None
+    _require_csrf(request, principal)
+    _require_platform_admin(principal)
+    try:
+        store.revoke_all_sessions(target_user_id, principal.user["id"], action="admin_revoke_sessions")
+        return {"ok": True}
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc

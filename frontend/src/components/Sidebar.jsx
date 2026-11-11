@@ -6,7 +6,7 @@ import Drawer from "antd/es/drawer";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
 import Tooltip from "antd/es/tooltip";
-import { MessageSquare, MoreHorizontal, FolderOpen, PanelLeftClose, PanelLeftOpen, Pencil, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
+import { MessageSquare, MoreHorizontal, FolderOpen, PanelLeftClose, PanelLeftOpen, Pencil, Search, Settings2, SquarePen, Trash2, X, Shield, UserRound } from "lucide-react";
 import styles from "./Sidebar.module.css";
 
 const iconProps = { size: 18, strokeWidth: 1.75, "aria-hidden": true };
@@ -25,7 +25,7 @@ const sidebarTheme = {
 
 const normalize = (value) => String(value || "").normalize("NFKC").toLocaleLowerCase();
 
-export default function Sidebar({ conversations, activeId, busy, collapsed, onToggleCollapsed, mobileOpen, onCloseMobile, onNewChat, onSelectConversation, onRenameConversation, onDeleteConversation, activeWorkspaceId, onOpenSettings, onOpenDocuments }) {
+export default function Sidebar({ conversations, activeId, busy, collapsed, onToggleCollapsed, mobileOpen, onCloseMobile, onNewChat, onSelectConversation, onRenameConversation, onDeleteConversation, activeWorkspaceId, onOpenSettings, onOpenDocuments, onOpenAdmin, onOpenAccount, canManageWorkspace }) {
   const [mobile, setMobile] = useState(() => window.matchMedia("(max-width: 700px)").matches);
   const [renaming, setRenaming] = useState(null);
   const [renameValue, setRenameValue] = useState("");
@@ -171,6 +171,12 @@ export default function Sidebar({ conversations, activeId, busy, collapsed, onTo
     </nav>}
 
     <div className={styles.footer}>
+      {canManageWorkspace && <Tooltip title={rail ? "管理工作区" : null} placement="right">
+        <Button type="text" className={styles.action} onClick={onOpenAdmin} aria-label="管理工作区" icon={<Shield {...iconProps} />}>{!rail && "管理工作区"}</Button>
+      </Tooltip>}
+      <Tooltip title={rail ? "我的账号" : null} placement="right">
+        <Button type="text" className={styles.action} onClick={onOpenAccount} aria-label="我的账号" icon={<UserRound {...iconProps} />}>{!rail && "我的账号"}</Button>
+      </Tooltip>
       <Tooltip title={rail ? "服务设置" : null} placement="right">
         <Button type="text" className={styles.action} onClick={onOpenSettings} aria-label="服务设置" icon={<Settings2 {...iconProps} />}>{!rail && "服务设置"}</Button>
       </Tooltip>

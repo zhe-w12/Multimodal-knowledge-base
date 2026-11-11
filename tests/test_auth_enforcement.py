@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi.testclient import TestClient
 
-from manufacturing_rag.api import create_app
+from manufacturing_rag.api import DEFAULT_CONFIG, create_app
 from manufacturing_rag.auth.store import AuthStore
 
 
@@ -43,11 +45,12 @@ def test_legacy_data_routes_require_session_and_workspace_permission(monkeypatch
     monkeypatch.setenv("AUTH_ALLOWED_ORIGINS", ORIGIN)
     monkeypatch.setenv("RAG_CORS_ORIGINS", ORIGIN)
     monkeypatch.setenv("RAG_AUTH_ENFORCEMENT_ENABLED", "true")
-    app = create_app()
+    app = create_app(config=replace(DEFAULT_CONFIG, vector_store_provider="memory"))
     store = AuthStore("sqlite://", b"p" * 32)
     app.state.auth_store = store
     try:
         admin = store.create_initial_platform_admin("admin", ADMIN_PASSWORD)
+        platform_admin, _admin_id, admin_csrf = _login(app, "admin", ADMIN_PASSWORD)
         invite, _status = store.reset_invitation(admin["id"])
         store.set_registration_enabled(admin["id"], True)
         bootstrap_client = TestClient(app)
@@ -126,5 +129,33 @@ def test_legacy_data_routes_require_session_and_workspace_permission(monkeypatch
             json={"chunks": [], "mode": "append", "workspace_id": workspace_id},
         )
         assert allowed_owner_write.status_code == 200
+
+        scoped_vector_sync = owner.post(
+            "/vector/ingest",
+            headers=_headers(owner_csrf),
+            json={"mode": "append", "workspace_id": workspace_id},
+        )
+        assert scoped_vector_sync.status_code == 200
+
+        denied_reader_vector_sync = reader.post(
+            "/vector/ingest",
+            headers=_headers(reader_csrf),
+            json={"mode": "append", "workspace_id": workspace_id},
+        )
+        assert denied_reader_vector_sync.status_code == 403
+
+        denied_global_vector_sync = owner.post(
+            "/vector/ingest",
+            headers=_headers(owner_csrf),
+            json={"mode": "append"},
+        )
+        assert denied_global_vector_sync.status_code == 403
+
+        allowed_platform_vector_sync = platform_admin.post(
+            "/vector/ingest",
+            headers=_headers(admin_csrf),
+            json={"mode": "append"},
+        )
+        assert allowed_platform_vector_sync.status_code == 200
     finally:
         store.engine.dispose()

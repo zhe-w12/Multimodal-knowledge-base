@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from manufacturing_rag.auth.store import AuthStore
+from manufacturing_rag.auth.store import AuthStore, LastPlatformAdminError
 from manufacturing_rag.api import create_app
 
 
@@ -88,6 +88,55 @@ def test_register_login_session_and_password_change(auth_client):
     assert login.status_code == 200
     assert login.json()["user"]["id"] == registration.json()["user"]["id"]
     assert store.current_principal(client.cookies.get("kujie_session")) is not None
+
+
+def test_platform_user_controls_and_public_registration_status(auth_client):
+    client, store = auth_client
+    admin, invite = bootstrap_admin(store)
+    assert client.get("/api/auth/registration").json() == {
+        "configured": True,
+        "registration_enabled": True,
+    }
+    registered = client.post(
+        "/api/auth/register",
+        headers=browser_headers(),
+        json={"username": "managee", "password": USER_PASSWORD, "invite_code": invite},
+    )
+    assert registered.status_code == 201
+    user_id = registered.json()["user"]["id"]
+
+    admin_client = TestClient(client.app)
+    admin_login = admin_client.post(
+        "/api/auth/login",
+        headers=browser_headers(),
+        json={"username": "admin", "password": ADMIN_PASSWORD},
+    )
+    assert admin_login.status_code == 200
+    csrf = admin_login.json()["csrf_token"]
+
+    listed = admin_client.get("/api/auth/admin/users?q=managee")
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["users"]] == [user_id]
+    assert "password_hash" not in listed.json()["users"][0]
+    assert client.get("/api/auth/admin/users").status_code == 403
+
+    promoted = admin_client.patch(
+        f"/api/auth/admin/users/{user_id}/platform-role",
+        headers=browser_headers(csrf),
+        json={"platform_role": "platform_admin"},
+    )
+    assert promoted.status_code == 200
+    assert client.get("/api/auth/session").json()["authenticated"] is False
+    disabled = admin_client.patch(
+        f"/api/auth/admin/users/{user_id}/status",
+        headers=browser_headers(csrf),
+        json={"status": "suspended"},
+    )
+    assert disabled.status_code == 200
+    assert client.get("/api/auth/session").json()["authenticated"] is False
+
+    with pytest.raises(LastPlatformAdminError, match="至少保留一名启用的平台管理员"):
+        store.set_platform_role(admin["id"], admin["id"], "user")
 
 
 def test_invite_reset_is_single_display_and_admin_only(auth_client):

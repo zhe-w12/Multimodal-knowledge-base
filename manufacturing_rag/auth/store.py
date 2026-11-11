@@ -96,6 +96,10 @@ class PlatformAdminRequired(RuntimeError):
     pass
 
 
+class LastPlatformAdminError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class Principal:
     user: dict[str, Any]
@@ -723,6 +727,127 @@ class AuthStore:
         if not user or user.status != "active" or user.platform_role != "platform_admin":
             raise PlatformAdminRequired("需要平台管理员权限")
         return user
+
+    def registration_status(self) -> dict[str, Any]:
+        self.ensure_schema()
+        try:
+            with self.Session() as db:
+                settings = db.get(RegistrationSettings, 1)
+                return {
+                    "configured": bool(settings and settings.invite_digest),
+                    "registration_enabled": bool(settings and settings.registration_enabled),
+                }
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
+
+    def list_users(self, actor_user_id: str, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        term = query.strip().casefold()
+        bounded_limit = min(max(int(limit), 1), 100)
+        try:
+            with self.Session() as db:
+                actor = db.get(User, actor_user_id)
+                if not actor or actor.status != "active" or actor.platform_role != "platform_admin":
+                    raise PlatformAdminRequired("需要平台管理员权限")
+                statement = select(User).order_by(User.username).limit(bounded_limit)
+                if term:
+                    escaped_term = term.replace("%", "\\%").replace("_", "\\_")
+                    pattern = f"%{escaped_term}%"
+                    statement = statement.where(
+                        User.username.ilike(pattern, escape="\\")
+                        | User.display_name.ilike(pattern, escape="\\")
+                    )
+                return [self.public_user(user) for user in db.scalars(statement).all()]
+        except PlatformAdminRequired:
+            raise
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
+
+    def set_platform_role(self, actor_user_id: str, target_user_id: str, role: str) -> dict[str, Any]:
+        if role not in {"user", "platform_admin"}:
+            raise ValueError("平台角色无效")
+        self.ensure_schema()
+        try:
+            with self.Session.begin() as db:
+                actor = self._require_platform_admin(db, actor_user_id)
+                target = db.get(User, target_user_id, with_for_update=True)
+                if target is None:
+                    raise ValueError("用户不存在")
+                if role == "platform_admin" and target.status != "active":
+                    raise ValueError("只能将启用账号设为平台管理员")
+                removing_active_admin = target.status == "active" and target.platform_role == "platform_admin" and role != "platform_admin"
+                if removing_active_admin:
+                    active_admin_ids = db.scalars(
+                        select(User.id)
+                        .where(User.status == "active", User.platform_role == "platform_admin")
+                        .with_for_update()
+                    ).all()
+                    if len(active_admin_ids) <= 1:
+                        raise LastPlatformAdminError("至少保留一名启用的平台管理员")
+                old_role = target.platform_role
+                target.platform_role = role
+                target.permissions_version += 1
+                if old_role != role:
+                    db.execute(
+                        AuthSession.__table__.update()
+                        .where(AuthSession.user_id == target.id, AuthSession.revoked_at.is_(None))
+                        .values(revoked_at=utcnow())
+                    )
+                self._audit(
+                    db,
+                    actor.id,
+                    "platform_role_changed",
+                    "user",
+                    target.id,
+                    {"old_role": old_role, "new_role": role},
+                )
+                return self.public_user(target)
+        except (PlatformAdminRequired, LastPlatformAdminError, ValueError):
+            raise
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
+
+    def set_user_status(self, actor_user_id: str, target_user_id: str, status: str) -> dict[str, Any]:
+        if status not in {"active", "suspended"}:
+            raise ValueError("账号状态无效")
+        self.ensure_schema()
+        try:
+            with self.Session.begin() as db:
+                actor = self._require_platform_admin(db, actor_user_id)
+                target = db.get(User, target_user_id, with_for_update=True)
+                if target is None:
+                    raise ValueError("用户不存在")
+                removing_active_admin = target.status == "active" and target.platform_role == "platform_admin" and status != "active"
+                if removing_active_admin:
+                    active_admin_ids = db.scalars(
+                        select(User.id)
+                        .where(User.status == "active", User.platform_role == "platform_admin")
+                        .with_for_update()
+                    ).all()
+                    if len(active_admin_ids) <= 1:
+                        raise LastPlatformAdminError("至少保留一名启用的平台管理员")
+                old_status = target.status
+                target.status = status
+                target.permissions_version += 1
+                if status != "active":
+                    db.execute(
+                        AuthSession.__table__.update()
+                        .where(AuthSession.user_id == target.id, AuthSession.revoked_at.is_(None))
+                        .values(revoked_at=utcnow())
+                    )
+                self._audit(
+                    db,
+                    actor.id,
+                    "user_status_changed",
+                    "user",
+                    target.id,
+                    {"old_status": old_status, "new_status": status},
+                )
+                return self.public_user(target)
+        except (PlatformAdminRequired, LastPlatformAdminError, ValueError):
+            raise
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
 
     def invitation_status(self, actor_user_id: str) -> dict[str, Any]:
         self.ensure_schema()
