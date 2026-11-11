@@ -721,17 +721,20 @@ function App() {
       }
       if (failure) throw new Error(failure);
       cancelQueuedAnswerUpdate();
-      if (!answer.trim()) throw new Error("没有收到有效回答，请重试。");
+      if (!answer.trim()) throw new Error("回答连接中断，请重新发送。");
       apply({ text: answer, ...metadata, pending: false, status: "" });
       setStatus({ kind: "idle", text: "" });
     } catch (error) {
       cancelQueuedAnswerUpdate();
       if (error?.name !== "AbortError" && conversationId) {
+        const errorText = error.message === "回答连接中断，请重新发送。"
+          ? error.message
+          : `暂时无法完成回答：${error.message}`;
         updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
-          ? { ...message, text: `暂时无法完成回答：${error.message}`, error: true, pending: false }
+          ? { ...message, text: errorText, error: true, pending: false }
           : message,
         ));
-        setStatus({ kind: "error", text: error.message });
+        setStatus({ kind: "idle", text: "" });
       } else if (error?.name !== "AbortError") {
         setStatus({ kind: "error", text: error.message || "无法创建对话" });
       }
