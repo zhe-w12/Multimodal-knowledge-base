@@ -894,7 +894,7 @@ function App() {
               <UploadProgress progress={uploadProgress} />
             </div>
           )}
-          {status.text && !uploadProgress && <div className={`inline-status ${status.kind}`}><span>{status.kind === "working" ? "◌" : status.kind === "error" ? "!" : "✓"}</span>{status.text}</div>}
+          {status.text && status.kind !== "working" && !uploadProgress && <div className={`inline-status ${status.kind}`}><span>{status.kind === "error" ? "!" : "✓"}</span>{status.text}</div>}
           <Sender
             ref={textInput}
             className="chat-sender"
@@ -1087,9 +1087,10 @@ function makeBubbleItem(message) {
     shape: isUser ? "round" : "default",
     styles: { content: { background: isUser ? "#f0eafd" : "#fff", border: isUser ? "none" : "1px solid #e7e2ed", paddingInline: 18, paddingBlock: isUser ? 10 : 14, borderRadius: isUser ? 999 : 20, fontSize: 16, lineHeight: isUser ? 1.6 : 1.85 } },
     avatar: isUser ? undefined : <div className="message-avatar assistant-avatar"><span className="brand-symbol"><i /><i /><i /></span></div>,
-    header: message.pending ? <div className="message-author"><span className="pending-label"><i />{message.status || "正在处理，请稍候…"}</span></div> : null,
-    content: <MessageContent message={message} />,
-    loading: Boolean(message.pending && !message.text),
+    content: <>
+      {message.pending && <div className="message-author"><span className="pending-label"><i />{message.status || "正在处理，请稍候…"}</span></div>}
+      <MessageContent message={message} />
+    </>,    loading: Boolean(message.pending && !message.text),
     streaming: Boolean(message.pending),
   };
 }
