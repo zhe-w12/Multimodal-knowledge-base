@@ -50,8 +50,11 @@ docker-compose.yml
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+python scripts/install_nltk_data.py
 Copy-Item .env.example .env
 ```
+
+安装 NLTK 的 `punkt_tab` 和英文词性标注数据，供 Unstructured 解析 Word、PowerPoint 等 Office 文档使用，避免首次解析时尝试从受限的运行时地址下载。
 
 在 `.env` 中分别设置新的 `DEEPSEEK_API_KEY`、`BAILIAN_API_KEY` 和 `BAILIAN_WORKSPACE_ID`。若已有旧 `.env`，将 `.env.example` 中模型配置段合并到本地文件；不要把密钥写入或提交到代码仓库。离线开发可临时使用：
 
