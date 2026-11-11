@@ -1090,7 +1090,8 @@ function makeBubbleItem(message) {
     content: <>
       {message.pending && <div className="message-author"><span className="pending-label"><i />{message.status || "正在处理，请稍候…"}</span></div>}
       <MessageContent message={message} />
-    </>,    loading: Boolean(message.pending && !message.text),
+    </>,
+    loading: Boolean(message.pending && !message.text),
     streaming: Boolean(message.pending),
   };
 }
