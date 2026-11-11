@@ -6,7 +6,7 @@ import Modal from "antd/es/modal";
 import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
-import { Archive, ArrowLeft, Building2, FileText, RefreshCw, Search, Shield, Users } from "lucide-react";
+import { Archive, ArrowLeft, Building2, ClipboardList, FileText, RefreshCw, Search, Shield, Users } from "lucide-react";
 import { apiFetch, apiResponse } from "../api.js";
 import "./AdminPortal.css";
 
@@ -22,6 +22,105 @@ function permissionLabel(access) {
   if (access?.can_manage) return "可管理、可检索";
   if (access?.can_read) return "可检索";
   return "无权限";
+}
+
+const AUDIT_ACTION_LABELS = {
+  platform_admin_bootstrapped: "初始化平台管理员",
+  login_succeeded: "登录",
+  logout: "退出登录",
+  admin_revoke_sessions: "管理员撤销登录会话",
+  account_registered: "注册账号",
+  password_changed: "修改密码",
+  platform_role_changed: "调整平台身份",
+  user_status_changed: "调整账号状态",
+  registration_invitation_reset: "重置邀请码",
+  registration_enabled: "开放注册",
+  registration_disabled: "关闭注册",
+  login_limits_cleared: "解除登录限流",
+  workspace_document_ingested: "上传资料",
+  workspace_documents_updated: "更新资料内容",
+  workspace_document_deleted: "删除资料",
+  workspace_created: "创建工作区",
+  workspace_updated: "修改工作区设置",
+  workspace_member_changed: "调整成员权限",
+  workspace_department_grant_changed: "调整部门工作区授权",
+  workspace_owner_transferred: "转交工作区负责人",
+  workspace_archived: "归档工作区",
+  workspace_restored: "恢复工作区",
+  department_created: "创建部门",
+  department_updated: "修改部门",
+  user_department_changed: "调整用户部门",
+};
+
+const AUDIT_TARGET_LABELS = {
+  workspace: "工作区",
+  department: "部门",
+  registration: "全局注册设置",
+  user: "账号",
+  session: "登录会话",
+  account_rate_limit: "登录限流",
+  index: "向量索引",
+};
+
+const AUDIT_DETAIL_LABELS = {
+  name: "名称",
+  old_role: "原角色",
+  new_role: "新角色",
+  old_status: "原状态",
+  new_status: "新状态",
+  enabled: "已启用",
+  old_owner_user_id: "原负责人账号 ID",
+  new_owner_user_id: "新负责人账号 ID",
+  target_user_id: "成员账号 ID",
+  department_id: "部门 ID",
+  old_department_id: "原部门 ID",
+  new_department_id: "新部门 ID",
+  is_active: "部门启用",
+  version: "版本",
+  removed_bucket_count: "清除的限流记录数",
+  source: "资料",
+  mode: "更新方式",
+  chunk_count: "片段数",
+};
+
+function auditDetails(details) {
+  if (!details || !Object.keys(details).length) return "";
+  return Object.entries(details).map(([key, value]) => {
+    const label = AUDIT_DETAIL_LABELS[key] || key;
+    const text = value === null ? "无" : typeof value === "boolean" ? (value ? "是" : "否") : String(value);
+    return `${label}：${text}`;
+  }).join("；");
+}
+
+function AuditPanel({ title, entries, total, page, onPageChange, onRefresh, loading, error }) {
+  const pageSize = 50;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const start = total ? page * pageSize + 1 : 0;
+  const end = Math.min((page + 1) * pageSize, total);
+  return <section className="admin-card admin-audit">
+    <div className="admin-card-heading">
+      <div><h2>{title}</h2><p>记录账号、授权与工作区管理操作。</p></div>
+      <Button type="text" icon={<RefreshCw size={15} />} onClick={onRefresh}>刷新</Button>
+    </div>
+    {error && <div className="admin-error" role="alert">{error}</div>}
+    {loading ? <div className="admin-loading">正在读取操作记录…</div> : entries.length ? <div className="admin-audit-list">
+      {entries.map((entry) => <article className="admin-audit-entry" key={entry.id}>
+        <div className="admin-audit-entry-heading">
+          <strong>{AUDIT_ACTION_LABELS[entry.action] || entry.action}</strong>
+          <time dateTime={entry.created_at}>{new Date(entry.created_at).toLocaleString("zh-CN")}</time>
+        </div>
+        <div className="admin-audit-entry-meta">{entry.actor_username || "未知操作者"} · {entry.target_username || AUDIT_TARGET_LABELS[entry.target_type] || entry.target_type}{entry.target_id ? " · " + entry.target_id : ""}</div>
+        {auditDetails(entry.details) && <p>{auditDetails(entry.details)}</p>}
+      </article>)}
+    </div> : <div className="admin-inline-empty">暂无操作记录。</div>}
+    <div className="admin-audit-pagination">
+      <span>{total ? `显示 ${start}–${end} 条，共 ${total} 条` : "共 0 条"}</span>
+      <div>
+        <Button size="small" disabled={loading || page <= 0} onClick={() => onPageChange(page - 1)}>上一页</Button>
+        <Button size="small" disabled={loading || page + 1 >= pageCount} onClick={() => onPageChange(page + 1)}>下一页</Button>
+      </div>
+    </div>
+  </section>;
 }
 
 export default function AdminPortal({
@@ -65,6 +164,12 @@ export default function AdminPortal({
   const [platformSaving, setPlatformSaving] = useState(false);
   const [departmentPreview, setDepartmentPreview] = useState(null);
   const [ownerTargetUserId, setOwnerTargetUserId] = useState("");
+  const [auditEntries, setAuditEntries] = useState([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditPage, setAuditPage] = useState(0);
+  const [auditReload, setAuditReload] = useState(0);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState("");
 
   const platformAdmin = user?.platform_role === "platform_admin";
   const manageableWorkspaces = useMemo(
@@ -149,6 +254,36 @@ export default function AdminPortal({
     void loadPlatformData();
     return () => { cancelled = true; };
   }, [apiBase, platformAdmin, section, userQuery]);
+
+  useEffect(() => {
+    const platformAudit = section === "platform" && platformAdmin;
+    const workspaceAudit = section === "workspace" && workspaceTab === "audit" && Boolean(workspace);
+    if (!platformAudit && !workspaceAudit) return undefined;
+    let cancelled = false;
+    async function loadAudit() {
+      setAuditLoading(true);
+      setAuditError("");
+      try {
+        const path = platformAudit
+          ? "/api/auth/admin/audit"
+          : `/api/workspaces/${encodeURIComponent(workspace.id)}/audit`;
+        const result = await apiFetch(url(apiBase, `${path}?limit=50&offset=${auditPage * 50}`)).then(apiResponse);
+        if (cancelled) return;
+        setAuditEntries(Array.isArray(result.entries) ? result.entries : []);
+        setAuditTotal(Number(result.total) || 0);
+      } catch (error) {
+        if (!cancelled) setAuditError(apiError(error, "读取操作记录失败。"));
+      } finally {
+        if (!cancelled) setAuditLoading(false);
+      }
+    }
+    void loadAudit();
+    return () => { cancelled = true; };
+  }, [apiBase, section, platformAdmin, workspaceTab, workspace?.id, auditPage, auditReload]);
+
+  useEffect(() => {
+    setAuditPage(0);
+  }, [section, workspace?.id]);
 
   async function runWrite(path, method, body, fallback) {
     setPlatformError("");
@@ -423,6 +558,7 @@ export default function AdminPortal({
   const workspaceTabs = [
     ...(workspace?.status === "active" ? [{ key: "documents", label: "资料管理", icon: <FileText size={16} /> }] : []),
     ...(workspace?.status === "active" && workspace?.workspace_type === "authorized" ? [{ key: "members", label: "成员与部门", icon: <Users size={16} /> }] : []),
+    { key: "audit", label: "操作记录", icon: <ClipboardList size={16} /> },
     { key: "settings", label: "工作区设置", icon: <Building2 size={16} /> },
   ];
 
@@ -477,7 +613,16 @@ export default function AdminPortal({
             {documentJob && <div className="admin-job-status" role="status">{documentJob.phase || documentJob.status} {documentJob.progress ? `· ${documentJob.progress}%` : ""}{documentJob.error ? ` · ${documentJob.error}` : ""}</div>}
             <Button className="admin-refresh" type="text" icon={<RefreshCw size={15} />} onClick={() => void refreshWorkspace()}>刷新资料</Button>
           </div>
-        </> : workspaceTab === "members" ? <div className="admin-grid">
+        </> : workspaceTab === "audit" ? <AuditPanel
+          title="工作区操作记录"
+          entries={auditEntries}
+          total={auditTotal}
+          page={auditPage}
+          onPageChange={setAuditPage}
+          onRefresh={() => setAuditReload((value) => value + 1)}
+          loading={auditLoading}
+          error={auditError}
+        /> : workspaceTab === "members" ? <div className="admin-grid">
           <section className="admin-card">
             <div className="admin-card-heading"><div><h2>个人授权</h2><p>按准确账号添加启用用户。</p></div></div>
             <div className="admin-member-search"><Input value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} onPressEnter={() => void findMember()} placeholder="输入完整账号" aria-label="查找用户账号" /><Button icon={<Search size={16} />} onClick={() => void findMember()}>查找</Button></div>
@@ -565,6 +710,13 @@ export default function AdminPortal({
       saving={platformSaving}
       error={platformError}
       notice={platformNotice}
+      auditEntries={auditEntries}
+      auditTotal={auditTotal}
+      auditPage={auditPage}
+      onAuditPageChange={setAuditPage}
+      onRefreshAudit={() => setAuditReload((value) => value + 1)}
+      auditLoading={auditLoading}
+      auditError={auditError}
     />}
     <Modal
       title="部门变更权限预览"
@@ -611,6 +763,13 @@ function PlatformPanel({
   saving,
   error,
   notice,
+  auditEntries,
+  auditTotal,
+  auditPage,
+  onAuditPageChange,
+  onRefreshAudit,
+  auditLoading,
+  auditError,
 }) {
   return <div className="admin-platform">
     {error && <div className="admin-error" role="alert">{error}</div>}
@@ -665,5 +824,15 @@ function PlatformPanel({
         </div>}
       </section>
     </div>
+    <AuditPanel
+      title="平台操作记录"
+      entries={auditEntries}
+      total={auditTotal}
+      page={auditPage}
+      onPageChange={onAuditPageChange}
+      onRefresh={onRefreshAudit}
+      loading={auditLoading}
+      error={auditError}
+    />
   </div>;
 }

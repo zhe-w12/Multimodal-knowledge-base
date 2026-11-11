@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from manufacturing_rag.auth.routes import (
@@ -128,6 +128,21 @@ def update_workspace(workspace_id: str, payload: UpdateWorkspacePayload, request
     return _run(
         lambda: _workspace_store(request).update_workspace(
             principal.user["id"], workspace_id, payload.name, payload.description
+        )
+    )
+
+
+@router.get("/{workspace_id}/audit")
+def list_workspace_audit(
+    workspace_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    principal = _required_principal(request)
+    return _run(
+        lambda: _workspace_store(request).list_workspace_audit(
+            principal.user["id"], workspace_id, limit, offset
         )
     )
 

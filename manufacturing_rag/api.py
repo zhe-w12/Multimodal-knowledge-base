@@ -1757,13 +1757,43 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     if FRONTEND_DIR.exists():
         app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
+    def record_audit_event(
+        actor_user_id: str | None,
+        action: str,
+        target_type: str,
+        target_id: str | None,
+        details: Dict[str, Any],
+    ) -> None:
+        if not actor_user_id:
+            return
+        store = getattr(app.state, "auth_store", None)
+        if store is None:
+            return
+        try:
+            store.record_audit_event(actor_user_id, action, target_type, target_id, details)
+        except AuthServiceUnavailable as exc:
+            write_debug_log(
+                config,
+                "auth_audit_write_failed",
+                action=action,
+                target_type=target_type,
+                error_type=type(exc).__name__,
+            )
+
+    def record_request_workspace_audit(http_request: Request, action: str, details: Dict[str, Any]) -> None:
+        principal = getattr(http_request.state, "auth_principal", None)
+        if principal is None:
+            return
+        workspace_id = str(getattr(http_request.state, "auth_workspace_id", DEFAULT_WORKSPACE_ID))
+        record_audit_event(principal.user["id"], action, "workspace", workspace_id, details)
+
     def update_document_delete_job(job_id: str, **updates: Any) -> None:
         with document_delete_jobs_lock:
             job = document_delete_jobs.get(job_id)
             if job is not None:
                 job.update(updates)
 
-    def run_document_delete_job(job_id: str, source: str, workspace_id: str) -> None:
+    def run_document_delete_job(job_id: str, source: str, workspace_id: str, actor_user_id: str | None) -> None:
         update_document_delete_job(status="running", progress=5, phase="正在检查资料索引")
         try:
             chunk_ids = kb_state.document_chunk_ids(source, workspace_id)
@@ -1787,6 +1817,13 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
 
             update_document_delete_job(progress=88, phase="正在从知识库移除资料")
             result = kb_state.delete_document(source, chunk_ids, workspace_id)
+            record_audit_event(
+                actor_user_id,
+                "workspace_document_deleted",
+                "workspace",
+                workspace_id,
+                {"source": source, "removed_chunk_count": result["removed_chunk_count"]},
+            )
             update_document_delete_job(
                 status="completed",
                 progress=100,
@@ -2166,7 +2203,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     if len(document_delete_jobs) < 90:
                         break
             document_delete_jobs[job_id] = job
-        background_tasks.add_task(run_document_delete_job, job_id, source, request.workspace_id)
+        background_tasks.add_task(run_document_delete_job, job_id, source, request.workspace_id, job["created_by_user_id"])
         return dict(job)
 
     @app.get("/kb/documents/delete/{job_id}")
@@ -2182,21 +2219,25 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
         return kb_state.list_chunks(limit=limit, offset=offset, workspace_id=workspace_id)
 
     @app.post("/kb/chunks", response_model=KnowledgeBaseUpdateResponse)
-    def update_kb_chunks(request: KnowledgeBaseReplaceRequest) -> KnowledgeBaseUpdateResponse:
-        return kb_state.update_chunks(request.chunks, mode=request.mode, workspace_id=request.workspace_id)
+    def update_kb_chunks(request: KnowledgeBaseReplaceRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
+        result = kb_state.update_chunks(request.chunks, mode=request.mode, workspace_id=request.workspace_id)
+        record_request_workspace_audit(http_request, "workspace_documents_updated", {"mode": result.mode, "chunk_count": result.chunk_count})
+        return result
 
     @app.post("/kb/jsonl", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_jsonl(request: JsonlIngestRequest) -> KnowledgeBaseUpdateResponse:
-        return kb_state.ingest_jsonl(
+    def ingest_kb_jsonl(request: JsonlIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
+        result = kb_state.ingest_jsonl(
             request.content,
             mode=request.mode,
             source_name=request.source_name,
             workspace_id=request.workspace_id,
         )
+        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.source_name or "JSONL资料"), "mode": result.mode, "chunk_count": result.chunk_count})
+        return result
 
     @app.post("/kb/pdf", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_pdf(request: PdfIngestRequest) -> KnowledgeBaseUpdateResponse:
-        return kb_state.ingest_pdf(
+    def ingest_kb_pdf(request: PdfIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
+        result = kb_state.ingest_pdf(
             request.filename,
             request.content_base64,
             mode=request.mode,
@@ -2204,20 +2245,24 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             render_dpi=request.render_dpi,
             workspace_id=request.workspace_id,
         )
+        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
+        return result
 
     @app.post("/kb/image-ocr", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_image_ocr(request: ImageOcrIngestRequest) -> KnowledgeBaseUpdateResponse:
-        return kb_state.ingest_image_ocr(
+    def ingest_kb_image_ocr(request: ImageOcrIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
+        result = kb_state.ingest_image_ocr(
             request.filename,
             request.content_base64,
             ocr_text=request.ocr_text,
             mode=request.mode,
             workspace_id=request.workspace_id,
         )
+        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
+        return result
 
     @app.post("/kb/document", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_document(request: DocumentIngestRequest) -> KnowledgeBaseUpdateResponse:
-        return kb_state.ingest_document(
+    def ingest_kb_document(request: DocumentIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
+        result = kb_state.ingest_document(
             request.filename,
             request.content_base64,
             mode=request.mode,
@@ -2225,6 +2270,8 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             render_dpi=request.render_dpi,
             workspace_id=request.workspace_id,
         )
+        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
+        return result
 
     @app.get("/vector/status")
     def vector_status() -> Dict[str, Any]:

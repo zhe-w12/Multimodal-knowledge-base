@@ -29,6 +29,15 @@
 .admin-empty { min-height: 300px; }
 .admin-error { margin: 10px 0; padding: 10px 12px; border: 1px solid #f0d5d2; border-radius: 10px; background: #fff7f6; color: #a3433c; font-size: 13px; line-height: 1.6; }
 .admin-success { margin: 10px 0; padding: 10px 12px; border: 1px solid #cfe8d6; border-radius: 10px; background: #f4fbf6; color: #34734b; font-size: 13px; line-height: 1.6; }
+.admin-audit-list { display: grid; }
+.admin-audit-entry { display: grid; gap: 5px; padding: 12px 0; border-bottom: 1px solid #f0edf3; }
+.admin-audit-entry-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.admin-audit-entry-heading strong { color: #454153; font-size: 13px; font-weight: 630; }
+.admin-audit-entry-heading time, .admin-audit-entry-meta { color: #8d8998; font-size: 11px; }
+.admin-audit-entry p { margin: 0; color: #686477; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.admin-audit-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; color: #8d8998; font-size: 12px; }
+.admin-audit-pagination > div { display: flex; gap: 7px; }
+
 .admin-loading { display: grid; min-height: 150px; place-items: center; color: #888494; font-size: 13px; }
 .admin-refresh { margin-top: 10px; color: #777284; }
 .admin-upload-status, .admin-job-status { margin: 12px 0; padding: 10px 12px; border-radius: 9px; background: #f7f5fb; color: #655c7c; font-size: 12px; }
@@ -86,6 +95,8 @@
   .admin-user-actions { grid-column: 2; flex-wrap: wrap; }
 }
 @media (max-width: 560px) {
+  .admin-audit-entry-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .admin-audit-pagination { align-items: flex-start; flex-direction: column; }
   .admin-portal { width: calc(100% - 28px); padding-top: 20px; }
   .admin-header { align-items: flex-start; }
   .admin-header h1 { font-size: 24px; }

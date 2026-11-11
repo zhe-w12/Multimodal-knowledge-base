@@ -5,7 +5,7 @@ import os
 import threading
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from manufacturing_rag.auth.store import (
@@ -368,6 +368,26 @@ def clear_login_limits(payload: ClearLoginLimitPayload, request: Request) -> dic
     except AuthServiceUnavailable as exc:
         raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
     return {"removed_bucket_count": removed_count}
+
+
+@router.get("/admin/audit")
+def list_platform_audit(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    store = _auth_store(request)
+    principal = _principal(request, store)
+    assert principal is not None
+    _require_platform_admin(principal)
+    try:
+        return store.list_audit_logs(principal.user["id"], limit, offset)
+    except PlatformAdminRequired as exc:
+        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AuthServiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail="账号审计数据暂不可用") from exc
 
 
 @router.get("/admin/users")

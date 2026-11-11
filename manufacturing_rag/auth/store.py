@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, create_engine, delete, event, insert, select
+from sqlalchemy import Column, DateTime, Integer, MetaData, String, Table, and_, create_engine, delete, event, func, insert, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import aliased, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from manufacturing_rag.auth.migrations import MIGRATIONS
@@ -311,6 +311,26 @@ class AuthStore:
                 created_at=utcnow(),
             )
         )
+
+    @staticmethod
+    def serialize_audit_entry(log: AuditLog, actor_username: str | None, target_username: str | None = None) -> dict[str, Any]:
+        try:
+            details = json.loads(log.details or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        visible_target_id = log.target_id if log.target_type in {"workspace", "department", "registration"} else None
+        return {
+            "id": log.id,
+            "action": log.action,
+            "actor_username": actor_username or "服务器初始化",
+            "target_type": log.target_type,
+            "target_id": visible_target_id,
+            "target_username": target_username,
+            "details": details,
+            "created_at": log.created_at.isoformat(),
+        }
 
     def create_initial_platform_admin(self, username: str, password: str) -> dict[str, Any]:
         try:
@@ -742,6 +762,59 @@ class AuthStore:
                 }
         except SQLAlchemyError as exc:
             raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
+
+    def record_audit_event(
+        self,
+        actor_user_id: str,
+        action: str,
+        target_type: str,
+        target_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.ensure_schema()
+        try:
+            with self.Session.begin() as db:
+                actor = db.get(User, actor_user_id)
+                if actor is None:
+                    return
+                self._audit(db, actor.id, action, target_type, target_id, details)
+        except AccountUnavailable:
+            raise
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号审计数据暂不可用") from exc
+
+    def list_audit_logs(self, actor_user_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        bounded_limit = min(max(int(limit), 1), 100)
+        bounded_offset = max(int(offset), 0)
+        self.ensure_schema()
+        actor_alias = aliased(User)
+        target_alias = aliased(User)
+        try:
+            with self.Session() as db:
+                actor = db.get(User, actor_user_id)
+                if not actor or actor.status != "active" or actor.platform_role != "platform_admin":
+                    raise PlatformAdminRequired("需要平台管理员权限")
+                total = int(db.scalar(select(func.count(AuditLog.id))) or 0)
+                rows = db.execute(
+                    select(AuditLog, actor_alias.username, target_alias.username)
+                    .outerjoin(actor_alias, actor_alias.id == AuditLog.actor_user_id)
+                    .outerjoin(
+                        target_alias,
+                        and_(AuditLog.target_type == "user", target_alias.id == AuditLog.target_id),
+                    )
+                    .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                    .limit(bounded_limit)
+                    .offset(bounded_offset)
+                ).all()
+                entries = [
+                    self.serialize_audit_entry(log, actor_name, target_name)
+                    for log, actor_name, target_name in rows
+                ]
+                return {"entries": entries, "total": total, "limit": bounded_limit, "offset": bounded_offset}
+        except PlatformAdminRequired:
+            raise
+        except SQLAlchemyError as exc:
+            raise AuthServiceUnavailable("账号审计数据暂不可用") from exc
 
     def list_users(self, actor_user_id: str, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
         self.ensure_schema()

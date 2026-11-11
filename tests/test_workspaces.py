@@ -59,6 +59,52 @@ def _setup(monkeypatch):
     return app, store, user_a, user_a_id, user_a_csrf, user_b, user_b_id, user_b_csrf, user_c_id, admin_client, admin_csrf
 
 
+def test_audit_logs_are_scoped_to_platform_admin_and_workspace_manager(monkeypatch):
+    (
+        _app,
+        store,
+        user_a,
+        _user_a_id,
+        user_a_csrf,
+        user_b,
+        _user_b_id,
+        user_b_csrf,
+        _user_c_id,
+        admin_client,
+        _admin_csrf,
+    ) = _setup(monkeypatch)
+    try:
+        workspace_a = user_a.post(
+            "/api/workspaces",
+            headers=_headers(user_a_csrf),
+            json={"name": "审计范围甲", "description": ""},
+        ).json()
+        workspace_b = user_b.post(
+            "/api/workspaces",
+            headers=_headers(user_b_csrf),
+            json={"name": "审计范围乙", "description": ""},
+        ).json()
+
+        owner_audit = user_a.get(f"/api/workspaces/{workspace_a['id']}/audit")
+        assert owner_audit.status_code == 200
+        owner_entries = owner_audit.json()["entries"]
+        assert any(entry["action"] == "workspace_created" for entry in owner_entries)
+        assert all(entry["target_id"] == workspace_a["id"] for entry in owner_entries)
+
+        cross_workspace = user_a.get(f"/api/workspaces/{workspace_b['id']}/audit")
+        assert cross_workspace.status_code == 403
+        user_global_audit = user_b.get("/api/auth/admin/audit")
+        assert user_global_audit.status_code == 403
+
+        platform_audit = admin_client.get("/api/auth/admin/audit")
+        assert platform_audit.status_code == 200
+        platform_entries = platform_audit.json()["entries"]
+        assert any(entry["target_id"] == workspace_a["id"] for entry in platform_entries)
+        assert any(entry["target_id"] == workspace_b["id"] for entry in platform_entries)
+    finally:
+        store.engine.dispose()
+
+
 def test_any_active_user_can_create_an_authorized_workspace(monkeypatch):
     (
         _app,

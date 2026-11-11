@@ -4,10 +4,12 @@ from functools import wraps
 from typing import Any, Callable, TypeVar
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import aliased
 
 from manufacturing_rag.auth.models import (
+    AuditLog,
     Department,
     DepartmentWorkspaceGrant,
     User,
@@ -789,6 +791,42 @@ class WorkspaceStore:
             }
 
     @_database_operation
+    def list_workspace_audit(
+        self,
+        actor_user_id: str,
+        workspace_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        bounded_limit = min(max(int(limit), 1), 100)
+        bounded_offset = max(int(offset), 0)
+        self.auth.ensure_schema()
+        actor_alias = aliased(User)
+        target_alias = aliased(User)
+        predicate = and_(AuditLog.target_type == "workspace", AuditLog.target_id == workspace_id)
+        with self.auth.Session() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id)
+            self._require_access(db, actor, workspace, manage=True)
+            total = int(db.scalar(select(func.count(AuditLog.id)).where(predicate)) or 0)
+            rows = db.execute(
+                select(AuditLog, actor_alias.username, target_alias.username)
+                .outerjoin(actor_alias, actor_alias.id == AuditLog.actor_user_id)
+                .outerjoin(
+                    target_alias,
+                    and_(AuditLog.target_type == "user", target_alias.id == AuditLog.target_id),
+                )
+                .where(predicate)
+                .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+                .limit(bounded_limit)
+                .offset(bounded_offset)
+            ).all()
+            entries = [
+                self.auth.serialize_audit_entry(log, actor_name, target_name)
+                for log, actor_name, target_name in rows
+            ]
+            return {"entries": entries, "total": total, "limit": bounded_limit, "offset": bounded_offset}
+
     def preview_user_department(
         self,
         actor_user_id: str,
