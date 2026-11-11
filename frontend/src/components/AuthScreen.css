@@ -23,9 +23,7 @@
 .auth-brand { display: flex; align-items: center; gap: 8px; color: #382988; font-size: 20px; font-weight: 720; }
 .auth-brand img { width: 42px; height: 42px; object-fit: contain; }
 .auth-intro { margin: 28px 0 24px; }
-.auth-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: var(--accent); font-size: 12px; font-weight: 620; }
-.auth-intro h1 { margin: 13px 0 6px; color: var(--ink); font-size: 28px; font-weight: 720; letter-spacing: -.035em; }
-.auth-intro p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.7; }
+.auth-intro h1 { margin: 0 0 6px; color: var(--ink); font-size: 28px; font-weight: 720; letter-spacing: -.035em; }
 .auth-form { display: grid; gap: 9px; }
 .auth-form label { margin-top: 5px; color: #49455d; font-size: 13px; font-weight: 620; }
 .auth-form label span { margin-left: 4px; color: #92909c; font-weight: 400; }

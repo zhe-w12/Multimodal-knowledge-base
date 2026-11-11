@@ -95,6 +95,7 @@ class Workspace(Base):
     workspace_type: Mapped[str] = mapped_column(String(16), nullable=False)
     general_marker: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    deletion_in_progress: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     created_by: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"), nullable=True)
     owner_user_id: Mapped[Optional[str]] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"), nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

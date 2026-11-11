@@ -52,6 +52,11 @@ class ConfirmPayload(StrictPayload):
     confirm: bool
 
 
+class DeleteWorkspacePayload(StrictPayload):
+    confirm: bool
+    workspace_name: str = Field(min_length=1, max_length=150)
+
+
 class CreateDepartmentPayload(StrictPayload):
     name: str = Field(min_length=1, max_length=160)
 
@@ -260,6 +265,56 @@ def restore_workspace(workspace_id: str, payload: ConfirmPayload, request: Reque
     if not payload.confirm:
         raise HTTPException(status_code=422, detail="请确认恢复该工作区")
     return _run(lambda: _workspace_store(request).set_archived(principal.user["id"], workspace_id, False))
+
+
+@router.delete("/{workspace_id}")
+def delete_workspace(
+    workspace_id: str,
+    payload: DeleteWorkspacePayload,
+    request: Request,
+) -> dict[str, Any]:
+    principal = _write_principal(request)
+    if not payload.confirm:
+        raise HTTPException(status_code=422, detail="请确认永久删除该工作区")
+    lock_factory = getattr(request.app.state, "workspace_operation_lock", None)
+    if lock_factory is None:
+        raise HTTPException(status_code=503, detail="工作区维护服务暂不可用")
+    operation_lock = lock_factory(workspace_id)
+    operation_lock.acquire()
+    try:
+        store = _workspace_store(request)
+        _run(
+            lambda: store.begin_workspace_deletion(
+                principal.user["id"], workspace_id, payload.workspace_name
+            )
+        )
+
+        jobs = getattr(request.app.state, "document_delete_jobs", {})
+        jobs_lock = getattr(request.app.state, "document_delete_jobs_lock", None)
+        if jobs_lock is not None:
+            with jobs_lock:
+                pending_job = any(
+                    job.get("workspace_id") == workspace_id
+                    and job.get("status") in {"queued", "running"}
+                    for job in jobs.values()
+                )
+        else:
+            pending_job = any(
+                job.get("workspace_id") == workspace_id
+                and job.get("status") in {"queued", "running"}
+                for job in jobs.values()
+            )
+        if pending_job:
+            raise HTTPException(status_code=409, detail="该工作区仍有资料删除任务运行，任务完成后请重试")
+
+        delete_data = getattr(request.app.state, "delete_workspace_data", None)
+        if delete_data is None:
+            raise HTTPException(status_code=503, detail="工作区资料清理服务暂不可用")
+        cleanup_result = delete_data(workspace_id)
+        deletion_result = _run(lambda: store.complete_workspace_deletion(principal.user["id"], workspace_id))
+        return {"ok": True, **cleanup_result, **deletion_result}
+    finally:
+        operation_lock.release()
 
 
 @admin_router.get("/departments")

@@ -31,16 +31,14 @@ def browser_headers(csrf_token: str | None = None) -> dict[str, str]:
     return headers
 
 
-def bootstrap_admin(store: AuthStore) -> tuple[dict, str]:
+def bootstrap_admin(store: AuthStore) -> dict:
     admin = store.create_initial_platform_admin("admin", ADMIN_PASSWORD)
-    code, _ = store.reset_invitation(admin["id"])
-    store.set_registration_enabled(admin["id"], True)
-    return admin, code
+    return admin
 
 
 def test_register_login_session_and_password_change(auth_client):
     client, store = auth_client
-    admin, invite = bootstrap_admin(store)
+    admin = bootstrap_admin(store)
 
     registration = client.post(
         "/api/auth/register",
@@ -49,7 +47,6 @@ def test_register_login_session_and_password_change(auth_client):
             "username": "Student_01",
             "display_name": "学生甲",
             "password": USER_PASSWORD,
-            "invite_code": invite.lower(),
         },
     )
     assert registration.status_code == 201
@@ -92,7 +89,7 @@ def test_register_login_session_and_password_change(auth_client):
 
 def test_platform_user_controls_and_public_registration_status(auth_client):
     client, store = auth_client
-    admin, invite = bootstrap_admin(store)
+    admin = bootstrap_admin(store)
     assert client.get("/api/auth/registration").json() == {
         "configured": True,
         "registration_enabled": True,
@@ -100,7 +97,7 @@ def test_platform_user_controls_and_public_registration_status(auth_client):
     registered = client.post(
         "/api/auth/register",
         headers=browser_headers(),
-        json={"username": "managee", "password": USER_PASSWORD, "invite_code": invite},
+        json={"username": "managee", "password": USER_PASSWORD},
     )
     assert registered.status_code == 201
     user_id = registered.json()["user"]["id"]
@@ -139,9 +136,9 @@ def test_platform_user_controls_and_public_registration_status(auth_client):
         store.set_platform_role(admin["id"], admin["id"], "user")
 
 
-def test_invite_reset_is_single_display_and_admin_only(auth_client):
+def test_registration_is_open_after_bootstrap_and_platform_admin_can_pause_it(auth_client):
     client, store = auth_client
-    admin, old_code = bootstrap_admin(store)
+    admin = bootstrap_admin(store)
     admin_client = TestClient(client.app)
     login = admin_client.post(
         "/api/auth/login",
@@ -150,57 +147,48 @@ def test_invite_reset_is_single_display_and_admin_only(auth_client):
     )
     assert login.status_code == 200
 
-    status = admin_client.get("/api/auth/admin/invitation")
-    assert status.status_code == 200
-    assert status.json()["configured"] is True
-    assert "invite_code" not in status.json()
-
-    reset = admin_client.post(
-        "/api/auth/admin/invitation/reset",
+    closed = admin_client.patch(
+        "/api/auth/admin/registration",
         headers=browser_headers(login.json()["csrf_token"]),
-        json={"confirm": True},
+        json={"enabled": False},
     )
-    assert reset.status_code == 200
-    new_code = reset.json()["invite_code"]
-    assert len(new_code) == 6 and new_code != old_code
+    assert closed.status_code == 200
+    assert closed.json()["registration_enabled"] is False
 
     rejected = admin_client.post(
         "/api/auth/register",
         headers=browser_headers(),
-        json={
-            "username": "student02",
-            "password": USER_PASSWORD,
-            "invite_code": old_code,
-        },
+        json={"username": "student02", "password": USER_PASSWORD},
     )
-    assert rejected.status_code == 400
+    assert rejected.status_code == 403
 
+    reopened = admin_client.patch(
+        "/api/auth/admin/registration",
+        headers=browser_headers(login.json()["csrf_token"]),
+        json={"enabled": True},
+    )
+    assert reopened.status_code == 200
     accepted = admin_client.post(
         "/api/auth/register",
         headers=browser_headers(),
-        json={
-            "username": "student02",
-            "password": USER_PASSWORD,
-            "invite_code": new_code,
-        },
+        json={"username": "student02", "password": USER_PASSWORD},
     )
     assert accepted.status_code == 201
 
     anonymous = TestClient(client.app)
-    denied = anonymous.get("/api/auth/admin/invitation")
-    assert denied.status_code == 401
+    removed = anonymous.get("/api/auth/admin/invitation")
+    assert removed.status_code == 404
 
 
 def test_registration_rejects_role_injection_and_untrusted_origin(auth_client):
     client, store = auth_client
-    _admin, invite = bootstrap_admin(store)
+    _admin = bootstrap_admin(store)
     injected = client.post(
         "/api/auth/register",
         headers=browser_headers(),
         json={
             "username": "student03",
             "password": USER_PASSWORD,
-            "invite_code": invite,
             "platform_role": "platform_admin",
             "department_id": "department-from-client",
         },
@@ -213,7 +201,6 @@ def test_registration_rejects_role_injection_and_untrusted_origin(auth_client):
         json={
             "username": "student03",
             "password": USER_PASSWORD,
-            "invite_code": invite,
         },
     )
     assert untrusted.status_code == 403

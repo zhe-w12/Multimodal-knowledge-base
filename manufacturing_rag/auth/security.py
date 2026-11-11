@@ -11,7 +11,6 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$")
-INVITE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
 RESERVED_USERNAMES = frozenset(
     {
         "admin",
@@ -123,11 +122,6 @@ def password_needs_rehash(password_hash: str) -> bool:
         return PASSWORD_HASHER.check_needs_rehash(password_hash)
     except (InvalidHashError, VerificationError, ValueError):
         return False
-
-
-def normalize_invite_code(value: str) -> str | None:
-    code = str(value or "").strip().upper()
-    return code if INVITE_PATTERN.fullmatch(code) else None
 
 
 def csrf_token_for_session(secret: bytes, raw_session_token: str) -> str:

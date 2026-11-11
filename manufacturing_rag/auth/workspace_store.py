@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from functools import wraps
 from typing import Any, Callable, TypeVar
 from uuid import uuid4
@@ -12,6 +13,8 @@ from manufacturing_rag.auth.models import (
     AuditLog,
     Department,
     DepartmentWorkspaceGrant,
+    Conversation,
+    ConversationMessage,
     User,
     Workspace,
     WorkspaceMembership,
@@ -60,6 +63,7 @@ class WorkspaceStore:
             "description": workspace.description,
             "workspace_type": workspace.workspace_type,
             "status": workspace.status,
+            "deletion_in_progress": workspace.deletion_in_progress,
             "created_by": workspace.created_by,
             "owner_user_id": workspace.owner_user_id,
             "version": workspace.version,
@@ -85,6 +89,7 @@ class WorkspaceStore:
     ) -> dict[str, Any]:
         is_platform_admin = user.platform_role == "platform_admin"
         is_owner = workspace.workspace_type == "authorized" and workspace.owner_user_id == user.id
+        is_creator = workspace.workspace_type == "authorized" and workspace.created_by == user.id
         is_active = workspace.status == "active"
 
         if workspace.workspace_type == "general":
@@ -126,6 +131,7 @@ class WorkspaceStore:
             "can_manage": can_manage,
             "can_manage_members": can_manage and workspace.workspace_type == "authorized",
             "can_manage_content": can_manage and is_active,
+            "can_delete": workspace.workspace_type == "authorized" and (is_creator or is_owner or is_platform_admin),
             "is_owner": is_owner,
             "is_platform_admin": is_platform_admin,
         }
@@ -213,7 +219,7 @@ class WorkspaceStore:
             visible = []
             for workspace in workspaces:
                 access = self._access_in_session(db, user, workspace)
-                if access["can_read"] or access["can_manage"]:
+                if access["can_read"] or access["can_manage"] or access["can_delete"]:
                     visible.append({**self._workspace_dict(workspace), **access})
             return visible
 
@@ -316,6 +322,8 @@ class WorkspaceStore:
             workspace = self._workspace_or_404(db, workspace_id, lock=True)
             if workspace.workspace_type != "authorized":
                 raise WorkspaceForbidden("通用工作区设置仅平台管理员可维护")
+            if workspace.deletion_in_progress:
+                raise WorkspaceConflict("工作区正在删除，不能修改设置")
             self._require_owner_or_platform(actor, workspace)
             workspace.name = normalized_name
             workspace.description = normalized_description
@@ -749,6 +757,8 @@ class WorkspaceStore:
             if workspace.workspace_type != "authorized":
                 raise WorkspaceForbidden("通用工作区不能归档")
             self._require_owner_or_platform(actor, workspace)
+            if workspace.deletion_in_progress:
+                raise WorkspaceConflict("工作区正在删除，不能恢复或更改状态")
             target_status = "archived" if archived else "active"
             if workspace.status == target_status:
                 raise WorkspaceConflict("工作区状态未发生变化")
@@ -758,6 +768,126 @@ class WorkspaceStore:
             self._bump_user(db, workspace.owner_user_id or "")
             self._audit(db, actor.id, "workspace_archived" if archived else "workspace_restored", workspace, {})
             return {**self._workspace_dict(workspace), **self._access_in_session(db, actor, workspace)}
+
+    @_database_operation
+    def begin_workspace_deletion(
+        self,
+        actor_user_id: str,
+        workspace_id: str,
+        confirmation_name: str,
+    ) -> dict[str, Any]:
+        self.auth.ensure_schema()
+        with self.auth.Session.begin() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id, lock=True)
+            if workspace.workspace_type != "authorized":
+                raise WorkspaceForbidden("通用工作区不能删除")
+            if actor.platform_role != "platform_admin" and actor.id not in {
+                workspace.created_by,
+                workspace.owner_user_id,
+            }:
+                raise WorkspaceForbidden("只有工作区创建者、负责人或平台管理员可以删除该工作区")
+            if confirmation_name.strip() != workspace.name:
+                raise ValueError("输入的工作区名称不一致")
+
+            if not workspace.deletion_in_progress:
+                workspace.status = "archived"
+                workspace.deletion_in_progress = True
+                workspace.version += 1
+                workspace.updated_at = utcnow()
+                affected_user_ids = set(
+                    db.scalars(
+                        select(WorkspaceMembership.user_id).where(
+                            WorkspaceMembership.workspace_id == workspace.id
+                        )
+                    ).all()
+                )
+                affected_department_ids = set(
+                    db.scalars(
+                        select(DepartmentWorkspaceGrant.department_id).where(
+                            DepartmentWorkspaceGrant.workspace_id == workspace.id
+                        )
+                    ).all()
+                )
+                if affected_department_ids:
+                    affected_user_ids.update(
+                        db.scalars(
+                            select(User.id).where(User.department_id.in_(affected_department_ids))
+                        ).all()
+                    )
+                affected_user_ids.update(
+                    user_id for user_id in (workspace.created_by, workspace.owner_user_id) if user_id
+                )
+                for user_id in affected_user_ids:
+                    self._bump_user(db, user_id)
+                self._audit(
+                    db,
+                    actor.id,
+                    "workspace_deletion_started",
+                    workspace,
+                    {"name": workspace.name},
+                )
+            return self._workspace_dict(workspace)
+
+    @_database_operation
+    def complete_workspace_deletion(self, actor_user_id: str, workspace_id: str) -> dict[str, Any]:
+        self.auth.ensure_schema()
+        with self.auth.Session.begin() as db:
+            actor = self._load_user(db, actor_user_id)
+            workspace = self._workspace_or_404(db, workspace_id, lock=True)
+            if workspace.workspace_type != "authorized":
+                raise WorkspaceForbidden("通用工作区不能删除")
+            if actor.platform_role != "platform_admin" and actor.id not in {
+                workspace.created_by,
+                workspace.owner_user_id,
+            }:
+                raise WorkspaceForbidden("只有工作区创建者、负责人或平台管理员可以删除该工作区")
+            if workspace.status != "archived" or not workspace.deletion_in_progress:
+                raise WorkspaceConflict("工作区必须进入删除状态后才能清理")
+
+            conversation_ids = set(
+                db.scalars(select(Conversation.id).where(Conversation.workspace_id == workspace.id)).all()
+            )
+            source_messages = db.scalars(
+                select(ConversationMessage).where(
+                    ConversationMessage.sources_json.contains(workspace.id)
+                )
+            ).all()
+            for message in source_messages:
+                try:
+                    sources = json.loads(message.sources_json or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(sources, list):
+                    continue
+                if any(
+                    isinstance(source, dict)
+                    and isinstance(source.get("metadata"), dict)
+                    and source["metadata"].get("workspace_id") == workspace.id
+                    for source in sources
+                ):
+                    conversation_ids.add(message.conversation_id)
+            if conversation_ids:
+                db.execute(
+                    delete(ConversationMessage).where(
+                        ConversationMessage.conversation_id.in_(conversation_ids)
+                    )
+                )
+                db.execute(delete(Conversation).where(Conversation.id.in_(conversation_ids)))
+
+            result = {
+                "workspace_id": workspace.id,
+                "deleted_conversation_count": len(conversation_ids),
+            }
+            self._audit(
+                db,
+                actor.id,
+                "workspace_deleted",
+                workspace,
+                {"name": workspace.name, **result},
+            )
+            db.delete(workspace)
+            return result
 
     @_database_operation
     def list_departments(self, actor_user_id: str) -> list[dict[str, Any]]:

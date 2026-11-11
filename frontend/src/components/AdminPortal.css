@@ -71,15 +71,10 @@
 .admin-permission-preview p { color: #686477; font-size: 13px; line-height: 1.65; }
 .admin-permission-preview ul { display: grid; gap: 8px; margin: 14px 0; padding-left: 20px; color: #5f5b6d; font-size: 13px; }
 .admin-platform { display: grid; gap: 16px; }
-.admin-registration-row, .admin-invite-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; padding: 10px 0; border-bottom: 1px solid #f0edf3; }
-.admin-registration-row > div, .admin-invite-row > div { display: grid; gap: 5px; }
-.admin-registration-row strong, .admin-invite-row strong { color: #4d485e; font-size: 13px; }
-.admin-registration-row span, .admin-invite-row span { color: #8b8795; font-size: 12px; }
-.admin-invite-row .ant-btn { flex: none; border-radius: 9px; }
-.admin-invite-code { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; padding: 12px; border-radius: 10px; background: #f6f2ff; }
-.admin-invite-code code { color: var(--accent); font-size: 20px; font-weight: 700; letter-spacing: .15em; }
-.admin-invite-code .ant-btn { border-radius: 8px; }
-.admin-invite-code small { color: #858093; }
+.admin-registration-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 56px; padding: 10px 0; border-bottom: 1px solid #f0edf3; }
+.admin-registration-row > div { display: grid; gap: 5px; }
+.admin-registration-row strong { color: #4d485e; font-size: 13px; }
+.admin-registration-row span { color: #8b8795; font-size: 12px; }
 .admin-user-card > .ant-input-affix-wrapper { height: 40px; border-radius: 9px; }
 .admin-user-list { margin-top: 10px; }
 .admin-user-row { display: grid; grid-template-columns: minmax(120px, 1fr) 145px 150px 95px auto; align-items: center; gap: 8px; min-height: 59px; border-bottom: 1px solid #f0edf3; }
@@ -109,6 +104,5 @@
   .admin-member-row .ant-select { grid-column: 2; grid-row: 1; width: 105px; }
   .admin-user-row { grid-template-columns: minmax(0, 1fr) 125px; gap: 8px; padding: 10px 0; }
   .admin-user-row .ant-select:nth-of-type(2), .admin-user-row .ant-select:nth-of-type(3), .admin-user-actions { grid-column: 2; }
-  .admin-registration-row, .admin-invite-row { align-items: flex-start; }
-  .admin-invite-row { flex-direction: column; }
+  .admin-registration-row { align-items: flex-start; }
 }

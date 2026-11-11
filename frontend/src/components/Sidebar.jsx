@@ -164,7 +164,6 @@ export default function Sidebar({ conversations, activeId, busy, collapsed, onTo
             ],
           })}
         /> : <div className={`${styles.emptyHistory} ${query.trim() ? styles.emptyHistorySearch : ""}`}>
-          {!query.trim() && <MessageSquare size={21} strokeWidth={1.5} aria-hidden />}
           <span>{query.trim() ? "没有找到相关对话" : "还没有历史对话"}</span>
         </div>}
       </div>

@@ -1,2413 +1,393 @@
-"""FastAPI service layer for the education RAG pipeline."""
-
-from __future__ import annotations
-
-import base64
-import binascii
-import asyncio
-import hashlib
-import json
-import mimetypes
-import os
-import re
-import zlib
-from dataclasses import replace
-from pathlib import Path
-from queue import Empty, Queue
-from threading import Event, RLock
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Literal, Optional
-from urllib.parse import quote
-from uuid import uuid4
-
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
-
-from manufacturing_rag.auth.routes import (
-    _auth_store,
-    _require_browser_request,
-    _require_csrf,
-    router as auth_router,
-)
-from manufacturing_rag.auth.conversation_routes import router as conversation_router
-from manufacturing_rag.auth.conversation_store import ConversationLocked, ConversationNotFound, ConversationStore
-from manufacturing_rag.auth.store import AuthServiceUnavailable, Principal
-from manufacturing_rag.auth.workspace_store import WorkspaceForbidden, WorkspaceNotFound, WorkspaceStore
-from manufacturing_rag.auth.workspace_routes import admin_router as workspace_admin_router
-from manufacturing_rag.auth.workspace_routes import router as workspace_router
-from manufacturing_rag.adapters.ocr import BaiduOCRAdapter
-from manufacturing_rag.adapters.llm import build_llm_router
-from manufacturing_rag.adapters.embedding import HashEmbeddingAdapter, build_embedding_adapter
-from manufacturing_rag.adapters.query_optimizer import AdaptiveQueryOptimizer
-from manufacturing_rag.adapters.retriever import HybridRetriever, MilvusHybridRetriever
-from manufacturing_rag.adapters.vector_store import MilvusVectorStore
-from manufacturing_rag.chunking import ETLValidationReport, prepare_chunks
-from manufacturing_rag.config import DEFAULT_CONFIG, RAGConfig
-from manufacturing_rag.debug_log import chunks_for_debug, retrieval_results_for_debug, write_debug_log
-from manufacturing_rag.etl import MultimodalETLPipeline
-from manufacturing_rag.infrastructure import RuntimeInfrastructure
-from manufacturing_rag.pipeline import ManufacturingRAGPipeline, contextualize_question, retrieve_with_query_variants
-from manufacturing_rag.pdf_quality import (
-    chunks_have_unusable_pdf_text,
-    looks_like_spaced_pdf_garble,
-    pdf_chunks_are_searchable,
-)
-from manufacturing_rag.schemas import DEFAULT_WORKSPACE_ID, DocumentChunk, RAGResponse
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_KB_PATH = PROJECT_ROOT / "examples" / "knowledge_base.jsonl"
-FRONTEND_SOURCE_DIR = PROJECT_ROOT / "frontend"
-FRONTEND_DIST_DIR = FRONTEND_SOURCE_DIR / "dist"
-FRONTEND_DIR = FRONTEND_DIST_DIR
-MAX_PDF_UPLOAD_BYTES = 10 * 1024 * 1024
-DOCUMENT_FILES_DIR = PROJECT_ROOT / "tmp" / "document_files"
-
-
-def safe_document_filename(source: str) -> str:
-    filename = str(source or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    return filename or "document"
-
-
-def stored_document_path(workspace_id: str, source: str) -> Path:
-    workspace_key = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
-    document_key = hashlib.sha256(f"{workspace_id}\\0{source}".encode("utf-8")).hexdigest()
-    return DOCUMENT_FILES_DIR / workspace_key / document_key
-
-
-def stored_document_metadata_path(workspace_id: str, source: str) -> Path:
-    path = stored_document_path(workspace_id, source)
-    return path.with_name(f"{path.name}.json")
-
-
-def stored_document_filename(workspace_id: str, source: str) -> str:
-    metadata_path = stored_document_metadata_path(workspace_id, source)
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        filename = str(metadata.get("filename") or "")
-        if filename:
-            return safe_document_filename(filename)
-    except (OSError, ValueError, TypeError):
-        pass
-    return safe_document_filename(source)
-
-
-def save_stored_document(workspace_id: str, source: str, filename: str, content: bytes) -> None:
-    path = stored_document_path(workspace_id, source)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-    metadata_path = stored_document_metadata_path(workspace_id, source)
-    temporary_metadata_path = metadata_path.with_name(f"{metadata_path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary_path.write_bytes(content)
-        temporary_path.replace(path)
-        temporary_metadata_path.write_text(
-            json.dumps({"source": source, "filename": safe_document_filename(filename)}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        temporary_metadata_path.replace(metadata_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-        temporary_metadata_path.unlink(missing_ok=True)
-
-
-def remove_stored_document(workspace_id: str, source: str) -> None:
-    for path in (
-        stored_document_path(workspace_id, source),
-        stored_document_metadata_path(workspace_id, source),
-    ):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            # Knowledge-base deletion should still complete if an old file is already gone.
-            pass
-
-
-def workspace_chunk_id(workspace_id: str, chunk_id: str) -> str:
-    """Keep IDs stable in the default workspace and unique in other workspaces."""
-
-    if workspace_id == DEFAULT_WORKSPACE_ID:
-        return chunk_id
-    workspace_hash = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:16]
-    chunk_hash = hashlib.sha256(chunk_id.encode("utf-8")).hexdigest()
-    return f"ws-{workspace_hash}-{chunk_hash}"
-
-
-def workspace_session_id(workspace_id: str, session_id: Optional[str]) -> Optional[str]:
-    if session_id is None or workspace_id == DEFAULT_WORKSPACE_ID:
-        return session_id
-    session_hash = hashlib.sha256(f"{workspace_id}\0{session_id}".encode("utf-8")).hexdigest()
-    return f"ws-{session_hash}"
-
-
-def authenticated_session_id(user_id: str, session_id: Optional[str]) -> Optional[str]:
-    if session_id is None:
-        return None
-    digest = hashlib.sha256(f"{user_id}\0{session_id}".encode("utf-8")).hexdigest()
-    return f"user-{digest}"
-
-
-def tag_chunks_for_workspace(chunks: Iterable[DocumentChunk], workspace_id: str) -> List[DocumentChunk]:
-    rows = list(chunks)
-    id_map = {chunk.id: workspace_chunk_id(workspace_id, chunk.id) for chunk in rows}
-    for chunk in rows:
-        chunk.id = id_map[chunk.id]
-        if chunk.parent_id:
-            chunk.parent_id = id_map.get(chunk.parent_id, workspace_chunk_id(workspace_id, chunk.parent_id))
-        metadata = dict(chunk.metadata or {})
-        metadata["workspace_id"] = workspace_id
-        if metadata.get("parent_id"):
-            parent_id = str(metadata["parent_id"])
-            metadata["parent_id"] = id_map.get(parent_id, workspace_chunk_id(workspace_id, parent_id))
-        chunk.metadata = metadata
-    return rows
-
-
-def sanitize_error_detail(value: Any) -> str:
-    """Return a bounded diagnostic string without common credential values."""
-
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=False)
-        except (TypeError, ValueError):
-            text = str(value)
-    text = re.sub(
-        r"(?i)\b(token|api[_-]?key|secret|password|passwd)\b\s*[:=]\s*[^\s,;ï¼Œã€‚]+",
-        lambda match: f"{match.group(1)}=<å·²éšè—>",
-        text,
-    )
-    return text.strip()[:1200]
-
-
-def explain_api_error(detail: Any, status_code: int, error_type: str = "") -> Dict[str, str]:
-    """Translate operational exceptions into a stable user-facing reason and action."""
-
-    technical_detail = sanitize_error_detail(detail)
-    lowered = technical_detail.lower()
-    reason = technical_detail or "æœåŠ¡æœªè¿”å›žå…·ä½“å¼‚å¸¸ä¿¡æ¯ã€‚"
-    suggestion = "è¯·ç¨åŽé‡è¯•ï¼›è‹¥é—®é¢˜æŒç»­ï¼Œè¯·æŸ¥çœ‹åŽç«¯æ—¥å¿—å®šä½å…·ä½“é˜¶æ®µã€‚"
-    code = f"HTTP_{status_code}"
-
-    if any(term in lowered for term in ("fail connecting", "server unavailable", "illegal connection params", "milvusexception")):
-        code = "VECTOR_CONNECTION_FAILED"
-        reason = "æ— æ³•è¿žæŽ¥æœ¬åœ° Docker Milvusï¼ˆé¡¹ç›®ä»…ä½¿ç”¨æœ¬åœ°å®žä¾‹ï¼Œä¸è¿žæŽ¥çº¿ä¸Š Zillizï¼‰ï¼Œå¯èƒ½æ˜¯å®¹å™¨æœªå°±ç»ªæˆ– Endpoint ä¸Ž Token ä¸åŒ¹é…ã€‚"
-        suggestion = "è¯·ç¡®è®¤ Docker Milvus å®¹å™¨å¥åº·è¿è¡Œï¼Œå¹¶æ£€æŸ¥ MILVUS_ENDPOINTã€MILVUS_TOKEN åŽé‡è¯•ã€‚"
-    elif "milvus configuration missing" in lowered or "zilliz configuration missing" in lowered or ("milvus" in lowered and "not configured" in lowered):
-        code = "VECTOR_CONFIG_MISSING"
-        reason = "æœ¬åœ° Docker Milvus è¿žæŽ¥é…ç½®ç¼ºå¤±ï¼ŒåŽç«¯æ²¡æœ‰è¯»å–åˆ° Endpoint æˆ– Tokenã€‚"
-        suggestion = "è¯·åœ¨ .env ä¸­é…ç½® MILVUS_ENDPOINT å’Œ MILVUS_TOKENï¼Œç„¶åŽé‡å¯åŽç«¯ã€‚"
-    elif any(term in lowered for term in ("unauthenticated", "unauthorized", "authentication failed", "invalid token", "permission denied")):
-        code = "AUTHENTICATION_FAILED"
-        reason = "äº‘æœåŠ¡èº«ä»½éªŒè¯å¤±è´¥ï¼Œå‡­æ®æ— æ•ˆã€å·²è¿‡æœŸæˆ–æ²¡æœ‰å½“å‰æ“ä½œæƒé™ã€‚"
-        suggestion = "è¯·é‡æ–°å¤åˆ¶å¯¹åº”æœåŠ¡çš„ Token/API Keyï¼Œç¡®è®¤æ²¡æœ‰å¤šä½™ç©ºæ ¼ï¼Œå¹¶æ£€æŸ¥è´¦å·æƒé™ã€‚"
-    elif any(term in lowered for term in ("timed out", "timeout", "deadline exceeded")):
-        code = "UPSTREAM_TIMEOUT"
-        reason = "è°ƒç”¨å¤–éƒ¨æœåŠ¡è¶…æ—¶ï¼Œç½‘ç»œè¾ƒæ…¢æˆ–äº‘æœåŠ¡æ²¡æœ‰åœ¨è§„å®šæ—¶é—´å†…å“åº”ã€‚"
-        suggestion = "è¯·æ£€æŸ¥ç½‘ç»œåŽé‡è¯•ï¼›å¤„ç†å¤§æ–‡ä»¶æ—¶å¯å‡å°‘ PDF é¡µæ•°æˆ–é™ä½Žæ¸²æŸ“ DPIã€‚"
-    elif any(term in lowered for term in ("name resolution", "getaddrinfo", "dns")):
-        code = "DNS_FAILED"
-        reason = "æ— æ³•è§£æžäº‘æœåŠ¡åŸŸåï¼Œå½“å‰ç½‘ç»œæˆ– DNS é…ç½®ä¸å¯ç”¨ã€‚"
-        suggestion = "è¯·æ£€æŸ¥ç½‘ç»œã€DNSã€ä»£ç†å’Œé˜²ç«å¢™è®¾ç½®åŽé‡è¯•ã€‚"
-    elif "baidu ocr" in lowered or "ç™¾åº¦ ocr" in lowered:
-        code = "OCR_FAILED"
-        reason = technical_detail
-        suggestion = "è¯·æ£€æŸ¥ç™¾åº¦ OCR Keyã€å›¾ç‰‡/PDF æ¸…æ™°åº¦å’Œç½‘ç»œï¼›ä¹Ÿå¯ä»¥ç²˜è´´æ‰‹åŠ¨ OCR æ–‡æœ¬ä½œä¸ºå…œåº•ã€‚"
-    elif status_code == 413 or any(term in lowered for term in ("exceeds 10mb", "too large", "upload limit")):
-        code = "FILE_TOO_LARGE"
-        reason = "ä¸Šä¼ æ–‡ä»¶è¶…è¿‡ç³»ç»Ÿå…è®¸çš„ 10MB å¤§å°é™åˆ¶ã€‚"
-        suggestion = "è¯·åŽ‹ç¼©æˆ–æ‹†åˆ†æ–‡ä»¶åŽé‡æ–°ä¸Šä¼ ã€‚"
-    elif "base64" in lowered:
-        code = "INVALID_FILE_PAYLOAD"
-        reason = "ä¸Šä¼ æ–‡ä»¶çš„æ•°æ®ç¼–ç æ— æ•ˆæˆ–ä¼ è¾“å†…å®¹ä¸å®Œæ•´ã€‚"
-        suggestion = "è¯·é‡æ–°é€‰æ‹©åŽŸå§‹æ–‡ä»¶ä¸Šä¼ ï¼Œä¸è¦ä¸Šä¼ æŸåæˆ–æœªå®Œæ•´ä¸‹è½½çš„æ–‡ä»¶ã€‚"
-    elif "not a pdf" in lowered or "ä¸æ˜¯ pdf" in lowered:
-        code = "INVALID_PDF"
-        reason = "ä¸Šä¼ å†…å®¹ä¸æ˜¯æœ‰æ•ˆçš„ PDF æ–‡ä»¶ã€‚"
-        suggestion = "è¯·ç¡®è®¤æ–‡ä»¶æ‰©å±•åä¸Žå®žé™…æ ¼å¼ä¸€è‡´ï¼Œå¹¶é‡æ–°å¯¼å‡º PDF åŽä¸Šä¼ ã€‚"
-    elif "invalid json" in lowered or "jsondecode" in lowered:
-        code = "INVALID_JSON"
-        reason = f"JSON/JSONL æ ¼å¼ä¸æ­£ç¡®ï¼š{technical_detail}"
-        suggestion = "è¯·æ£€æŸ¥æŠ¥é”™è¡Œé™„è¿‘æ˜¯å¦ç¼ºå°‘å¼•å·ã€é€—å·æˆ–å¤§æ‹¬å·ï¼Œå¹¶ç¡®ä¿ JSONL æ¯è¡Œæ˜¯ä¸€ä¸ªå®Œæ•´å¯¹è±¡ã€‚"
-    elif status_code == 422 or error_type == "RequestValidationError":
-        code = "INVALID_REQUEST"
-        reason = f"è¯·æ±‚å‚æ•°ä¸ç¬¦åˆæŽ¥å£è¦æ±‚ï¼š{technical_detail}"
-        suggestion = "è¯·æ£€æŸ¥å¿…å¡«å­—æ®µã€å­—æ®µç±»åž‹ä»¥åŠè¾“å…¥å†…å®¹æ˜¯å¦ä¸ºç©ºã€‚"
-    elif status_code == 404:
-        code = "API_NOT_FOUND"
-        reason = "è¯·æ±‚çš„åŽç«¯æŽ¥å£ä¸å­˜åœ¨ï¼Œé€šå¸¸æ˜¯ API åœ°å€å¡«å†™é”™è¯¯æˆ–å‰åŽç«¯ç‰ˆæœ¬ä¸ä¸€è‡´ã€‚"
-        suggestion = "è¯·æ£€æŸ¥ API Endpointï¼Œå¹¶ç¡®è®¤åŽç«¯æœåŠ¡å·²å¯åŠ¨ä¸ºå½“å‰é¡¹ç›®ç‰ˆæœ¬ã€‚"
-    elif status_code == 429:
-        code = "RATE_LIMITED"
-        reason = "äº‘æœåŠ¡è¯·æ±‚è¿‡äºŽé¢‘ç¹æˆ–é¢åº¦å·²ç”¨å°½ã€‚"
-        suggestion = "è¯·ç¨åŽé‡è¯•ï¼Œå¹¶æ£€æŸ¥å¯¹åº”äº‘æœåŠ¡çš„è°ƒç”¨é¢åº¦å’Œé™æµè®¾ç½®ã€‚"
-    elif status_code >= 500:
-        code = "SERVER_ERROR"
-        reason = technical_detail or "åŽç«¯æˆ–ä¸Šæ¸¸äº‘æœåŠ¡å‘ç”Ÿå†…éƒ¨é”™è¯¯ã€‚"
-        suggestion = "è¯·ç¨åŽé‡è¯•ï¼Œå¹¶æŸ¥çœ‹ run_api.err.log ä¸Ž logs/rag_debug.jsonlã€‚"
-
-    return {
-        "code": code,
-        "reason": reason,
-        "suggestion": suggestion,
-        "technical_detail": technical_detail,
-    }
-
-
-class RerankRuleRequest(BaseModel):
-    boost_terms: List[str] = Field(default_factory=list, description="Terms that raise matching passages in the rerank order")
-    exclude_terms: List[str] = Field(default_factory=list, description="Terms that remove matching passages from rerank results")
-
-
-class AnswerRequest(BaseModel):
-    """Question payload accepted by the frontend API mode."""
-
-    question: str = Field(..., min_length=1, description="User question to answer from indexed OCR/CLIP materials")
-    session_id: Optional[str] = Field(None, max_length=128, description="Conversation id cached in Redis and persisted in MySQL")
-    conversation_id: Optional[str] = Field(None, max_length=36, description="Server-owned private conversation id")
-    conversation_context: str = Field("", max_length=4000, description="Recent turns from the current chat")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128, description="Knowledge workspace to search")
-    scope: Literal["all", "common", "workspace"] = Field(
-        "workspace",
-        description="Requested search scope; the server resolves this to workspaces the signed-in user can read",
-    )
-    rerank_rules: RerankRuleRequest = Field(default_factory=RerankRuleRequest)
-    hallucination_threshold: float = Field(0.75, ge=0.0, le=0.95, description="Minimum confidence required to accept a source-checked answer")
-
-
-class KnowledgeBaseReplaceRequest(BaseModel):
-    """JSON knowledge-base update payload."""
-
-    chunks: List[Dict[str, Any]] = Field(default_factory=list, description="OCR structured chunks")
-    mode: str = Field("append", description="append or replace; append is the safe default")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class JsonlIngestRequest(BaseModel):
-    """JSONL text ingestion payload for browser or integration clients."""
-
-    content: str = Field(..., min_length=1, description="JSONL content; one OCR chunk per line or a JSON array")
-    mode: str = Field("append", description="append or replace; append is the safe default")
-    source_name: Optional[str] = Field(None, description="Optional logical source label used in error messages")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class PdfIngestRequest(BaseModel):
-    """Base64 PDF ingestion payload sent by the zero-dependency frontend."""
-
-    filename: str = Field(..., min_length=1, description="Original PDF file name")
-    content_base64: str = Field(..., min_length=1, description="Base64 encoded PDF bytes")
-    mode: str = Field("append", description="append or replace; append is the safe default")
-    max_pages: Optional[int] = Field(None, ge=0, le=1000, description="Maximum OCR pages; 0 means unlimited")
-    render_dpi: Optional[int] = Field(None, ge=72, le=300, description="PDF page render DPI for OCR fallback")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class ImageOcrIngestRequest(BaseModel):
-    """Base64 image ingestion payload for OCR processing."""
-
-    filename: str = Field(..., min_length=1, description="Original image file name")
-    content_base64: str = Field(..., min_length=1, description="Base64 encoded image bytes")
-    ocr_text: Optional[str] = Field(None, description="Optional OCR text already extracted by client or another tool")
-    mode: str = Field("append", description="append or replace; append is the safe default")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class DocumentIngestRequest(BaseModel):
-    """Base64 PDF, Word, PowerPoint, text or image payload for the multimodal ETL chain."""
-
-    filename: str = Field(..., min_length=1, description="Original file name with extension")
-    content_base64: str = Field(..., min_length=1, description="Base64 encoded document bytes")
-    mode: str = Field("append", description="append or replace; append is the safe default")
-    max_pages: Optional[int] = Field(None, ge=0, le=1000, description="Maximum PDF OCR pages; 0 means unlimited")
-    render_dpi: Optional[int] = Field(None, ge=72, le=300, description="PDF render DPI used by PaddleOCR fallback")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class DocumentDeleteRequest(BaseModel):
-    source: str = Field(..., min_length=1, description="Exact document source name returned by the knowledge-base summary")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class VectorCollectionRequest(BaseModel):
-    """Zilliz collection creation request."""
-
-    drop_existing: bool = Field(False, description="Drop and recreate the Zilliz collection")
-
-
-class VectorIngestRequest(BaseModel):
-    """Vector synchronization mode sent after a knowledge-base upload."""
-
-    mode: str = Field("append", description="append or replace; append preserves existing remote rows")
-    workspace_id: Optional[str] = Field(None, min_length=1, max_length=128)
-
-
-class VectorSearchRequest(BaseModel):
-    """Zilliz vector-search request."""
-
-    query: str = Field(..., min_length=1, description="Vector search query")
-    limit: int = Field(5, ge=1, le=50, description="Maximum result count")
-    workspace_id: str = Field(DEFAULT_WORKSPACE_ID, min_length=1, max_length=128)
-
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    kb_chunk_count: int
-    model_mode: str
-    embedding_provider: str
-    embedding_model: str
-    rerank_provider: str
-    rerank_model: str
-    ocr_provider: str
-    vector_store_provider: str
-    vector_collection_name: str
-    strict_source_required: bool
-    default_kb_path: str
-    query_classifier: str
-    query_agent: str
-    redis_status: str
-    mysql_status: str
-
-
-class KnowledgeBaseSummary(BaseModel):
-    chunk_count: int
-    sources: List[str]
-    doc_types: List[str]
-    review_chunk_count: int = 0
-    parent_count: int = 0
-
-
-class KnowledgeBaseUpdateResponse(BaseModel):
-    status: str
-    mode: str
-    chunk_count: int
-    summary: KnowledgeBaseSummary
-    validation: Dict[str, int] = Field(default_factory=dict)
-    parser_chain: List[str] = Field(default_factory=list)
-
-
-class KnowledgeBaseState:
-    """Thread-safe in-memory knowledge base and pipeline holder."""
-
-    def __init__(self, config: RAGConfig = DEFAULT_CONFIG, initial_chunks: Optional[Iterable[DocumentChunk]] = None) -> None:
-        self._config = config
-        self._lock = RLock()
-        self._version = 1
-        self.infrastructure = RuntimeInfrastructure(config)
-        self._last_validation = ETLValidationReport(0, 0, 0)
-        self._persistence_enabled = initial_chunks is None and bool(config.kb_runtime_path.strip())
-        provided_chunks = list(initial_chunks) if initial_chunks is not None else []
-        if provided_chunks:
-            self._chunks = provided_chunks
-        elif self._persistence_enabled:
-            runtime_path = self._runtime_path()
-            if runtime_path is not None and runtime_path.exists():
-                # An existing empty runtime file means the user intentionally
-                # cleared the knowledge base; do not repopulate bundled samples.
-                self._chunks = self._load_runtime_chunks()
-            else:
-                self._chunks = self._load_startup_chunks()
-        else:
-            self._chunks = self._load_startup_chunks()
-        self._workspace_pipelines: Dict[str, tuple[int, ManufacturingRAGPipeline]] = {}
-
-    @property
-    def chunk_count(self) -> int:
-        with self._lock:
-            return len(self._chunks)
-
-    def answer(
-        self,
-        question: str,
-        session_id: Optional[str] = None,
-        rerank_rules: Optional[Dict[str, List[str]]] = None,
-        conversation_context: str = "",
-        on_token: Optional[Callable[[str], None]] = None,
-        hallucination_threshold: float = 0.75,
-        on_status: Optional[Callable[[str], None]] = None,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-        workspace_ids: Optional[Iterable[str]] = None,
-        principal_user_id: Optional[str] = None,
-        permission_cache_scope: Optional[str] = None,
-        strict_workspace_metadata: bool = False,
-    ) -> RAGResponse:
-        with self._lock:
-            if workspace_ids is None:
-                pipeline = self._workspace_pipeline_locked(workspace_id)
-                effective_workspace_ids = [workspace_id]
-            else:
-                effective_workspace_ids = sorted(set(str(value) for value in workspace_ids if value))
-                pipeline = self._workspace_scope_pipeline_locked(
-                    effective_workspace_ids,
-                    strict_workspace_metadata=strict_workspace_metadata,
-                )
-            knowledge_version = self._version
-        scope_key = ",".join(effective_workspace_ids)
-        scoped_session_id = workspace_session_id(scope_key, session_id)
-        stored_context = self.infrastructure.get_session_context(scoped_session_id)
-        session_context = str(conversation_context or "").strip()[-4000:] or stored_context
-        if on_status:
-            on_status("æ­£åœ¨è¯†åˆ«é—®é¢˜ç±»åž‹â€¦")
-        intent = pipeline.classify_intent(question, session_context)
-        cache_basis = contextualize_question(question, session_context)
-        safe_rerank_rules = rerank_rules or {"boost_terms": [], "exclude_terms": []}
-        safe_threshold = min(0.95, max(0.0, float(hallucination_threshold)))
-        cache_basis = (
-            f"{cache_basis}\n[intent_category:{intent.category}]"
-            f"\n[workspace_ids:{','.join(effective_workspace_ids)}]"
-            f"\n[principal_user_id:{principal_user_id or 'anonymous'}]"
-            f"\n[permission_cache_scope:{permission_cache_scope or 'legacy'}]"
-            f"\n[rerank_rules:{json.dumps(safe_rerank_rules, ensure_ascii=False, sort_keys=True)}]"
-            f"\n[hallucination_threshold:{safe_threshold:.2f}]"
-        )
-        # Chat replies depend on conversation tone and should not be replaced
-        # by a previous global cache entry. They are still persisted into the
-        # selected session's conversation history below.
-        cached = None
-        if intent.allowed and intent.category != "chit_chat":
-            cached = self.infrastructure.get_cached_answer(cache_basis, knowledge_version)
-        if cached is not None and cached.hallucination_check and cached.hallucination_check.passed:
-            self.infrastructure.cache_answer(cached, knowledge_version, session_id=scoped_session_id, cache_basis=cache_basis)
-            return cached
-        response = pipeline.answer(
-            question,
-            conversation_context=session_context,
-            rerank_rules=safe_rerank_rules,
-            on_token=on_token,
-            hallucination_threshold=safe_threshold,
-            on_status=on_status,
-            classified_intent=intent,
-        )
-        self.infrastructure.cache_answer(response, knowledge_version, session_id=scoped_session_id, cache_basis=cache_basis)
-        return response
-
-    def _chunk_workspace_id(self, chunk: DocumentChunk) -> str:
-        return str((chunk.metadata or {}).get("workspace_id") or DEFAULT_WORKSPACE_ID)
-
-    def _workspace_pipeline_locked(self, workspace_id: str) -> ManufacturingRAGPipeline:
-        cached = self._workspace_pipelines.get(workspace_id)
-        if cached and cached[0] == self._version:
-            return cached[1]
-        chunks = [chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id]
-        pipeline = ManufacturingRAGPipeline(
-            chunks,
-            config=self._config,
-            remote_cache_callback=self._cache_remote_chunks,
-            workspace_id=workspace_id,
-        )
-        self._workspace_pipelines[workspace_id] = (self._version, pipeline)
-        return pipeline
-
-    def _workspace_scope_pipeline_locked(
-        self,
-        workspace_ids: Iterable[str],
-        *,
-        strict_workspace_metadata: bool = False,
-    ) -> ManufacturingRAGPipeline:
-        normalized_ids = tuple(sorted(set(str(value) for value in workspace_ids if value)))
-        if not normalized_ids:
-            raise HTTPException(status_code=403, detail="æ²¡æœ‰å¯æ£€ç´¢çš„å·¥ä½œåŒº")
-        if len(normalized_ids) == 1 and not strict_workspace_metadata:
-            return self._workspace_pipeline_locked(normalized_ids[0])
-        cache_key = "scope:" + hashlib.sha256("\0".join(normalized_ids).encode("utf-8")).hexdigest()
-        cached = self._workspace_pipelines.get(cache_key)
-        if cached and cached[0] == self._version:
-            return cached[1]
-        allowed = frozenset(normalized_ids)
-        chunks = [chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) in allowed]
-        pipeline = ManufacturingRAGPipeline(
-            chunks,
-            config=self._config,
-            remote_cache_callback=self._cache_remote_chunks,
-            workspace_ids=normalized_ids,
-            strict_workspace_metadata=strict_workspace_metadata,
-        )
-        self._workspace_pipelines[cache_key] = (self._version, pipeline)
-        return pipeline
-
-    def chunks_snapshot(self, workspace_id: Optional[str] = None) -> List[DocumentChunk]:
-        with self._lock:
-            if workspace_id is None:
-                return list(self._chunks)
-            return [chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id]
-
-    def document_chunk_ids(self, source: str, workspace_id: str = DEFAULT_WORKSPACE_ID) -> List[str]:
-        with self._lock:
-            return [
-                chunk.id for chunk in self._chunks
-                if chunk.source == source and self._chunk_workspace_id(chunk) == workspace_id
-            ]
-
-    def list_original_documents(self, workspace_id: str = DEFAULT_WORKSPACE_ID) -> Dict[str, Any]:
-        workspace_key = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
-        workspace_dir = DOCUMENT_FILES_DIR / workspace_key
-        documents = []
-        if not workspace_dir.is_dir():
-            return {"documents": documents, "count": 0, "workspace_id": workspace_id}
-        for metadata_path in workspace_dir.glob("*.json"):
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                source = str(metadata.get("source") or "")
-                filename = safe_document_filename(str(metadata.get("filename") or source))
-                if not source or metadata_path != stored_document_metadata_path(workspace_id, source):
-                    continue
-                path = stored_document_path(workspace_id, source)
-                if not path.is_file():
-                    continue
-                documents.append({
-                    "source": source,
-                    "filename": filename,
-                    "size_bytes": path.stat().st_size,
-                })
-            except (OSError, ValueError, TypeError):
-                continue
-        documents.sort(key=lambda item: item["filename"].casefold())
-        return {"documents": documents, "count": len(documents), "workspace_id": workspace_id}
-
-    def document_content(
-        self,
-        source: str,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-        max_chars: int = 150_000,
-    ) -> Dict[str, Any]:
-        with self._lock:
-            chunks = [
-                chunk for chunk in self._chunks
-                if chunk.source == source and self._chunk_workspace_id(chunk) == workspace_id
-            ]
-            if not chunks:
-                raise HTTPException(status_code=404, detail=f"çŸ¥è¯†åº“ä¸­ä¸å­˜åœ¨èµ„æ–™ï¼š{source}")
-            content = "\n\n".join(chunk.text.strip() for chunk in chunks if chunk.text and chunk.text.strip())
-            safe_limit = max(0, min(int(max_chars), 500_000))
-            truncated = bool(safe_limit and len(content) > safe_limit)
-            if truncated:
-                content = content[:safe_limit]
-            return {
-                "source": source,
-                "filename": stored_document_filename(workspace_id, source),
-                "content": content,
-                "chunk_count": len(chunks),
-                "original_available": stored_document_path(workspace_id, source).is_file(),
-                "truncated": truncated,
-            }
-
-    def workspace_chunk_ids(self, workspace_id: str) -> List[str]:
-        with self._lock:
-            return [
-                chunk.id for chunk in self._chunks
-                if self._chunk_workspace_id(chunk) == workspace_id
-            ]
-
-    def delete_workspace(self, workspace_id: str) -> Dict[str, Any]:
-        if workspace_id == DEFAULT_WORKSPACE_ID:
-            raise HTTPException(status_code=400, detail="é»˜è®¤å·¥ä½œåŒºä¸èƒ½åˆ é™¤")
-
-        workspace_key = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
-        workspace_dir = DOCUMENT_FILES_DIR / workspace_key
-        with self._lock:
-            removed = [chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id]
-            removed_chunk_count = len(removed)
-            removed_document_count = 0
-
-            try:
-                if workspace_dir.is_symlink():
-                    workspace_dir.unlink(missing_ok=True)
-                elif workspace_dir.is_dir():
-                    stored_files = list(workspace_dir.iterdir())
-                    removed_document_count = sum(1 for path in stored_files if path.suffix == ".json")
-                    for path in stored_files:
-                        if path.is_file() or path.is_symlink():
-                            path.unlink(missing_ok=True)
-                        else:
-                            raise OSError("unexpected directory in workspace document store")
-                    workspace_dir.rmdir()
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail="æ— æ³•æ¸…ç†å·¥ä½œåŒºä¸­çš„åŽŸå§‹æ–‡æ¡£") from exc
-
-            self._chunks = [
-                chunk for chunk in self._chunks
-                if self._chunk_workspace_id(chunk) != workspace_id
-            ]
-            self._version += 1
-            self._persist_runtime_chunks_locked()
-            self._invalidate_workspace_pipelines_locked()
-            write_debug_log(
-                self._config,
-                "kb_workspace_deleted",
-                workspace_id=workspace_id,
-                deleted_chunk_count=removed_chunk_count,
-                deleted_document_count=removed_document_count,
-            )
-            return {
-                "workspace_id": workspace_id,
-                "removed_chunk_count": removed_chunk_count,
-                "removed_document_count": removed_document_count,
-            }
-
-    def delete_document(
-        self,
-        source: str,
-        expected_chunk_ids: Iterable[str],
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> Dict[str, Any]:
-        expected_ids = set(expected_chunk_ids)
-        with self._lock:
-            removed = [
-                chunk for chunk in self._chunks
-                if chunk.source == source and chunk.id in expected_ids and self._chunk_workspace_id(chunk) == workspace_id
-            ]
-            if not removed:
-                raise HTTPException(status_code=404, detail=f"çŸ¥è¯†åº“ä¸­ä¸å­˜åœ¨èµ„æ–™ï¼š{source}")
-            removed_ids = {chunk.id for chunk in removed}
-            self._chunks = [
-                chunk for chunk in self._chunks
-                if not (
-                    chunk.source == source
-                    and chunk.id in removed_ids
-                    and self._chunk_workspace_id(chunk) == workspace_id
-                )
-            ]
-            remove_stored_document(workspace_id, source)
-            self._version += 1
-            self._persist_runtime_chunks_locked()
-            self._invalidate_workspace_pipelines_locked()
-            summary = self.summary_locked(workspace_id)
-            write_debug_log(
-                self._config,
-                "kb_document_deleted",
-                source=source,
-                deleted_chunk_count=len(removed),
-                remaining_chunk_count=sum(1 for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id),
-            )
-            return {
-                "source": source,
-                "removed_chunk_count": len(removed),
-                "summary": summary.model_dump() if hasattr(summary, "model_dump") else summary.dict(),
-            }
-
-    def list_chunks(
-        self,
-        limit: int = 50,
-        offset: int = 0,
-        workspace_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        with self._lock:
-            safe_offset = max(offset, 0)
-            safe_limit = max(min(limit, 200), 1)
-            chunks = self._chunks if workspace_id is None else [
-                chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id
-            ]
-            rows = chunks[safe_offset : safe_offset + safe_limit]
-            return {
-                "total": len(chunks),
-                "offset": safe_offset,
-                "limit": safe_limit,
-                "chunks": [chunk_to_dict(chunk) for chunk in rows],
-            }
-
-    def update_chunks(
-        self,
-        payloads: Iterable[Dict[str, Any]],
-        mode: str = "append",
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        normalized_mode = validate_mode(mode)
-        chunks, report = prepare_chunks((DocumentChunk.from_mapping(payload) for payload in payloads), self._config)
-        log_chunks_for_ingest(self._config, "kb_chunks_payload", chunks, normalized_mode)
-        return self._apply_chunks_locked(chunks, normalized_mode, validation=report, workspace_id=workspace_id)
-
-    def ingest_pdf(
-        self,
-        filename: str,
-        content_base64: str,
-        mode: str = "append",
-        max_pages: Optional[int] = None,
-        render_dpi: Optional[int] = None,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        normalized_mode = validate_mode(mode)
-        pdf_bytes = decode_pdf_base64(content_base64)
-        raw_chunks = pdf_bytes_to_chunks(
-            pdf_bytes,
-            filename=filename,
-            config=self._config,
-            max_pages=max_pages,
-            render_dpi=render_dpi,
-        )
-        chunks, report = prepare_chunks(raw_chunks, self._config)
-        log_chunks_for_ingest(self._config, "pdf_ingest_payload", chunks, normalized_mode, filename=filename)
-        return self._apply_chunks_locked(
-            chunks,
-            normalized_mode,
-            validation=report,
-            parser_chain=["PDFæ–‡æœ¬è§£æž", self._config.ocr_provider],
-            workspace_id=workspace_id,
-        )
-
-    def ingest_image_ocr(
-        self,
-        filename: str,
-        content_base64: str,
-        ocr_text: Optional[str] = None,
-        mode: str = "append",
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        normalized_mode = validate_mode(mode)
-        raw_chunks = image_payload_to_chunks(
-            filename=filename,
-            content_base64=content_base64,
-            ocr_text=ocr_text,
-            config=self._config,
-        )
-        chunks, report = prepare_chunks(raw_chunks, self._config)
-        log_chunks_for_ingest(self._config, "image_ocr_ingest_payload", chunks, normalized_mode, filename=filename)
-        return self._apply_chunks_locked(
-            chunks,
-            normalized_mode,
-            validation=report,
-            parser_chain=[self._config.ocr_provider, "Qwen-VL"],
-            workspace_id=workspace_id,
-        )
-
-    def ingest_document(
-        self,
-        filename: str,
-        content_base64: str,
-        mode: str = "append",
-        max_pages: Optional[int] = None,
-        render_dpi: Optional[int] = None,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        normalized_mode = validate_mode(mode)
-        content = decode_document_base64(content_base64)
-        etl_config = replace(
-            self._config,
-            baidu_ocr_pdf_max_pages=self._config.baidu_ocr_pdf_max_pages if max_pages is None else max_pages,
-            baidu_ocr_pdf_render_dpi=self._config.baidu_ocr_pdf_render_dpi if render_dpi is None else render_dpi,
-        )
-        try:
-            result = MultimodalETLPipeline(etl_config).parse_bytes(
-                content,
-                filename=filename,
-                max_pages=max_pages,
-                render_dpi=render_dpi,
-            )
-        except Exception as exc:  # noqa: BLE001 - convert parser-specific failures to a stable API error.
-            raise HTTPException(status_code=400, detail=f"å¤šæ¨¡æ€ ETL å¤±è´¥ï¼š{exc}") from exc
-        log_chunks_for_ingest(self._config, "multimodal_document_ingest", result.chunks, normalized_mode, filename=filename)
-        response = self._apply_chunks_locked(
-            result.chunks,
-            normalized_mode,
-            validation=result.validation,
-            parser_chain=result.parser_chain,
-            workspace_id=workspace_id,
-        )
-        document_source = next((chunk.source for chunk in result.chunks if chunk.source), filename)
-        save_stored_document(workspace_id, document_source, filename, content)
-        return response
-
-    def _apply_chunks_locked(
-        self,
-        chunks: List[DocumentChunk],
-        normalized_mode: str,
-        validation: Optional[ETLValidationReport] = None,
-        parser_chain: Optional[List[str]] = None,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        if not chunks and normalized_mode == "replace":
-            raise HTTPException(status_code=400, detail="replace mode requires at least one chunk")
-        chunks = tag_chunks_for_workspace(chunks, workspace_id)
-        with self._lock:
-            if normalized_mode == "replace":
-                previous_sources = {
-                    chunk.source for chunk in self._chunks
-                    if self._chunk_workspace_id(chunk) == workspace_id and chunk.source
-                }
-                incoming_sources = {chunk.source for chunk in chunks if chunk.source}
-                self._chunks = [
-                    chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) != workspace_id
-                ] + chunks
-                for removed_source in previous_sources - incoming_sources:
-                    remove_stored_document(workspace_id, removed_source)
-            else:
-                # Keep different documents searchable while treating a
-                # repeated upload of the same source as an update. This
-                # avoids stale pages and duplicate chunks in append mode.
-                incoming_by_id = {chunk.id: chunk for chunk in chunks}
-                incoming_chunks = list(incoming_by_id.values())
-                incoming_sources = {
-                    chunk.source
-                    for chunk in incoming_chunks
-                    if chunk.source and chunk.source != "unknown"
-                }
-                self._chunks = [
-                    chunk
-                    for chunk in self._chunks
-                    if self._chunk_workspace_id(chunk) != workspace_id
-                    or (chunk.id not in incoming_by_id and chunk.source not in incoming_sources)
-                ]
-                self._chunks.extend(incoming_chunks)
-            self._version += 1
-            self._last_validation = validation or ETLValidationReport(len(chunks), 0, 0)
-            self._persist_runtime_chunks_locked()
-            log_chunks_for_ingest(self._config, "kb_before_pipeline_rebuild", self._chunks, normalized_mode)
-            self._invalidate_workspace_pipelines_locked()
-            return KnowledgeBaseUpdateResponse(
-                status="ok",
-                mode=normalized_mode,
-                chunk_count=sum(1 for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id),
-                summary=self.summary_locked(workspace_id),
-                validation=self._last_validation.to_dict(),
-                parser_chain=list(parser_chain or []),
-            )
-
-    def ingest_jsonl(
-        self,
-        content: str,
-        mode: str = "append",
-        source_name: Optional[str] = None,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-    ) -> KnowledgeBaseUpdateResponse:
-        payloads = parse_jsonl_or_array(content, source_name=source_name or "request.content")
-        return self.update_chunks(payloads, mode=mode, workspace_id=workspace_id)
-
-    def summary(self, workspace_id: Optional[str] = DEFAULT_WORKSPACE_ID) -> KnowledgeBaseSummary:
-        with self._lock:
-            return self.summary_locked(workspace_id)
-
-    def summary_locked(self, workspace_id: Optional[str] = DEFAULT_WORKSPACE_ID) -> KnowledgeBaseSummary:
-        chunks = self._chunks if workspace_id is None else [
-            chunk for chunk in self._chunks if self._chunk_workspace_id(chunk) == workspace_id
-        ]
-        sources = sorted({chunk.source for chunk in chunks if chunk.source})
-        doc_types = sorted({str(chunk.metadata.get("doc_type")) for chunk in chunks if chunk.metadata.get("doc_type")})
-        parent_ids = {chunk.parent_id for chunk in chunks if chunk.parent_id}
-        return KnowledgeBaseSummary(
-            chunk_count=len(chunks),
-            sources=sources,
-            doc_types=doc_types,
-            review_chunk_count=sum(1 for chunk in chunks if chunk.needs_review),
-            parent_count=len(parent_ids),
-        )
-
-    def _invalidate_workspace_pipelines_locked(self) -> None:
-        self._workspace_pipelines.clear()
-
-    def _cache_remote_chunks(self, chunks: Iterable[DocumentChunk]) -> None:
-        """Persist validated remote contexts for later local-first queries."""
-
-        incoming_by_id = {chunk.id: chunk for chunk in chunks if chunk.id}
-        if not incoming_by_id:
-            return
-        with self._lock:
-            current_by_id = {chunk.id: chunk for chunk in self._chunks}
-            changed = [
-                chunk
-                for chunk_id, chunk in incoming_by_id.items()
-                if current_by_id.get(chunk_id) != chunk
-            ]
-            if not changed:
-                return
-            current_by_id.update(incoming_by_id)
-            self._chunks = list(current_by_id.values())
-            self._version += 1
-            self._invalidate_workspace_pipelines_locked()
-            self._persist_runtime_chunks_locked()
-            write_debug_log(
-                self._config,
-                "kb_remote_context_cache",
-                cached_count=len(changed),
-                total_count=len(self._chunks),
-                chunks=chunks_for_debug(changed, text_chars=self._config.debug_log_text_chars),
-            )
-
-    def _load_startup_chunks(self) -> List[DocumentChunk]:
-        paths = startup_kb_paths()
-        chunks: List[DocumentChunk] = []
-        for path in paths:
-            if not path.exists():
-                continue
-            content = path.read_text(encoding="utf-8-sig")
-            chunks.extend(DocumentChunk.from_mapping(payload) for payload in parse_jsonl_or_array(content, source_name=str(path)))
-        return chunks
-
-    def _runtime_path(self) -> Optional[Path]:
-        raw_path = self._config.kb_runtime_path.strip()
-        if not raw_path:
-            return None
-        return Path(raw_path).expanduser().resolve()
-
-    def _load_runtime_chunks(self) -> List[DocumentChunk]:
-        path = self._runtime_path()
-        if path is None or not path.exists():
-            return []
-        try:
-            content = path.read_text(encoding="utf-8-sig")
-            return [
-                DocumentChunk.from_mapping(payload)
-                for payload in parse_jsonl_or_array(content, source_name=str(path))
-            ]
-        except (OSError, ValueError, HTTPException) as exc:
-            write_debug_log(self._config, "kb_runtime_load_error", path=str(path), error=str(exc))
-            return []
-
-    def _persist_runtime_chunks_locked(self) -> None:
-        path = self._runtime_path()
-        if not self._persistence_enabled or path is None:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = path.with_name(f"{path.name}.tmp")
-            payload = "\n".join(json.dumps(chunk_to_dict(chunk), ensure_ascii=False) for chunk in self._chunks)
-            temporary_path.write_text(f"{payload}\n" if payload else "", encoding="utf-8")
-            os.replace(temporary_path, path)
-        except OSError as exc:
-            write_debug_log(self._config, "kb_runtime_persist_error", path=str(path), error=str(exc))
-
-
-def startup_kb_paths() -> List[Path]:
-    configured = os.getenv("RAG_KB_PATHS", "").strip()
-    if configured:
-        return [Path(item).expanduser().resolve() for item in configured.split(";") if item.strip()]
-    return [DEFAULT_KB_PATH]
-
-
-def validate_mode(mode: str) -> str:
-    normalized = (mode or "append").strip().lower()
-    if normalized not in {"replace", "append"}:
-        raise HTTPException(status_code=400, detail="mode must be 'replace' or 'append'")
-    return normalized
-
-
-def log_chunks_for_ingest(
-    config: RAGConfig,
-    event: str,
-    chunks: List[DocumentChunk],
-    mode: str,
-    filename: Optional[str] = None,
-) -> None:
-    write_debug_log(
-        config,
-        event,
-        mode=mode,
-        filename=filename,
-        chunk_count=len(chunks),
-        chunks=chunks_for_debug(chunks, text_chars=config.debug_log_text_chars),
-    )
-
-
-def parse_jsonl_or_array(content: str, source_name: str = "content") -> List[Dict[str, Any]]:
-    text = (content or "").strip().lstrip("\ufeff")
-    if not text:
-        raise HTTPException(status_code=400, detail="knowledge content is empty")
-    try:
-        if text.startswith("["):
-            payload = json.loads(text)
-            if not isinstance(payload, list):
-                raise ValueError("JSON array expected")
-            return [ensure_mapping(item, source_name, index + 1) for index, item in enumerate(payload)]
-        records: List[Dict[str, Any]] = []
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            stripped = line.strip().lstrip("\ufeff")
-            if not stripped:
-                continue
-            records.append(ensure_mapping(json.loads(stripped), source_name, line_number))
-        if not records:
-            raise ValueError("no JSONL records found")
-        return records
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"invalid JSON in {source_name}:{exc.lineno}: {exc.msg}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"invalid knowledge content in {source_name}: {exc}") from exc
-
-
-def decode_pdf_base64(content_base64: str) -> bytes:
-    payload = (content_base64 or "").strip()
-    if "," in payload and payload.lower().startswith("data:"):
-        payload = payload.split(",", 1)[1]
-    try:
-        pdf_bytes = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid base64 PDF payload") from exc
-    if len(pdf_bytes) > MAX_PDF_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="PDF exceeds 10MB upload limit")
-    if not pdf_bytes.startswith(b"%PDF-"):
-        raise HTTPException(status_code=400, detail="uploaded file is not a PDF")
-    return pdf_bytes
-
-
-def pdf_bytes_to_chunks(
-    pdf_bytes: bytes,
-    filename: str,
-    config: RAGConfig = DEFAULT_CONFIG,
-    max_pages: Optional[int] = None,
-    render_dpi: Optional[int] = None,
-) -> List[DocumentChunk]:
-    source = Path(filename or "uploaded.pdf").name or "uploaded.pdf"
-    page_texts = extract_pdf_text_by_page(pdf_bytes)
-    chunks: List[DocumentChunk] = []
-    for page_number, page_text in enumerate(page_texts, start=1):
-        for block_number, block_text in enumerate(split_text_blocks(page_text), start=1):
-            chunks.append(
-                DocumentChunk(
-                    id=f"{source}:p{page_number}:b{block_number}",
-                    text=block_text,
-                    source=source,
-                    page=page_number,
-                    block_id=f"p{page_number}-b{block_number}",
-                    modality="pdf_text",
-                    metadata={"doc_type": "PDFæ–‡æ¡£", "ingest_format": "pdf", "parser": "lightweight_pdf_text"},
-                )
-            )
-    is_searchable = bool(chunks) and pdf_chunks_are_searchable(chunks)
-    write_debug_log(
-        config,
-        "pdf_lightweight_parse_result",
-        filename=source,
-        chunk_count=len(chunks),
-        searchable=is_searchable,
-        chunks=chunks_for_debug(chunks, text_chars=config.debug_log_text_chars),
-    )
-    if is_searchable:
-        return chunks
-    write_debug_log(config, "pdf_fallback_to_baidu_ocr", filename=source, reason="lightweight_parse_empty_or_garbled")
-    chunks = pdf_bytes_to_baidu_ocr_chunks(
-        pdf_bytes,
-        source=source,
-        config=config,
-        max_pages=max_pages,
-        render_dpi=render_dpi,
-    )
-    write_debug_log(
-        config,
-        "pdf_baidu_ocr_result",
-        filename=source,
-        chunk_count=len(chunks),
-        ingest_formats=sorted({str(chunk.metadata.get("ingest_format")) for chunk in chunks if chunk.metadata.get("ingest_format")}),
-        chunks=chunks_for_debug(chunks, text_chars=config.debug_log_text_chars),
-    )
-    if not chunks:
-        raise HTTPException(status_code=400, detail="ç™¾åº¦ OCR æœªä»Ž PDF ä¸­è¯†åˆ«åˆ°å¯å…¥åº“æ–‡æœ¬ï¼Œè¯·æ£€æŸ¥ PDF æ¸…æ™°åº¦ã€‚")
-    return chunks
-
-
-def pdf_bytes_to_baidu_ocr_chunks(
-    pdf_bytes: bytes,
-    source: str,
-    config: RAGConfig = DEFAULT_CONFIG,
-    max_pages: Optional[int] = None,
-    render_dpi: Optional[int] = None,
-) -> List[DocumentChunk]:
-    try:
-        page_limit = config.baidu_ocr_pdf_max_pages if max_pages is None else max_pages
-        dpi = config.baidu_ocr_pdf_render_dpi if render_dpi is None else render_dpi
-        return BaiduOCRAdapter(config).parse_pdf_bytes(
-            pdf_bytes,
-            source=source,
-            max_pages=page_limit,
-            render_dpi=dpi,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"PDF æ–‡æœ¬è§£æžè´¨é‡ä¸è¶³ï¼Œä¸”ç™¾åº¦ OCR æœªå®Œæˆï¼š{exc}ã€‚è¯·æ£€æŸ¥ç™¾åº¦ OCR Keyï¼Œæˆ–ä¸Šä¼ æ¸…æ™°å›¾ç‰‡/æ‰‹åŠ¨ OCR æ–‡æœ¬ã€‚",
-        ) from exc
-
-
-def image_payload_to_chunks(
-    filename: str,
-    content_base64: str,
-    ocr_text: Optional[str] = None,
-    config: RAGConfig = DEFAULT_CONFIG,
-) -> List[DocumentChunk]:
-    source = Path(filename or "uploaded-image").name or "uploaded-image"
-    image_bytes = decode_image_base64(content_base64)
-    text = (ocr_text or "").strip()
-    if text:
-        return [
-            DocumentChunk(
-                id=f"{source}:image-ocr:1",
-                text=text,
-                source=source,
-                page=1,
-                block_id="image-ocr-1",
-                modality="image_ocr",
-                metadata={"doc_type": "å›¾ç‰‡OCR", "ingest_format": "image", "ocr_provider": "manual", "image_bytes": len(image_bytes)},
-            )
-        ]
-    try:
-        chunks = BaiduOCRAdapter(config).parse_image_bytes(image_bytes, source=source)
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"ç™¾åº¦ OCR æœªå®Œæˆï¼š{exc}ã€‚è¯·æ£€æŸ¥ OCR å‡­æ®ï¼Œæˆ–ä¸´æ—¶ç²˜è´´ OCR æ–‡æœ¬ã€‚",
-        ) from exc
-    if not chunks:
-        raise HTTPException(status_code=400, detail="ç™¾åº¦ OCR æœªè¯†åˆ«åˆ°å¯å…¥åº“æ–‡æœ¬ï¼Œè¯·æ£€æŸ¥å›¾ç‰‡æ¸…æ™°åº¦ã€‚")
-    return chunks
-
-
-def decode_image_base64(content_base64: str) -> bytes:
-    payload = (content_base64 or "").strip()
-    if "," in payload and payload.lower().startswith("data:"):
-        payload = payload.split(",", 1)[1]
-    try:
-        image_bytes = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid base64 image payload") from exc
-    if len(image_bytes) > MAX_PDF_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="image exceeds 10MB upload limit")
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="uploaded image is empty")
-    return image_bytes
-
-
-def decode_document_base64(content_base64: str) -> bytes:
-    payload = (content_base64 or "").strip()
-    if "," in payload and payload.lower().startswith("data:"):
-        payload = payload.split(",", 1)[1]
-    try:
-        content = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="invalid base64 document payload") from exc
-    if len(content) > MAX_PDF_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="document exceeds 10MB upload limit")
-    if not content:
-        raise HTTPException(status_code=400, detail="uploaded document is empty")
-    return content
-
-
-def extract_pdf_text_by_page(pdf_bytes: bytes) -> List[str]:
-    objects = parse_pdf_objects(pdf_bytes)
-    unicode_map = build_pdf_unicode_map(objects.values())
-    page_refs = [obj_id for obj_id, body in objects.items() if is_pdf_page_object(body)]
-    page_texts: List[str] = []
-    for page_ref in page_refs:
-        stream_refs = page_content_refs(objects[page_ref])
-        page_parts = [extract_pdf_stream_text(objects.get(ref, b""), unicode_map) for ref in stream_refs]
-        page_text = normalize_pdf_text("\n".join(part for part in page_parts if part))
-        if page_text:
-            page_texts.append(page_text)
-    if page_texts:
-        return page_texts
-    stream_texts = [extract_pdf_stream_text(body, unicode_map) for body in objects.values()]
-    merged = normalize_pdf_text("\n".join(text for text in stream_texts if text))
-    return [merged] if merged else []
-
-
-def parse_pdf_objects(pdf_bytes: bytes) -> Dict[int, bytes]:
-    objects: Dict[int, bytes] = {}
-    pattern = re.compile(rb"(\d+)\s+\d+\s+obj\b(.*?)\bendobj", re.S)
-    for match in pattern.finditer(pdf_bytes):
-        objects[int(match.group(1))] = match.group(2)
-    return objects
-
-
-def is_pdf_page_object(body: bytes) -> bool:
-    return b"/Type" in body and re.search(rb"/Type\s*/Page\b", body) is not None
-
-
-def page_content_refs(page_body: bytes) -> List[int]:
-    contents_match = re.search(rb"/Contents\s*(\[(.*?)\]|\d+\s+\d+\s+R)", page_body, re.S)
-    if not contents_match:
-        return []
-    content_spec = contents_match.group(1)
-    return [int(ref) for ref in re.findall(rb"(\d+)\s+\d+\s+R", content_spec)]
-
-
-def extract_pdf_stream_text(object_body: bytes, unicode_map: Dict[bytes, str]) -> str:
-    stream = decoded_pdf_stream(object_body)
-    if not stream:
-        return ""
-    parts: List[str] = []
-    for text_block in re.findall(rb"BT\b(.*?)\bET", stream, flags=re.S):
-        parts.extend(extract_pdf_strings(text_block, unicode_map))
-    return normalize_pdf_text(" ".join(parts))
-
-
-def decoded_pdf_stream(object_body: bytes) -> bytes:
-    match = re.search(rb"stream\r?\n(.*?)\r?\nendstream", object_body, re.S)
-    if not match:
-        return b""
-    stream = match.group(1)
-    if b"/FlateDecode" in object_body:
-        try:
-            return zlib.decompress(stream)
-        except zlib.error:
-            return b""
-    return stream
-
-
-def build_pdf_unicode_map(object_bodies: Iterable[bytes]) -> Dict[bytes, str]:
-    unicode_map: Dict[bytes, str] = {}
-    for body in object_bodies:
-        stream = decoded_pdf_stream(body)
-        if b"beginbfchar" not in stream and b"beginbfrange" not in stream:
-            continue
-        text = stream.decode("latin-1", errors="ignore")
-        for block in re.findall(r"beginbfchar(.*?)endbfchar", text, flags=re.S):
-            for src, dst in re.findall(r"<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>", block):
-                unicode_map[bytes.fromhex(src)] = decode_utf16_hex(dst)
-        for block in re.findall(r"beginbfrange(.*?)endbfrange", text, flags=re.S):
-            for src_start, src_end, dst in re.findall(r"<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>", block):
-                start = int(src_start, 16)
-                end = int(src_end, 16)
-                dst_start = int(dst, 16)
-                src_width = len(src_start) // 2
-                dst_width = len(dst) // 2
-                if end - start > 512:
-                    continue
-                for offset, src_value in enumerate(range(start, end + 1)):
-                    unicode_map[src_value.to_bytes(src_width, "big")] = decode_utf16_bytes(
-                        (dst_start + offset).to_bytes(dst_width, "big")
-                    )
-            for src_start, src_end, dst_values in re.findall(
-                r"<([0-9A-Fa-f]+)>\s+<([0-9A-Fa-f]+)>\s+\[(.*?)\]", block, flags=re.S
-            ):
-                start = int(src_start, 16)
-                src_width = len(src_start) // 2
-                values = re.findall(r"<([0-9A-Fa-f]+)>", dst_values)
-                for offset, dst in enumerate(values[:512]):
-                    unicode_map[(start + offset).to_bytes(src_width, "big")] = decode_utf16_hex(dst)
-    return unicode_map
-
-
-def extract_pdf_strings(text_block: bytes, unicode_map: Dict[bytes, str]) -> List[str]:
-    strings: List[str] = []
-    index = 0
-    while index < len(text_block):
-        char = text_block[index : index + 1]
-        if char == b"(":
-            literal, index = read_pdf_literal_string(text_block, index + 1)
-            strings.append(decode_pdf_bytes(literal))
-            continue
-        if char == b"<" and text_block[index : index + 2] != b"<<":
-            end = text_block.find(b">", index + 1)
-            if end == -1:
-                break
-            hex_text = re.sub(rb"\s+", b"", text_block[index + 1 : end])
-            try:
-                raw = bytes.fromhex(hex_text.decode("ascii"))
-                strings.append(decode_pdf_hex_bytes(raw, unicode_map))
-            except ValueError:
-                pass
-            index = end + 1
-            continue
-        index += 1
-    return [item for item in strings if item]
-
-
-def read_pdf_literal_string(data: bytes, start: int) -> tuple[bytes, int]:
-    result = bytearray()
-    depth = 1
-    index = start
-    while index < len(data) and depth > 0:
-        char = data[index]
-        if char == 92:
-            if index + 1 >= len(data):
-                break
-            next_char = data[index + 1]
-            escape_map = {110: 10, 114: 13, 116: 9, 98: 8, 102: 12, 40: 40, 41: 41, 92: 92}
-            if next_char in escape_map:
-                result.append(escape_map[next_char])
-                index += 2
-                continue
-            if 48 <= next_char <= 55:
-                octal = bytes([next_char])
-                lookahead = index + 2
-                while lookahead < len(data) and len(octal) < 3 and 48 <= data[lookahead] <= 55:
-                    octal += bytes([data[lookahead]])
-                    lookahead += 1
-                # PDF literal strings are byte-oriented. A few generators emit
-                # malformed octal escapes above \377; keep the low byte so one
-                # bad escape does not abort the complete document upload.
-                result.append(int(octal, 8) & 0xFF)
-                index = lookahead
-                continue
-            index += 2
-            continue
-        if char == 40:
-            depth += 1
-        elif char == 41:
-            depth -= 1
-            if depth == 0:
-                index += 1
-                break
-        result.append(char)
-        index += 1
-    return bytes(result), index
-
-
-def decode_pdf_hex_bytes(raw: bytes, unicode_map: Dict[bytes, str]) -> str:
-    if unicode_map:
-        lengths = sorted({len(key) for key in unicode_map}, reverse=True)
-        output: List[str] = []
-        index = 0
-        while index < len(raw):
-            matched = False
-            for length in lengths:
-                token = raw[index : index + length]
-                if token in unicode_map:
-                    output.append(unicode_map[token])
-                    index += length
-                    matched = True
-                    break
-            if not matched:
-                output.append(decode_pdf_bytes(raw[index : index + 1]))
-                index += 1
-        return "".join(output)
-    return decode_pdf_bytes(raw)
-
-
-def decode_pdf_bytes(raw: bytes) -> str:
-    if not raw:
-        return ""
-    for encoding in ("utf-8", "utf-16-be", "latin-1"):
-        try:
-            text = raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        if text and printable_ratio(text) >= 0.5:
-            return text
-    return raw.decode("latin-1", errors="ignore")
-
-
-def decode_utf16_hex(value: str) -> str:
-    return decode_utf16_bytes(bytes.fromhex(value))
-
-
-def decode_utf16_bytes(value: bytes) -> str:
-    if not value:
-        return ""
-    encoding = "utf-16-be" if len(value) % 2 == 0 else "latin-1"
-    return value.decode(encoding, errors="ignore")
-
-
-def printable_ratio(text: str) -> float:
-    if not text:
-        return 0.0
-    printable = sum(1 for char in text if char.isprintable() or char.isspace())
-    return printable / len(text)
-
-
-def normalize_pdf_text(text: str) -> str:
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", text)
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def split_text_blocks(text: str, max_chars: int = 900) -> List[str]:
-    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
-    blocks: List[str] = []
-    current = ""
-    for paragraph in paragraphs or [text.strip()]:
-        if len(current) + len(paragraph) + 1 <= max_chars:
-            current = f"{current}\n{paragraph}".strip()
-            continue
-        if current:
-            blocks.append(current)
-        while len(paragraph) > max_chars:
-            blocks.append(paragraph[:max_chars].strip())
-            paragraph = paragraph[max_chars:].strip()
-        current = paragraph
-    if current:
-        blocks.append(current)
-    return blocks
-
-
-def ensure_mapping(value: Any, source_name: str, line_number: int) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"record {line_number} in {source_name} must be a JSON object")
-    return value
-
-
-def chunk_to_dict(chunk: DocumentChunk) -> Dict[str, Any]:
-    return {
-        "id": chunk.id,
-        "text": chunk.text,
-        "source": chunk.source,
-        "page": chunk.page,
-        "block_id": chunk.block_id,
-        "modality": chunk.modality,
-        "coordinates": None
-        if chunk.coordinates is None
-        else {
-            "x1": chunk.coordinates.x1,
-            "y1": chunk.coordinates.y1,
-            "x2": chunk.coordinates.x2,
-            "y2": chunk.coordinates.y2,
-        },
-        "metadata": dict(chunk.metadata),
-        "image_path": chunk.image_path,
-        "parent_id": chunk.parent_id,
-        "chunk_level": chunk.chunk_level,
-        "confidence": chunk.confidence,
-        "needs_review": chunk.needs_review,
-    }
-
-
-def sse_event(event: str, payload: Any) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def text_stream_chunks(text: str, size: int = 36) -> Iterable[str]:
-    for start in range(0, len(text), max(1, size)):
-        yield text[start : start + size]
-
-
-def auth_enforcement_enabled() -> bool:
-    return os.getenv("RAG_AUTH_ENFORCEMENT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _legacy_data_endpoint(path: str) -> bool:
-    return (
-        path in {"/answer", "/answer/stream", "/vector/status", "/vector/collection", "/vector/ingest", "/vector/search"}
-        or path.startswith("/kb/")
-        or (path.startswith("/workspaces/") and path.count("/") == 2)
-    )
-
-
-def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config: RAGConfig = DEFAULT_CONFIG) -> FastAPI:
-    kb_state = KnowledgeBaseState(config=config, initial_chunks=initial_chunks)
-    document_delete_jobs: Dict[str, Dict[str, Any]] = {}
-    document_delete_jobs_lock = RLock()
-    app = FastAPI(
-        title="Education Multimodal RAG API",
-        description="Source-grounded API for education-material multimodal RAG.",
-        version="0.2.0",
-    )
-    app.state.kb = kb_state
-    app.state.document_delete_jobs = document_delete_jobs
-    app.state.auth_store = None
-    cors_origins = parse_cors_origins()
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_credentials="*" not in cors_origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    app.include_router(auth_router, prefix="/api/auth")
-    app.include_router(conversation_router)
-    app.include_router(workspace_router)
-    app.include_router(workspace_admin_router)
-
-    async def authorize_legacy_request(request: Request) -> Optional[Response]:
-        path = request.url.path
-        if request.method == "OPTIONS":
-            # Let CORSMiddleware answer browser preflight before requiring a session.
-            return None
-        if not _legacy_data_endpoint(path):
-            return None
-        enforcement_enabled = auth_enforcement_enabled()
-        if not enforcement_enabled and path not in {"/answer", "/answer/stream"}:
-            return None
-
-        try:
-            store = _auth_store(request)
-            principal = await run_in_threadpool(store.current_principal, request.cookies.get("kujie_session"))
-        except AuthServiceUnavailable:
-            return JSONResponse(status_code=503, content={"detail": "è´¦å·æœåŠ¡æš‚ä¸å¯ç”¨"})
-        except HTTPException as exc:
-            return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
-        if principal is None:
-            if enforcement_enabled:
-                return JSONResponse(status_code=401, content={"detail": "è¯·å…ˆç™»å½•"})
-            return None
-        request.state.auth_principal = principal
-        is_platform_admin = principal.user.get("platform_role") == "platform_admin"
-        workspace_store = WorkspaceStore(store)
-
-        def denied(status_code: int, detail: str) -> JSONResponse:
-            return JSONResponse(status_code=status_code, content={"detail": detail})
-
-        global_admin_paths = {"/vector/status", "/vector/collection"}
-        is_legacy_workspace_delete = request.method == "DELETE" and path.startswith("/workspaces/")
-        if path in global_admin_paths or is_legacy_workspace_delete:
-            if not is_platform_admin:
-                return denied(403, "éœ€è¦å¹³å°ç®¡ç†å‘˜æƒé™")
-
-        is_write = request.method in {"POST", "PUT", "PATCH", "DELETE"}
-        if is_write:
-            try:
-                _require_browser_request(request, require_json=request.method != "DELETE")
-                _require_csrf(request, principal)
-            except HTTPException as exc:
-                return denied(exc.status_code, str(exc.detail))
-
-        payload: dict[str, Any] = {}
-        if request.method in {"POST", "PUT", "PATCH"}:
-            raw_body = await request.body()
-            try:
-                parsed = json.loads(raw_body) if raw_body else {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return denied(400, "è¯·æ±‚ä½“ä¸æ˜¯æœ‰æ•ˆçš„ JSON")
-            if not isinstance(parsed, dict):
-                return denied(400, "è¯·æ±‚ä½“æ ¼å¼æ— æ•ˆ")
-            payload = parsed
-
-            async def replay_body():
-                return {"type": "http.request", "body": raw_body, "more_body": False}
-
-            request._receive = replay_body
-
-        if path in {"/answer", "/answer/stream"}:
-            scope = str(payload.get("scope") or "workspace")
-            workspace_id = str(payload.get("workspace_id") or DEFAULT_WORKSPACE_ID)
-            try:
-                resolved = await run_in_threadpool(
-                    workspace_store.resolve_readable_scope,
-                    principal.user["id"],
-                    scope,
-                    workspace_id,
-                )
-            except WorkspaceNotFound as exc:
-                return denied(404, str(exc))
-            except WorkspaceForbidden as exc:
-                return denied(403, str(exc))
-            except ValueError as exc:
-                return denied(422, str(exc))
-            except AuthServiceUnavailable:
-                return denied(503, "è´¦å·æˆ–å·¥ä½œåŒºæƒé™æœåŠ¡æš‚ä¸å¯ç”¨")
-            request.state.auth_workspace_scope = {**resolved, "scope": scope}
-            request.state.auth_requested_workspace_id = workspace_id
-        elif path == "/vector/ingest":
-            workspace_id = str(payload.get("workspace_id") or "").strip()
-            mode = str(payload.get("mode") or "append").strip().lower()
-            if mode == "replace":
-                if workspace_id:
-                    return denied(422, "å‘é‡ç´¢å¼•æ›¿æ¢ä»…æ”¯æŒå¹³å°çº§æ“ä½œ")
-                if not is_platform_admin:
-                    return denied(403, "å…¨é‡é‡å»ºå‘é‡ç´¢å¼•éœ€è¦å¹³å°ç®¡ç†å‘˜æƒé™")
-            elif workspace_id:
-                try:
-                    access = await run_in_threadpool(
-                        workspace_store.get_workspace,
-                        principal.user["id"],
-                        workspace_id,
-                    )
-                except WorkspaceNotFound as exc:
-                    return denied(404, str(exc))
-                except WorkspaceForbidden as exc:
-                    return denied(403, str(exc))
-                except AuthServiceUnavailable:
-                    return denied(503, "è´¦å·æˆ–å·¥ä½œåŒºæƒé™æœåŠ¡æš‚ä¸å¯ç”¨")
-                if not access.get("can_manage_content"):
-                    return denied(403, "éœ€è¦æœ¬å·¥ä½œåŒºç®¡ç†æƒé™")
-                request.state.auth_workspace_id = workspace_id
-            elif not is_platform_admin:
-                return denied(403, "å…¨åº“å‘é‡åŒæ­¥éœ€è¦å¹³å°ç®¡ç†å‘˜æƒé™")
-        elif path in global_admin_paths or is_legacy_workspace_delete:
-            # The platform administrator may run global maintenance operations.
-            pass
-        elif path == "/kb/documents/delete" or path.startswith("/kb/documents/delete/"):
-            if request.method == "GET":
-                job_id = path.rsplit("/", 1)[-1]
-                with document_delete_jobs_lock:
-                    job = document_delete_jobs.get(job_id)
-                    job_snapshot = dict(job) if job else None
-                if job_snapshot is None:
-                    return denied(404, "åˆ é™¤ä»»åŠ¡ä¸å­˜åœ¨æˆ–å·²è¿‡æœŸ")
-                if job_snapshot.get("created_by_user_id") != principal.user["id"]:
-                    try:
-                        access = await run_in_threadpool(
-                            workspace_store.get_workspace,
-                            principal.user["id"],
-                            str(job_snapshot.get("workspace_id") or ""),
-                        )
-                    except (WorkspaceNotFound, WorkspaceForbidden):
-                        return denied(404, "åˆ é™¤ä»»åŠ¡ä¸å­˜åœ¨æˆ–å·²è¿‡æœŸ")
-                    if not access.get("can_manage_content"):
-                        return denied(404, "åˆ é™¤ä»»åŠ¡ä¸å­˜åœ¨æˆ–å·²è¿‡æœŸ")
-                request.state.auth_workspace_id = str(job_snapshot.get("workspace_id") or "")
-            else:
-                workspace_id = str(payload.get("workspace_id") or DEFAULT_WORKSPACE_ID)
-                try:
-                    access = await run_in_threadpool(
-                        workspace_store.get_workspace,
-                        principal.user["id"],
-                        workspace_id,
-                    )
-                except WorkspaceNotFound as exc:
-                    return denied(404, str(exc))
-                except WorkspaceForbidden as exc:
-                    return denied(403, str(exc))
-                except AuthServiceUnavailable:
-                    return denied(503, "è´¦å·æˆ–å·¥ä½œåŒºæƒé™æœåŠ¡æš‚ä¸å¯ç”¨")
-                if not access.get("can_manage_content"):
-                    return denied(403, "éœ€è¦æœ¬å·¥ä½œåŒºç®¡ç†æƒé™")
-                request.state.auth_workspace_id = workspace_id
-        else:
-            workspace_id = str(
-                payload.get("workspace_id")
-                or request.query_params.get("workspace_id")
-                or DEFAULT_WORKSPACE_ID
-            )
-            try:
-                access = await run_in_threadpool(
-                    workspace_store.get_workspace,
-                    principal.user["id"],
-                    workspace_id,
-                )
-            except WorkspaceNotFound as exc:
-                return denied(404, str(exc))
-            except WorkspaceForbidden as exc:
-                return denied(403, str(exc))
-            except AuthServiceUnavailable:
-                return denied(503, "è´¦å·æˆ–å·¥ä½œåŒºæƒé™æœåŠ¡æš‚ä¸å¯ç”¨")
-            if is_write and not access.get("can_manage_content"):
-                return denied(403, "éœ€è¦æœ¬å·¥ä½œåŒºç®¡ç†æƒé™")
-            if not is_write and not access.get("can_read"):
-                return denied(403, "æ— æƒè¯»å–è¯¥å·¥ä½œåŒº")
-            request.state.auth_workspace_id = workspace_id
-            request.state.auth_permission_cache_scope = (
-                f"u{principal.user.get('permissions_version', 0)}:"
-                f"{workspace_id}={access.get('version')}:{access.get('role')}"
-            )
-
-        return None
-
-    async def answer_scope_change(request: Request) -> str | None:
-        original_scope = getattr(request.state, "auth_workspace_scope", None)
-        if original_scope is None:
-            return None
-        try:
-            store = _auth_store(request)
-            current = await run_in_threadpool(store.current_principal, request.cookies.get("kujie_session"))
-            if current is None or current.user.get("id") != original_scope.get("user_id"):
-                return "session_revoked"
-            if current.user.get("permissions_version") != original_scope.get("user_permissions_version"):
-                return "permission_changed"
-            resolved = await run_in_threadpool(
-                WorkspaceStore(store).resolve_readable_scope,
-                current.user["id"],
-                str(original_scope.get("scope") or "workspace"),
-                request.state.auth_requested_workspace_id,
-            )
-            if resolved.get("cache_scope") != original_scope.get("cache_scope"):
-                return "permission_changed"
-            return None
-        except AuthServiceUnavailable:
-            return "permission_changed"
-        except (WorkspaceForbidden, WorkspaceNotFound, ValueError):
-            return "permission_changed"
-
-    @app.middleware("http")
-    async def preserve_error_reason_for_browser(request: Request, call_next):
-        """Keep API errors readable by browsers from configured frontend origins."""
-
-        try:
-            auth_response = await authorize_legacy_request(request)
-            response = auth_response if auth_response is not None else await call_next(request)
-        except HTTPException as exc:
-            response = JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
-        except Exception as exc:  # noqa: BLE001 - final API safety net.
-            error = explain_api_error(exc, 500, type(exc).__name__)
-            write_debug_log(config, "unhandled_api_error", error_type=type(exc).__name__, error=error["technical_detail"])
-            response = JSONResponse(
-                status_code=500,
-                content={"detail": f"åŽŸå› ï¼š{error['reason']} å¤„ç†å»ºè®®ï¼š{error['suggestion']}", "error": error},
-            )
-
-        origin = request.headers.get("origin", "")
-        if origin and (origin in cors_origins or "*" in cors_origins):
-            response.headers.setdefault("Access-Control-Allow-Origin", origin)
-            vary = response.headers.get("Vary", "")
-            if "origin" not in {part.strip().lower() for part in vary.split(",")}:
-                response.headers["Vary"] = f"{vary}, Origin" if vary else "Origin"
-        return response
-
-    @app.exception_handler(HTTPException)
-    async def explain_http_exception(_request: Request, exc: HTTPException) -> JSONResponse:
-        error = explain_api_error(exc.detail, exc.status_code, type(exc).__name__)
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": f"åŽŸå› ï¼š{error['reason']} å¤„ç†å»ºè®®ï¼š{error['suggestion']}", "error": error},
-            headers=exc.headers,
-        )
-
-    @app.exception_handler(RequestValidationError)
-    async def explain_validation_exception(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        fields = []
-        for item in exc.errors():
-            location = ".".join(str(part) for part in item.get("loc", []) if part != "body")
-            message = str(item.get("msg") or "å‚æ•°æ— æ•ˆ")
-            fields.append(f"{location or 'è¯·æ±‚ä½“'}: {message}")
-        error = explain_api_error("ï¼›".join(fields), 422, type(exc).__name__)
-        return JSONResponse(
-            status_code=422,
-            content={"detail": f"åŽŸå› ï¼š{error['reason']} å¤„ç†å»ºè®®ï¼š{error['suggestion']}", "error": error},
-        )
-
-    @app.exception_handler(Exception)
-    async def explain_unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
-        error = explain_api_error(exc, 500, type(exc).__name__)
-        write_debug_log(config, "unhandled_api_error", error_type=type(exc).__name__, error=error["technical_detail"])
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"åŽŸå› ï¼š{error['reason']} å¤„ç†å»ºè®®ï¼š{error['suggestion']}", "error": error},
-        )
-
-    if FRONTEND_DIR.exists():
-        app.mount("/frontend", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-
-    def record_audit_event(
-        actor_user_id: str | None,
-        action: str,
-        target_type: str,
-        target_id: str | None,
-        details: Dict[str, Any],
-    ) -> None:
-        if not actor_user_id:
-            return
-        store = getattr(app.state, "auth_store", None)
-        if store is None:
-            return
-        try:
-            store.record_audit_event(actor_user_id, action, target_type, target_id, details)
-        except AuthServiceUnavailable as exc:
-            write_debug_log(
-                config,
-                "auth_audit_write_failed",
-                action=action,
-                target_type=target_type,
-                error_type=type(exc).__name__,
-            )
-
-    def record_request_workspace_audit(http_request: Request, action: str, details: Dict[str, Any]) -> None:
-        principal = getattr(http_request.state, "auth_principal", None)
-        if principal is None:
-            return
-        workspace_id = str(getattr(http_request.state, "auth_workspace_id", DEFAULT_WORKSPACE_ID))
-        record_audit_event(principal.user["id"], action, "workspace", workspace_id, details)
-
-    def update_document_delete_job(job_id: str, **updates: Any) -> None:
-        with document_delete_jobs_lock:
-            job = document_delete_jobs.get(job_id)
-            if job is not None:
-                job.update(updates)
-
-    def run_document_delete_job(job_id: str, source: str, workspace_id: str, actor_user_id: str | None) -> None:
-        update_document_delete_job(status="running", progress=5, phase="æ­£åœ¨æ£€æŸ¥èµ„æ–™ç´¢å¼•")
-        try:
-            chunk_ids = kb_state.document_chunk_ids(source, workspace_id)
-            if not chunk_ids:
-                raise HTTPException(status_code=404, detail=f"çŸ¥è¯†åº“ä¸­ä¸å­˜åœ¨èµ„æ–™ï¼š{source}")
-
-            if config.vector_store_provider == "memory":
-                update_document_delete_job(progress=78, phase="æ­£åœ¨æ›´æ–°æœ¬åœ°å‘é‡ç´¢å¼•")
-            else:
-                update_document_delete_job(progress=12, phase="æ­£åœ¨è¿žæŽ¥æœ¬åœ°å‘é‡åº“")
-                vector_store = MilvusVectorStore(config=config, embedding=HashEmbeddingAdapter(config))
-
-                def report_vector_progress(done: int, total: int) -> None:
-                    ratio = done / max(total, 1)
-                    update_document_delete_job(
-                        progress=20 + round(ratio * 62),
-                        phase=f"æ­£åœ¨åˆ é™¤å‘é‡ç´¢å¼•ï¼ˆ{done}/{total}ï¼‰",
-                    )
-
-                vector_store.delete_chunk_ids(chunk_ids, progress_callback=report_vector_progress)
-
-            update_document_delete_job(progress=88, phase="æ­£åœ¨ä»ŽçŸ¥è¯†åº“ç§»é™¤èµ„æ–™")
-            result = kb_state.delete_document(source, chunk_ids, workspace_id)
-            record_audit_event(
-                actor_user_id,
-                "workspace_document_deleted",
-                "workspace",
-                workspace_id,
-                {"source": source, "removed_chunk_count": result["removed_chunk_count"]},
-            )
-            update_document_delete_job(
-                status="completed",
-                progress=100,
-                phase="åˆ é™¤å®Œæˆ",
-                removed_chunk_count=result["removed_chunk_count"],
-                summary=result["summary"],
-                error="",
-            )
-        except Exception as exc:  # noqa: BLE001 - keep job state pollable when backend operations fail.
-            detail = exc.detail if isinstance(exc, HTTPException) else exc
-            status_code = exc.status_code if isinstance(exc, HTTPException) else 503
-            error = explain_api_error(detail, status_code, type(exc).__name__)["reason"]
-            update_document_delete_job(status="failed", phase="åˆ é™¤å¤±è´¥", error=error)
-
-    @app.get("/")
-    def root() -> Dict[str, Any]:
-        return {
-            "service": "education-rag-api",
-            "health": "/health",
-            "answer": "/answer",
-            "answer_stream": "/answer/stream",
-            "document_ingest": "/kb/document",
-            "frontend": "/frontend/" if FRONTEND_DIR.exists() else None,
-        }
-
-    @app.get("/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
-        infrastructure_status = kb_state.infrastructure.status()
-        return HealthResponse(
-            status="ok",
-            service="education-rag-api",
-            kb_chunk_count=kb_state.chunk_count,
-            model_mode=f"{config.llm_provider}:{config.llm_model}",
-            embedding_provider=config.embedding_provider,
-            embedding_model=config.embedding_model,
-            rerank_provider=config.rerank_provider,
-            rerank_model=config.rerank_model,
-            ocr_provider=config.ocr_provider,
-            vector_store_provider=config.vector_store_provider,
-            vector_collection_name=config.zilliz_collection_name,
-            strict_source_required=config.strict_source_required,
-            default_kb_path=str(DEFAULT_KB_PATH),
-            query_classifier=f"{config.query_classifier_provider}:{config.query_classifier_model}",
-            query_agent=config.query_agent_provider,
-            redis_status=str(infrastructure_status["redis"]),
-            mysql_status=str(infrastructure_status["mysql"]),
-        )
-
-    @app.post("/answer")
-    async def answer(payload: AnswerRequest, http_request: Request) -> Dict[str, Any]:
-        scope = getattr(http_request.state, "auth_workspace_scope", None)
-        principal = getattr(http_request.state, "auth_principal", None)
-        answer_options: dict[str, Any] = {}
-        if scope is not None:
-            answer_options = {
-                "workspace_ids": scope["workspace_ids"],
-                "principal_user_id": scope["user_id"],
-                "permission_cache_scope": scope["cache_scope"],
-                "strict_workspace_metadata": True,
-            }
-        session_id = payload.session_id
-        conversation_context = payload.conversation_context
-        conversation_store = None
-        conversation_id = payload.conversation_id
-        if scope is not None and principal is not None:
-            if not conversation_id:
-                raise HTTPException(status_code=400, detail="è¯·å…ˆåˆ›å»ºæœåŠ¡å™¨å¯¹è¯")
-            conversation_store = ConversationStore(_auth_store(http_request))
-            try:
-                conversation_context = await run_in_threadpool(
-                    conversation_store.begin_turn,
-                    scope["user_id"],
-                    conversation_id,
-                    payload.scope,
-                    payload.workspace_id if payload.scope == "workspace" else None,
-                    scope["workspace_ids"],
-                    payload.question.strip(),
-                )
-            except ConversationNotFound as exc:
-                raise HTTPException(status_code=404, detail="å¯¹è¯ä¸å­˜åœ¨") from exc
-            except ConversationLocked as exc:
-                raise HTTPException(status_code=403, detail=str(exc)) from exc
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            if conversation_context is None:
-                raise HTTPException(status_code=403, detail="èµ„æ–™æƒé™å·²å˜æ›´ï¼Œè¯·æ–°å»ºå¯¹è¯")
-            session_id = authenticated_session_id(scope["user_id"], conversation_id)
-        response = await run_in_threadpool(
-            kb_state.answer,
-            payload.question.strip(),
-            session_id,
-            payload.rerank_rules.dict(),
-            conversation_context=conversation_context,
-            hallucination_threshold=payload.hallucination_threshold,
-            workspace_id=payload.workspace_id,
-            **answer_options,
-        )
-        change = await answer_scope_change(http_request)
-        if change == "session_revoked":
-            raise HTTPException(status_code=401, detail="ç™»å½•çŠ¶æ€å·²å¤±æ•ˆï¼Œè¯·é‡æ–°ç™»å½•")
-        if change == "permission_changed":
-            raise HTTPException(status_code=403, detail="èµ„æ–™æƒé™å·²å˜æ›´ï¼Œè¯·é‡æ–°æé—®")
-        if conversation_store is not None and scope is not None and conversation_id:
-            serialized = response.to_dict()
-            try:
-                await run_in_threadpool(
-                    conversation_store.append_assistant,
-                    scope["user_id"],
-                    conversation_id,
-                    str(serialized.get("answer") or ""),
-                    serialized.get("sources") or [],
-                )
-            except ConversationNotFound as exc:
-                raise HTTPException(status_code=404, detail="å¯¹è¯ä¸å­˜åœ¨") from exc
-            except ConversationLocked as exc:
-                raise HTTPException(status_code=403, detail=str(exc)) from exc
-            change = await answer_scope_change(http_request)
-            if change == "session_revoked":
-                raise HTTPException(status_code=401, detail="ç™»å½•çŠ¶æ€å·²å¤±æ•ˆï¼Œè¯·é‡æ–°ç™»å½•")
-            if change == "permission_changed":
-                raise HTTPException(status_code=403, detail="èµ„æ–™æƒé™å·²å˜æ›´ï¼Œè¯·é‡æ–°æé—®")
-        return response.to_dict()
-
-    @app.post("/answer/stream")
-    async def answer_stream(payload: AnswerRequest, http_request: Request) -> StreamingResponse:
-        scope = getattr(http_request.state, "auth_workspace_scope", None)
-        principal = getattr(http_request.state, "auth_principal", None)
-        answer_options: dict[str, Any] = {}
-        if scope is not None:
-            answer_options = {
-                "workspace_ids": scope["workspace_ids"],
-                "principal_user_id": scope["user_id"],
-                "permission_cache_scope": scope["cache_scope"],
-                "strict_workspace_metadata": True,
-            }
-        session_id = payload.session_id
-        conversation_context = payload.conversation_context
-        conversation_store = None
-        conversation_id = payload.conversation_id
-        if scope is not None and principal is not None:
-            if not conversation_id:
-                raise HTTPException(status_code=400, detail="è¯·å…ˆåˆ›å»ºæœåŠ¡å™¨å¯¹è¯")
-            conversation_store = ConversationStore(_auth_store(http_request))
-            try:
-                conversation_context = await run_in_threadpool(
-                    conversation_store.begin_turn,
-                    scope["user_id"],
-                    conversation_id,
-                    payload.scope,
-                    payload.workspace_id if payload.scope == "workspace" else None,
-                    scope["workspace_ids"],
-                    payload.question.strip(),
-                )
-            except ConversationNotFound as exc:
-                raise HTTPException(status_code=404, detail="å¯¹è¯ä¸å­˜åœ¨") from exc
-            except ConversationLocked as exc:
-                raise HTTPException(status_code=403, detail=str(exc)) from exc
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            if conversation_context is None:
-                raise HTTPException(status_code=403, detail="èµ„æ–™æƒé™å·²å˜æ›´ï¼Œè¯·æ–°å»ºå¯¹è¯")
-            session_id = authenticated_session_id(scope["user_id"], conversation_id)
-
-        async def events() -> AsyncIterator[str]:
-            yield sse_event("status", {"stage": "intent", "message": "æ­£åœ¨è¯†åˆ«é—®é¢˜ç±»åž‹â€¦"})
-            event_queue: Queue[tuple[str, Dict[str, Any]]] = Queue()
-            streamed = False
-            stop_stream = Event()
-
-            def enqueue_token(token: str) -> None:
-                if token and not stop_stream.is_set():
-                    event_queue.put(("token", {"text": token}))
-
-            def enqueue_status(message: str) -> None:
-                if message and not stop_stream.is_set():
-                    event_queue.put(("status", {"message": message}))
-
-            worker = asyncio.create_task(
-                run_in_threadpool(
-                    kb_state.answer,
-                    payload.question.strip(),
-                    session_id,
-                    payload.rerank_rules.dict(),
-                    conversation_context=conversation_context,
-                    on_token=enqueue_token,
-                    hallucination_threshold=payload.hallucination_threshold,
-                    on_status=enqueue_status,
-                    workspace_id=payload.workspace_id,
-                    **answer_options,
-                )
-            )
-            loop = asyncio.get_running_loop()
-            last_permission_check = loop.time()
-            try:
-                while not worker.done() or not event_queue.empty():
-                    if scope is not None and loop.time() - last_permission_check >= 2.0:
-                        last_permission_check = loop.time()
-                        change = await answer_scope_change(http_request)
-                        if change:
-                            stop_stream.set()
-                            while not event_queue.empty():
-                                try:
-                                    event_queue.get_nowait()
-                                except Empty:
-                                    break
-                            worker.cancel()
-                            await asyncio.gather(worker, return_exceptions=True)
-                            yield sse_event(change, {"message": "ç™»å½•çŠ¶æ€æˆ–èµ„æ–™æƒé™å·²å˜æ›´"})
-                            return
-                    try:
-                        event_name, event_payload = event_queue.get_nowait()
-                    except Empty:
-                        await asyncio.sleep(0.015)
-                        continue
-                    if event_name == "token":
-                        streamed = True
-                    yield sse_event(event_name, event_payload)
-                response = await worker
-                change = await answer_scope_change(http_request)
-                if change:
-                    yield sse_event(change, {"message": "ç™»å½•çŠ¶æ€æˆ–èµ„æ–™æƒé™å·²å˜æ›´"})
-                    return
-            except Exception as exc:  # noqa: BLE001 - keep failures visible in an SSE stream.
-                error = explain_api_error(exc, 500, type(exc).__name__)
-                write_debug_log(
-                    config,
-                    "answer_stream_error",
-                    error_type=type(exc).__name__,
-                    error=error["technical_detail"],
-                )
-                yield sse_event("error", {
-                    "code": error["code"],
-                    "reason": error["reason"],
-                    "suggestion": error["suggestion"],
-                })
-                return
-            metadata = response.to_dict()
-            answer_text = str(metadata.pop("answer", ""))
-            if conversation_store is not None and scope is not None and conversation_id:
-                try:
-                    await run_in_threadpool(
-                        conversation_store.append_assistant,
-                        scope["user_id"],
-                        conversation_id,
-                        answer_text,
-                        metadata.get("sources") or [],
-                    )
-                except ConversationLocked:
-                    yield sse_event("permission_changed", {"message": "èµ„æ–™æƒé™å·²å˜æ›´"})
-                    return
-                change = await answer_scope_change(http_request)
-                if change:
-                    yield sse_event(change, {"message": "ç™»å½•çŠ¶æ€æˆ–èµ„æ–™æƒé™å·²å˜æ›´"})
-                    return
-            yield sse_event("metadata", metadata)
-            if not streamed:
-                for token_chunk in text_stream_chunks(answer_text):
-                    yield sse_event("token", {"text": token_chunk})
-            yield sse_event("done", {"answer": answer_text, "cache_hit": response.cache_hit})
-
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    @app.get("/kb/summary", response_model=KnowledgeBaseSummary)
-    def kb_summary(workspace_id: str = DEFAULT_WORKSPACE_ID) -> KnowledgeBaseSummary:
-        return kb_state.summary(workspace_id)
-
-    @app.delete("/workspaces/{workspace_id}")
-    def delete_workspace(workspace_id: str) -> Dict[str, Any]:
-        if not workspace_id or len(workspace_id) > 128:
-            raise HTTPException(status_code=400, detail="å·¥ä½œåŒº ID æ— æ•ˆ")
-        if workspace_id == DEFAULT_WORKSPACE_ID:
-            raise HTTPException(status_code=400, detail="é»˜è®¤å·¥ä½œåŒºä¸èƒ½åˆ é™¤")
-
-        chunk_ids = kb_state.workspace_chunk_ids(workspace_id)
-        if chunk_ids and config.vector_store_provider != "memory":
-            try:
-                vector_store = MilvusVectorStore(config=config, embedding=HashEmbeddingAdapter(config))
-                vector_store.delete_chunk_ids(chunk_ids)
-            except Exception as exc:  # noqa: BLE001 - retain workspace data if vector cleanup fails.
-                write_debug_log(
-                    config,
-                    "workspace_delete_vector_error",
-                    workspace_id=workspace_id,
-                    error_type=type(exc).__name__,
-                    error=sanitize_error_detail(str(exc)),
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="å·¥ä½œåŒºå‘é‡ç´¢å¼•åˆ é™¤å¤±è´¥ï¼Œè¯·æ£€æŸ¥å‘é‡æ•°æ®åº“è¿žæŽ¥åŽé‡è¯•",
-                ) from exc
-
-        return kb_state.delete_workspace(workspace_id)
-
-    @app.get("/kb/documents")
-    def list_uploaded_documents(workspace_id: str = DEFAULT_WORKSPACE_ID) -> Dict[str, Any]:
-        return kb_state.list_original_documents(workspace_id)
-
-    @app.get("/kb/documents/content")
-    def get_document_content(
-        source: str,
-        workspace_id: str = DEFAULT_WORKSPACE_ID,
-        max_chars: int = 150_000,
-    ) -> Dict[str, Any]:
-        return kb_state.document_content(source, workspace_id, max_chars)
-
-    @app.get("/kb/documents/preview")
-    def preview_document(source: str, workspace_id: str = DEFAULT_WORKSPACE_ID) -> FileResponse:
-        original_path = stored_document_path(workspace_id, source)
-        if not original_path.is_file():
-            raise HTTPException(status_code=404, detail="åŽŸå§‹æ–‡æ¡£ä¸å­˜åœ¨ï¼Œè¯·é‡æ–°ä¸Šä¼ åŽé¢„è§ˆ")
-
-        filename = stored_document_filename(workspace_id, source)
-        return FileResponse(
-            original_path,
-            media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
-            headers={
-                "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
-                "X-Original-Document": "true",
-            },
-        )
-
-    @app.get("/kb/documents/download")
-    def download_document(source: str, workspace_id: str = DEFAULT_WORKSPACE_ID) -> Response:
-        document = kb_state.document_content(source, workspace_id, max_chars=0)
-        original_path = stored_document_path(workspace_id, source)
-        filename = stored_document_filename(workspace_id, source)
-        if original_path.is_file():
-            return FileResponse(
-                original_path,
-                media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
-                filename=filename,
-                headers={"X-Original-Document": "true"},
-            )
-        export_name = filename if filename.lower().endswith(".txt") else f"{filename}.txt"
-        return Response(
-            content=document["content"].encode("utf-8"),
-            media_type="text/plain; charset=utf-8",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_name)}",
-                "X-Original-Document": "false",
-            },
-        )
-
-    @app.post("/kb/documents/delete")
-    def begin_document_delete(
-        request: DocumentDeleteRequest,
-        background_tasks: BackgroundTasks,
-        http_request: Request,
-    ) -> Dict[str, Any]:
-        source = request.source.strip()
-        if not source:
-            raise HTTPException(status_code=400, detail="èµ„æ–™åç§°ä¸èƒ½ä¸ºç©º")
-        if not kb_state.document_chunk_ids(source, request.workspace_id):
-            raise HTTPException(status_code=404, detail=f"çŸ¥è¯†åº“ä¸­ä¸å­˜åœ¨èµ„æ–™ï¼š{source}")
-        job_id = uuid4().hex
-        principal = getattr(http_request.state, "auth_principal", None)
-        job = {
-            "job_id": job_id,
-            "source": source,
-            "workspace_id": request.workspace_id,
-            "created_by_user_id": principal.user["id"] if principal else None,
-            "status": "queued",
-            "progress": 0,
-            "phase": "ç­‰å¾…åˆ é™¤",
-            "removed_chunk_count": 0,
-            "error": "",
-        }
-        with document_delete_jobs_lock:
-            if len(document_delete_jobs) >= 100:
-                for old_job_id, old_job in list(document_delete_jobs.items()):
-                    if old_job.get("status") in {"completed", "failed"}:
-                        document_delete_jobs.pop(old_job_id, None)
-                    if len(document_delete_jobs) < 90:
-                        break
-            document_delete_jobs[job_id] = job
-        background_tasks.add_task(run_document_delete_job, job_id, source, request.workspace_id, job["created_by_user_id"])
-        return dict(job)
-
-    @app.get("/kb/documents/delete/{job_id}")
-    def get_document_delete_progress(job_id: str) -> Dict[str, Any]:
-        with document_delete_jobs_lock:
-            job = document_delete_jobs.get(job_id)
-            if job is None:
-                raise HTTPException(status_code=404, detail="åˆ é™¤ä»»åŠ¡ä¸å­˜åœ¨æˆ–å·²è¿‡æœŸ")
-            return dict(job)
-
-    @app.get("/kb/chunks")
-    def list_kb_chunks(limit: int = 50, offset: int = 0, workspace_id: str = DEFAULT_WORKSPACE_ID) -> Dict[str, Any]:
-        return kb_state.list_chunks(limit=limit, offset=offset, workspace_id=workspace_id)
-
-    @app.post("/kb/chunks", response_model=KnowledgeBaseUpdateResponse)
-    def update_kb_chunks(request: KnowledgeBaseReplaceRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
-        result = kb_state.update_chunks(request.chunks, mode=request.mode, workspace_id=request.workspace_id)
-        record_request_workspace_audit(http_request, "workspace_documents_updated", {"mode": result.mode, "chunk_count": result.chunk_count})
-        return result
-
-    @app.post("/kb/jsonl", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_jsonl(request: JsonlIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
-        result = kb_state.ingest_jsonl(
-            request.content,
-            mode=request.mode,
-            source_name=request.source_name,
-            workspace_id=request.workspace_id,
-        )
-        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.source_name or "JSONLèµ„æ–™"), "mode": result.mode, "chunk_count": result.chunk_count})
-        return result
-
-    @app.post("/kb/pdf", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_pdf(request: PdfIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
-        result = kb_state.ingest_pdf(
-            request.filename,
-            request.content_base64,
-            mode=request.mode,
-            max_pages=request.max_pages,
-            render_dpi=request.render_dpi,
-            workspace_id=request.workspace_id,
-        )
-        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
-        return result
-
-    @app.post("/kb/image-ocr", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_image_ocr(request: ImageOcrIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
-        result = kb_state.ingest_image_ocr(
-            request.filename,
-            request.content_base64,
-            ocr_text=request.ocr_text,
-            mode=request.mode,
-            workspace_id=request.workspace_id,
-        )
-        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
-        return result
-
-    @app.post("/kb/document", response_model=KnowledgeBaseUpdateResponse)
-    def ingest_kb_document(request: DocumentIngestRequest, http_request: Request) -> KnowledgeBaseUpdateResponse:
-        result = kb_state.ingest_document(
-            request.filename,
-            request.content_base64,
-            mode=request.mode,
-            max_pages=request.max_pages,
-            render_dpi=request.render_dpi,
-            workspace_id=request.workspace_id,
-        )
-        record_request_workspace_audit(http_request, "workspace_document_ingested", {"source": safe_document_filename(request.filename), "mode": result.mode, "chunk_count": result.chunk_count})
-        return result
-
-    @app.get("/vector/status")
-    def vector_status() -> Dict[str, Any]:
-        if config.vector_store_provider == "memory":
-            return {
-                "provider": "memory",
-                "connected": True,
-                "endpoint_configured": False,
-                "token_configured": False,
-                "collection_name": "in_memory_hybrid_index",
-                "collection_exists": True,
-                "row_count": kb_state.chunk_count,
-                "message": "in-memory BM25 + dense/sparse index ready",
-            }
-        return MilvusVectorStore(config=config).status().to_dict()
-
-    @app.post("/vector/collection")
-    def create_vector_collection(request: VectorCollectionRequest) -> Dict[str, Any]:
-        if config.vector_store_provider == "memory":
-            return {
-                "provider": "memory",
-                "connected": True,
-                "collection_name": "in_memory_hybrid_index",
-                "collection_exists": True,
-                "row_count": kb_state.chunk_count,
-                "message": "memory mode has no remote collection to recreate",
-            }
-        try:
-            return MilvusVectorStore(config=config).ensure_collection(drop_existing=request.drop_existing).to_dict()
-        except Exception as exc:  # noqa: BLE001 - surface sanitized operational error to API client.
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    @app.post("/vector/ingest")
-    def ingest_vector_collection(request: VectorIngestRequest = VectorIngestRequest()) -> Dict[str, Any]:
-        normalized_mode = validate_mode(request.mode)
-        if normalized_mode == "replace" and request.workspace_id:
-            raise HTTPException(status_code=422, detail="å‘é‡ç´¢å¼•æ›¿æ¢ä»…æ”¯æŒå¹³å°çº§æ“ä½œ")
-        chunks = kb_state.chunks_snapshot(request.workspace_id) if request.workspace_id else kb_state.chunks_snapshot()
-        if config.vector_store_provider == "memory":
-            return {
-                "status": "ok",
-                "inserted": len(chunks),
-                "collection_name": "in_memory_hybrid_index",
-                "mode": normalized_mode,
-                "provider": "memory",
-            }
-        try:
-            store = MilvusVectorStore(config=config)
-            if normalized_mode == "replace":
-                log_chunks_for_ingest(config, "vector_replace_payload", chunks, mode=normalized_mode)
-                result = store.replace_chunks(chunks)
-                result_event = "vector_replace_result"
-            else:
-                log_chunks_for_ingest(config, "vector_append_payload", chunks, mode=normalized_mode)
-                result = store.upsert_chunks(chunks)
-                result["mode"] = normalized_mode
-                result_event = "vector_append_result"
-            write_debug_log(config, result_event, **result)
-            return result
-        except Exception as exc:  # noqa: BLE001 - surface sanitized operational error to API client.
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    @app.post("/vector/search")
-    def search_vector_collection(payload: VectorSearchRequest, http_request: Request) -> Dict[str, Any]:
-        try:
-            processor = AdaptiveQueryOptimizer(build_llm_router(config), config)
-            intent = processor.classify_intent(payload.query)
-            entities = processor.extract_entities(payload.query)
-            query_variants = processor.expand_queries(payload.query, intent, entities)
-            if not query_variants:
-                query_variants = [payload.query]
-            optimized_query = query_variants[1] if len(query_variants) > 1 else query_variants[0]
-            workspace_chunks = kb_state.chunks_snapshot(payload.workspace_id)
-            if config.vector_store_provider == "memory":
-                retriever = HybridRetriever(
-                    workspace_chunks,
-                    embedding=build_embedding_adapter(config),
-                    config=config,
-                )
-            else:
-                local_embedding = (
-                    HashEmbeddingAdapter(config)
-                    if config.embedding_provider in {"bailian", "dashscope", "aliyun"}
-                    else build_embedding_adapter(config)
-                )
-                retriever = MilvusHybridRetriever(
-                    MilvusVectorStore(config=config),
-                    workspace_chunks,
-                    embedding=local_embedding,
-                    config=config,
-                    workspace_id=payload.workspace_id,
-                    workspace_ids=(payload.workspace_id,) if auth_enforcement_enabled() else None,
-                    strict_workspace_metadata=auth_enforcement_enabled(),
-                )
-            results = retrieve_with_query_variants(
-                retriever,
-                query_variants,
-                entities,
-                limit=payload.limit,
-                rrf_k=config.rrf_k,
-            )
-            write_debug_log(
-                config,
-                "vector_search_results",
-                query=payload.query,
-                optimized_query=optimized_query,
-                query_variants=query_variants,
-                result_count=len(results),
-                results=retrieval_results_for_debug(results, text_chars=config.debug_log_text_chars),
-            )
-            return {
-                "query": payload.query,
-                "optimized_query": optimized_query,
-                "query_variants": query_variants,
-                "entities": entities.to_dict(),
-                "results": [
-                    {
-                        "rank": result.rank,
-                        "score": result.score,
-                        "source": result.chunk.to_source_ref(score=result.score).to_dict(),
-                        "text": result.chunk.text,
-                    }
-                    for result in results
-                ],
-            }
-        except Exception as exc:  # noqa: BLE001 - surface sanitized operational error to API client.
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    return app
-
-
-def parse_cors_origins() -> List[str]:
-    configured = os.getenv("RAG_CORS_ORIGINS", "").strip()
-    if configured:
-        return [origin.strip() for origin in configured.split(",") if origin.strip()]
-    return ["*"]
-
-
-app = create_app()
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éíß¾tõ:-jZ.¶›­–)Þ³R""$f7D’6W'f–6RÆ–W"f÷"F†RVGV6F–öâ$r—VÆ–æRâ""  ¦g&öÒõögWGW&Uõò–×÷'Bææ÷FF–öç0 ¦–×÷'B&6Sc@¦–×÷'B&–æ66–¦–×÷'B7–æ6–ð¦–×÷'B†6†Æ– ¦–×÷'B§6öà¦–×÷'BÖ–ÖWG—W0¦–×÷'B÷0¦–×÷'B&P¦–×÷'B¦Æ– ¦g&öÒFF6Æ76W2–×÷'B&WÆ6P¦g&öÒF†Æ–"–×÷'BF€¦g&öÒVWVR–×÷'BV×G’ÂVWVP¦g&öÒF‡&VF–ær–×÷'BWfVçBÂÆö6²Â$Æö6°¦g&öÒG—–ær–×÷'Bç’Â7–æ4—FW&F÷"Â6ÆÆ&ÆRÂF–7BÂ—FW&&ÆRÂÆ—7BÂÆ—FW&ÂÂ÷F–öæÀ¦g&öÒW&ÆÆ–"ç'6R–×÷'BV÷FP¦g&öÒWV–B–×÷'BWV–C@ ¦g&öÒf7F’–×÷'B&6¶w&÷VæEF6·2Âf7D’Â…EEW†6WF–öâÂ&WVW7@¦g&öÒf7F’æW†6WF–öç2–×÷'B&WVW7EfÆ–FF–öäW'&÷ ¦g&öÒf7F’æÖ–FFÆWv&Ræ6÷'2–×÷'B4õ%4Ö–FFÆWv&P¦g&öÒf7F’ç&W7öç6W2–×÷'Bf–ÆU&W7öç6RÂ¥4ôå&W7öç6RÂ&W7öç6RÂ7G&VÖ–æu&W7öç6P¦g&öÒf7F’ç7FF–6f–ÆW2–×÷'B7FF–4f–ÆW0¦g&öÒ7F&ÆWGFRæ6öæ7W'&Væ7’–×÷'B'Våö–å÷F‡&VGööÀ¦g&öÒ–FçF–2–×÷'B&6TÖöFVÂÂf–VÆ@ ¦g&öÒÖçVf7GW&–æu÷&ræWF‚ç&÷WFW2–×÷'B€¢öWF…÷7F÷&RÀ¢÷&WV—&Uö'&÷w6W%÷&WVW7BÀ¢÷&WV—&Uö77&bÀ¢&÷WFW"2WF…÷&÷WFW"À¢¦g&öÒÖçVf7GW&–æu÷&ræWF‚æ6öçfW'6F–öå÷&÷WFW2–×÷'B&÷WFW"26öçfW'6F–öå÷&÷WFW ¦g&öÒÖçVf7GW&–æu÷&ræWF‚æ6öçfW'6F–öå÷7F÷&R–×÷'B6öçfW'6F–öäÆö6¶VBÂ6öçfW'6F–öäæ÷Df÷VæBÂ6öçfW'6F–öå7F÷&P¦g&öÒÖçVf7GW&–æu÷&ræWF‚ç7F÷&R–×÷'BWF…6W'f–6UVæf–Æ&ÆRÂ&–æ6—À¦g&öÒÖçVf7GW&–æu÷&ræWF‚çv÷&·76U÷7F÷&R–×÷'Bv÷&·76Tf÷&&–FFVâÂv÷&·76Tæ÷Df÷VæBÂv÷&·76U7F÷&P¦g&öÒÖçVf7GW&–æu÷&ræWF‚çv÷&·76U÷&÷WFW2–×÷'BFÖ–å÷&÷WFW"2v÷&·76UöFÖ–å÷&÷WFW ¦g&öÒÖçVf7GW&–æu÷&ræWF‚çv÷&·76U÷&÷WFW2–×÷'B&÷WFW"2v÷&·76U÷&÷WFW ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2æö7"–×÷'B&–GTô5$FFW ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2æÆÆÒ–×÷'B'V–ÆEöÆÆÕ÷&÷WFW ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2æVÖ&VFF–ær–×÷'B†6„VÖ&VFF–ætFFW"Â'V–ÆEöVÖ&VFF–æuöFFW ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2çVW'•ö÷F–Ö—¦W"–×÷'BFF—fUVW'”÷F–Ö—¦W ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2ç&WG&–WfW"–×÷'B‡–'&–E&WG&–WfW"ÂÖ–ÇgW4‡–'&–E&WG&–WfW ¦g&öÒÖçVf7GW&–æu÷&ræFFW'2çfV7F÷%÷7F÷&R–×÷'BÖ–ÇgW5fV7F÷%7F÷&P¦g&öÒÖçVf7GW&–æu÷&ræ6‡Væ¶–ær–×÷'BUDÅfÆ–FF–öå&W÷'BÂ&W&Uö6‡Væ·0¦g&öÒÖçVf7GW&–æu÷&ræ6öæf–r–×÷'BDTdTÅEô4ôäd”rÂ$t6öæf–p¦g&öÒÖçVf7GW&–æu÷&ræFV'VuöÆör–×÷'B6‡Væ·5öf÷%öFV'VrÂ&WG&–WfÅ÷&W7VÇG5öf÷%öFV'VrÂw&—FUöFV'VuöÆöp¦g&öÒÖçVf7GW&–æu÷&ræWFÂ–×÷'B×VÇF–ÖöFÄUDÅ—VÆ–æP¦g&öÒÖçVf7GW&–æu÷&ræ–æg&7G'V7GW&R–×÷'B'VçF–ÖT–æg&7G'V7GW&P¦g&öÒÖçVf7GW&–æu÷&rç—VÆ–æR–×÷'BÖçVf7GW&–æu$u—VÆ–æRÂ6öçFW‡GVÆ—¦U÷VW7F–öâÂ&WG&–WfU÷v—F…÷VW'•÷f&–çG0¦g&öÒÖçVf7GW&–æu÷&rçFe÷VÆ—G’–×÷'B€¢6‡Væ·5ö†fU÷VçW6&ÆU÷Fe÷FW‡BÀ¢Æöö·5öÆ–¶U÷76VE÷Feöv&&ÆRÀ¢Feö6‡Væ·5ö&U÷6V&6†&ÆRÀ¢¦g&öÒÖçVf7GW&–æu÷&rç66†VÖ2–×÷'BDTdTÅEõtõ$µ54Uô”BÂFö7VÖVçD6‡Væ²Â$u&W7öç6P ¥$ô¤T5Eõ$ôõBÒF‚…õöf–ÆUõò’ç&W6öÇfR‚’ç&VçG5³Ð¤DTdTÅEô´%õD‚Ò$ô¤T5Eõ$ôõBò&W†×ÆW2"ò&¶æ÷vÆVFvUö&6Ræ§6öæÂ ¤e$ôåDTäEõ4õU$4UôD•"Ò$ô¤T5Eõ$ôõBò&g&öçFVæB ¤e$ôåDTäEôD•5EôD•"Òe$ôåDTäEõ4õU$4UôD•"ò&F—7B ¤e$ôåDTäEôD•"Òe$ôåDTäEôD•5EôD• ¤Ô…õDeõUÄôEô%•DU2Ò¢#B¢#@¤Dô5TÔTåEôd”ÄU5ôD•"Ò$ô¤T5Eõ$ôõBò'F×"ò&Fö7VÖVçEöf–ÆW2   ¦FVb6fUöFö7VÖVçEöf–ÆVæÖR‡6÷W&6S¢7G"’Óâ7G# ¢f–ÆVæÖRÒ7G"‡6÷W&6R÷"""’ç&WÆ6R‚%ÅÂ"Â"ò"’ç'7Æ—B‚"ò"Â•²ÓÒç7G&—‚¢&WGW&âf–ÆVæÖR÷"&Fö7VÖVçB   ¦FVb7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–C¢7G"Â6÷W&6S¢7G"’ÓâFƒ ¢v÷&·76Uö¶W’Ò†6†Æ–"ç6†#Sb‡v÷&·76Uö–BæVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚•³£#EÐ¢Fö7VÖVçEö¶W’Ò†6†Æ–"ç6†#Sb†b'·v÷&·76Uö–GÕÅÃ·6÷W&6WÒ"æVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚¢&WGW&âDô5TÔTåEôd”ÄU5ôD•"òv÷&·76Uö¶W’òFö7VÖVçEö¶W  ¦FVb7F÷&VEöFö7VÖVçEöÖWFFF÷F‚‡v÷&·76Uö–C¢7G"Â6÷W&6S¢7G"’ÓâFƒ ¢F‚Ò7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–BÂ6÷W&6R¢&WGW&âF‚çv—F…öæÖR†b'·F‚ææÖWÒæ§6öâ"  ¦FVb7F÷&VEöFö7VÖVçEöf–ÆVæÖR‡v÷&·76Uö–C¢7G"Â6÷W&6S¢7G"’Óâ7G# ¢ÖWFFF÷F‚Ò7F÷&VEöFö7VÖVçEöÖWFFF÷F‚‡v÷&·76Uö–BÂ6÷W&6R¢G'“ ¢ÖWFFFÒ§6öâæÆöG2†ÖWFFF÷F‚ç&VE÷FW‡B†Væ6öF–æsÒ'WFbÓ‚"’¢f–ÆVæÖRÒ7G"†ÖWFFFævWB‚&f–ÆVæÖR"’÷"""¢–bf–ÆVæÖS ¢&WGW&â6fUöFö7VÖVçEöf–ÆVæÖR†f–ÆVæÖR¢W†6WB„õ4W'&÷"ÂfÇVTW'&÷"ÂG—TW'&÷"“ ¢70¢&WGW&â6fUöFö7VÖVçEöf–ÆVæÖR‡6÷W&6R  ¦FVb6fU÷7F÷&VEöFö7VÖVçB‡v÷&·76Uö–C¢7G"Â6÷W&6S¢7G"Âf–ÆVæÖS¢7G"Â6öçFVçC¢'—FW2’ÓâæöæS ¢F‚Ò7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–BÂ6÷W&6R¢F‚ç&VçBæÖ¶F—"‡&VçG3ÕG'VRÂW†—7Eöö³ÕG'VR¢FV×÷&'•÷F‚ÒF‚çv—F…öæÖR†b'·F‚ææÖWÒç·WV–CB‚’æ†W‡ÒçF×"¢ÖWFFF÷F‚Ò7F÷&VEöFö7VÖVçEöÖWFFF÷F‚‡v÷&·76Uö–BÂ6÷W&6R¢FV×÷&'•öÖWFFF÷F‚ÒÖWFFF÷F‚çv—F…öæÖR†b'¶ÖWFFF÷F‚ææÖWÒç·WV–CB‚’æ†W‡ÒçF×"¢G'“ ¢FV×÷&'•÷F‚çw&—FUö'—FW2†6öçFVçB¢FV×÷&'•÷F‚ç&WÆ6R‡F‚¢FV×÷&'•öÖWFFF÷F‚çw&—FU÷FW‡B€¢§6öâæGV×2‡²'6÷W&6R#¢6÷W&6RÂ&f–ÆVæÖR#¢6fUöFö7VÖVçEöf–ÆVæÖR†f–ÆVæÖR—ÒÂVç7W&Uö66–“ÔfÇ6R’À¢Væ6öF–æsÒ'WFbÓ‚"À¢¢FV×÷&'•öÖWFFF÷F‚ç&WÆ6R†ÖWFFF÷F‚¢f–æÆÇ“ ¢FV×÷&'•÷F‚çVæÆ–æ²†Ö—76–æuöö³ÕG'VR¢FV×÷&'•öÖWFFF÷F‚çVæÆ–æ²†Ö—76–æuöö³ÕG'VR  ¦FVb&VÖ÷fU÷7F÷&VEöFö7VÖVçB‡v÷&·76Uö–C¢7G"Â6÷W&6S¢7G"’ÓâæöæS ¢f÷"F‚–â€¢7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–BÂ6÷W&6R’À¢7F÷&VEöFö7VÖVçEöÖWFFF÷F‚‡v÷&·76Uö–BÂ6÷W&6R’À¢“ ¢G'“ ¢F‚çVæÆ–æ²†Ö—76–æuöö³ÕG'VR¢W†6WBõ4W'&÷# ¢2¶æ÷vÆVFvRÖ&6RFVÆWF–öâ6†÷VÆB7F–ÆÂ6ö×ÆWFR–bâöÆBf–ÆR—2Ç&VG’vöæRà¢70  ¦FVbv÷&·76Uö6‡Væµö–B‡v÷&·76Uö–C¢7G"Â6‡Væµö–C¢7G"’Óâ7G# ¢""$¶VW”G27F&ÆR–âF†RFVfVÇBv÷&·76RæBVæ—VR–â÷F†W"v÷&·76W2â""  ¢–bv÷&·76Uö–BÓÒDTdTÅEõtõ$µ54Uô”C ¢&WGW&â6‡Væµö–@¢v÷&·76Uö†6‚Ò†6†Æ–"ç6†#Sb‡v÷&·76Uö–BæVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚•³£eÐ¢6‡Væµö†6‚Ò†6†Æ–"ç6†#Sb†6‡Væµö–BæVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚¢&WGW&âb'w2×·v÷&·76Uö†6‡Ò×¶6‡Væµö†6‡Ò   ¦FVbv÷&·76U÷6W76–öåö–B‡v÷&·76Uö–C¢7G"Â6W76–öåö–C¢÷F–öæÅ·7G%Ò’Óâ÷F–öæÅ·7G%Ó ¢–b6W76–öåö–B—2æöæR÷"v÷&·76Uö–BÓÒDTdTÅEõtõ$µ54Uô”C ¢&WGW&â6W76–öåö–@¢6W76–öåö†6‚Ò†6†Æ–"ç6†#Sb†b'·v÷&·76Uö–GÕÃ·6W76–öåö–GÒ"æVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚¢&WGW&âb'w2×·6W76–öåö†6‡Ò   ¦FVbWF†VçF–6FVE÷6W76–öåö–B‡W6W%ö–C¢7G"Â6W76–öåö–C¢÷F–öæÅ·7G%Ò’Óâ÷F–öæÅ·7G%Ó ¢–b6W76–öåö–B—2æöæS ¢&WGW&âæöæP¢F–vW7BÒ†6†Æ–"ç6†#Sb†b'·W6W%ö–GÕÃ·6W76–öåö–GÒ"æVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚¢&WGW&âb'W6W"×¶F–vW7GÒ   ¦FVbFuö6‡Væ·5öf÷%÷v÷&·76R†6‡Væ·3¢—FW&&ÆU´Fö7VÖVçD6‡VæµÒÂv÷&·76Uö–C¢7G"’ÓâÆ—7E´Fö7VÖVçD6‡VæµÓ ¢&÷w2ÒÆ—7B†6‡Væ·2¢–EöÖÒ¶6‡Væ²æ–C¢v÷&·76Uö6‡Væµö–B‡v÷&·76Uö–BÂ6‡Væ²æ–B’f÷"6‡Væ²–â&÷w7Ð¢f÷"6‡Væ²–â&÷w3 ¢6‡Væ²æ–BÒ–EöÖ¶6‡Væ²æ–EÐ¢–b6‡Væ²ç&VçEö–C ¢6‡Væ²ç&VçEö–BÒ–EöÖævWB†6‡Væ²ç&VçEö–BÂv÷&·76Uö6‡Væµö–B‡v÷&·76Uö–BÂ6‡Væ²ç&VçEö–B’¢ÖWFFFÒF–7B†6‡Væ²æÖWFFF÷"·Ò¢ÖWFFF²'v÷&·76Uö–B%ÒÒv÷&·76Uö–@¢–bÖWFFFævWB‚'&VçEö–B"“ ¢&VçEö–BÒ7G"†ÖWFFF²'&VçEö–B%Ò¢ÖWFFF²'&VçEö–B%ÒÒ–EöÖævWB‡&VçEö–BÂv÷&·76Uö6‡Væµö–B‡v÷&·76Uö–BÂ&VçEö–B’¢6‡Væ²æÖWFFFÒÖWFFF¢&WGW&â&÷w0  ¦FVb6æ—F—¦UöW'&÷%öFWF–Â‡fÇVS¢ç’’Óâ7G# ¢""%&WGW&â&÷VæFVBF–væ÷7F–27G&–ærv—F†÷WB6öÖÖöâ7&VFVçF–ÂfÇVW2â""  ¢–b—6–ç7Fæ6R‡fÇVRÂ7G"“ ¢FW‡BÒfÇVP¢VÇ6S ¢G'“ ¢FW‡BÒ§6öâæGV×2‡fÇVRÂVç7W&Uö66–“ÔfÇ6R¢W†6WB…G—TW'&÷"ÂfÇVTW'&÷"“ ¢FW‡BÒ7G"‡fÇVR¢FW‡BÒ&Rç7V"€¢""ƒö’•Æ"‡Fö¶VçÆ•µòÕÓö¶W—Ç6V7&WGÇ77v÷&GÇ77vB•Æ%Ç2¥³£ÕÕÇ2¥µåÇ2Ã¾ûÈÎ8%Ò²"À¢ÆÖ&FÖF6ƒ¢b'¶ÖF6‚æw&÷Wƒ—ÓÓÎ[{.™©‰xóâ"À¢FW‡BÀ¢¢&WGW&âFW‡Bç7G&—‚•³£#Ð  ¦FVbW‡Æ–åö•öW'&÷"†FWF–Ã¢ç’Â7FGW5ö6öFS¢–çBÂW'&÷%÷G—S¢7G"Ò""’ÓâF–7E·7G"Â7G%Ó ¢""%G&ç6ÆFR÷W&F–öæÂW†6WF–öç2–çFò7F&ÆRW6W"Öf6–ær&V6öâæB7F–öââ""  ¢FV6†æ–6ÅöFWF–ÂÒ6æ—F—¦UöW'&÷%öFWF–Â†FWF–Â¢Æ÷vW&VBÒFV6†æ–6ÅöFWF–ÂæÆ÷vW"‚¢&V6öâÒFV6†æ–6ÅöFWF–Â÷".iÈÞXªiÊ®‹ùNY¹îX[~KÙ>[È.[‹ŽKúhþ8" ¢7VvvW7F–öâÒ.Šû~zˆÞYî˜xÞŠù^ûÉ¾ˆº^™zîš)ŽhÈ{ºÞûÈÎŠû~iú^yÈ¾Yîzºþiz^[ù~Zé®KØÞX[~KÙ>™‹një^8" ¢6öFRÒb$…EE÷·7FGW5ö6öFWÒ  ¢–bç’‡FW&Ò–âÆ÷vW&VBf÷"FW&Ò–â‚&f–Â6öææV7F–ær"Â'6W'fW"Væf–Æ&ÆR"Â&–ÆÆVvÂ6öææV7F–öâ&×2"Â&Ö–ÇgW6W†6WF–öâ"’“ ¢6öFRÒ%dT5Dõ%ô4ôääT5D”ôåôd”ÄTB ¢&V6öâÒ.izk9^‹ùîhê^iÊÎYËFö6¶W"Ö–ÇgW>ûÈŽšžyºîK¸^KÛþyJŽiÊÎYËZéîKè¾ûÈÎKˆÞ‹ùîhê^{«þKˆ¢¦–ÆÆ—®ûÈžûÈÎXúþˆ;ÞiŠþZëžYšŽiÊ®[{º®h‰bVæGö–çBKˆâFö¶VâKˆÞXËž˜XÞ8" ¢7VvvW7F–öâÒ.Šû~zîŠêBFö6¶W"Ö–ÇgW2ZëžYšŽX^[«~‹ùŠÎûÈÎ[›nj8iúRÔ”ÅeU5ôTäEô”åN8Ô”ÅeU5õDô´TâYî˜xÞŠù^8" ¢VÆ–b&Ö–ÇgW26öæf–wW&F–öâÖ—76–ær"–âÆ÷vW&VB÷"'¦–ÆÆ—¢6öæf–wW&F–öâÖ—76–ær"–âÆ÷vW&VB÷"‚&Ö–ÇgW2"–âÆ÷vW&VBæB&æ÷B6öæf–wW&VB"–âÆ÷vW&VB“ ¢6öFRÒ%dT5Dõ%ô4ôäd”uôÔ•54”är ¢&V6öâÒ.iÊÎYËFö6¶W"Ö–ÇgW2‹ùîhê^˜XÞ{Úî{Ë®ZKûÈÎYîzºþk*iÈžŠû¾XùnX‹VæGö–çBh‰bFö¶Vî8" ¢7VvvW7F–öâÒ.Šû~YÊ‚æVçbKŠÞ˜XÞ{ÚâÔ”ÅeU5ôTäEô”åBY(ÂÔ”ÅeU5õDô´TîûÈÎxKnYî˜xÞY
+þYîzºþ8" ¢VÆ–bç’‡FW&Ò–âÆ÷vW&VBf÷"FW&Ò–â‚'VæWF†VçF–6FVB"Â'VæWF†÷&—¦VB"Â&WF†VçF–6F–öâf–ÆVB"Â&–çfÆ–BFö¶Vâ"Â'W&Ö—76–öâFVæ–VB"’“ ¢6öFRÒ$UD„TåD”4D”ôåôd”ÄTB ¢&V6öâÒ.K©iÈÞXª‹ª¾K»Þš¨ÎŠøZK‹J^ûÈÎXzÞhÚîiziXŽ8[{.‹ø~iÉþh‰nk*iÈž[Ù>X˜Þi8ÞKÙÎiØ>™™8" ¢7VvvW7F–öâÒ.Šû~˜xÞikZHÞX‹nZûž[©NiÈÞXªy¨BFö¶Vâô’¶WžûÈÎzîŠêNk*iÈžZI®KÙžz›®jÎûÈÎ[›nj8iú^‹JnXû~iØ>™™8" ¢VÆ–bç’‡FW&Ò–âÆ÷vW&VBf÷"FW&Ò–â‚'F–ÖVB÷WB"Â'F–ÖV÷WB"Â&FVFÆ–æRW†6VVFVB"’“ ¢6öFRÒ%U5E$TÕõD”ÔTõUB ¢&V6öâÒ.‹>yJŽZIn˜:ŽiÈÞXª‹h^i{nûÈÎ{Ù{¹Î‹è>hZ.h‰nK©iÈÞXªk*iÈžYÊŽŠxNZé®i{n™{NXh^Y8Þ[©N8" ¢7VvvW7F–öâÒ.Šû~j8iú^{Ù{¹ÎYî˜xÞŠù^ûÉ¾ZHNynZJ~ih~K»ni{nXúþXxþ[	Dbš^i[h‰n™˜ÞKØîk‹.iù2Ež8" ¢VÆ–bç’‡FW&Ò–âÆ÷vW&VBf÷"FW&Ò–â‚&æÖR&W6öÇWF–öâ"Â&vWFFG&–æfò"Â&Fç2"’“ ¢6öFRÒ$Då5ôd”ÄTB ¢&V6öâÒ.izk9^Šz>iéK©iÈÞXªYùþYÞûÈÎ[Ù>X˜Þ{Ù{¹Îh‰bDå2˜XÞ{ÚîKˆÞXúþyJŽ8" ¢7VvvW7F–öâÒ.Šû~j8iú^{Ù{¹Î8Då>8Kº>ynY(Î™‹.x¾Z)žŠëî{ÚîYî˜xÞŠù^8" ¢VÆ–b&&–GRö7""–âÆ÷vW&VB÷".y›î[ªbö7""–âÆ÷vW&VC ¢6öFRÒ$ô5%ôd”ÄTB ¢&V6öâÒFV6†æ–6ÅöFWF–À¢7VvvW7F–öâÒ.Šû~j8iú^y›î[ªbô5"¶Wž8Y»îx˜rõDbkˆ^i›[ªnY(Î{Ù{¹ÎûÉ¾K™þXúþKº^{)Ž‹KNh˜¾Xª‚ô5"ih~iÊÎKÙÎK‹®XYÎ[©^8" ¢VÆ–b7FGW5ö6öFRÓÒC2÷"ç’‡FW&Ò–âÆ÷vW&VBf÷"FW&Ò–â‚&W†6VVG2Ö""Â'FöòÆ&vR"Â'WÆöBÆ–Ö—B"’“ ¢6öFRÒ$d”ÄUõDôõôÄ$tR ¢&V6öâÒ.Kˆ®KÊih~K»n‹h^‹ø~{;¾{¹þXXŠëŽy¨BÔ"ZJ~[þ™™X‹n8" ¢7VvvW7F–öâÒ.Šû~Xè¾{Êžh‰nh¸nXˆnih~K»nYî˜xÞikKˆ®KÊ8" ¢VÆ–b&&6ScB"–âÆ÷vW&VC ¢6öFRÒ$”ådÄ”Eôd”ÄUõ”ÄôB ¢&V6öâÒ.Kˆ®KÊih~K»ny¨Ni[hÚî{ÉnziziXŽh‰nKÊ‹é>Xh^ZëžKˆÞZèÎi[N8" ¢7VvvW7F–öâÒ.Šû~˜xÞik˜žhºžXéþZx¾ih~K»nKˆ®KÊûÈÎKˆÞŠhKˆ®KÊhÙþYØþh‰niÊ®ZèÎi[NKˆ¾‹ÛÞy¨Nih~K»n8" ¢VÆ–b&æ÷BFb"–âÆ÷vW&VB÷".KˆÞiŠòFb"–âÆ÷vW&VC ¢6öFRÒ$”ådÄ”EõDb ¢&V6öâÒ.Kˆ®KÊXh^ZëžKˆÞiŠþiÈžiXŽy¨BDbih~K»n8" ¢7VvvW7F–öâÒ.Šû~zîŠêNih~K»nhšž[^YÞKˆîZéî™˜^jÎ[ÈþKˆˆ{NûÈÎ[›n˜xÞikZûÎX{¢DbYîKˆ®KÊ8" ¢VÆ–b&–çfÆ–B§6öâ"–âÆ÷vW&VB÷"&§6öæFV6öFR"–âÆ÷vW&VC ¢6öFRÒ$”ådÄ”Eô¥4ôâ ¢&V6öâÒb$¥4ôâô¥4ôäÂjÎ[ÈþKˆÞjÚ>zîûÉ§·FV6†æ–6ÅöFWF–ÇÒ ¢7VvvW7F–öâÒ.Šû~j8iú^hª^™IžŠÎ™˜N‹ùiŠþY
+n{Ë®[	[É^Xû~8˜	~Xû~h‰nZJ~hºÎXû~ûÈÎ[›nzîKùÒ¥4ôäÂjøþŠÎiŠþKˆKŠ®ZèÎi[NZûž‹8" ¢VÆ–b7FGW5ö6öFRÓÒC#"÷"W'&÷%÷G—RÓÒ%&WVW7EfÆ–FF–öäW'&÷"# ¢6öFRÒ$”ådÄ”Eõ$UTU5B ¢&V6öâÒb.Šû~k.Xø.i[KˆÞzÊnYŽhê^Xú>Šhk.ûÉ§·FV6†æ–6ÅöFWF–ÇÒ ¢7VvvW7F–öâÒ.Šû~j8iú^[ø^Z¾ZÙ~jë^8ZÙ~jë^{¾Yè¾Kº^Xø®‹é>XZ^Xh^ZëžiŠþY
+nK‹®z›®8" ¢VÆ–b7FGW5ö6öFRÓÒCC ¢6öFRÒ$•ôäõEôdõTäB ¢&V6öâÒ.Šû~k.y¨NYîzºþhê^Xú>KˆÞZÙŽYÊŽûÈÎ˜	®[‹ŽiŠò’YËYØZ¾Xiž™IžŠúþh‰nX˜ÞYîzºþx˜ŽiÊÎKˆÞKˆˆ{N8" ¢7VvvW7F–öâÒ.Šû~j8iúR’VæGö–çNûÈÎ[›nzîŠêNYîzºþiÈÞXª[{.Y
+þXªŽK‹®[Ù>X˜Þšžyºîx˜ŽiÊÎ8" ¢VÆ–b7FGW5ö6öFRÓÒC#“ ¢6öFRÒ%$DUôÄ”Ô•DTB ¢&V6öâÒ.K©iÈÞXªŠû~k.‹ø~K¨îš){˜h‰nš)Þ[ªn[{.yJŽ[Þ8" ¢7VvvW7F–öâÒ.Šû~zˆÞYî˜xÞŠù^ûÈÎ[›nj8iú^Zûž[©NK©iÈÞXªy¨N‹>yJŽš)Þ[ªnY(Î™™kXŠëî{Úî8" ¢VÆ–b7FGW5ö6öFRãÒS ¢6öFRÒ%4U%dU%ôU%$õ" ¢&V6öâÒFV6†æ–6ÅöFWF–Â÷".Yîzºþh‰nKˆ®k‹ŽK©iÈÞXªXùyIþXh^˜:Ž™IžŠúþ8" ¢7VvvW7F–öâÒ.Šû~zˆÞYî˜xÞŠù^ûÈÎ[›niú^yÈ²'Våö’æW'"æÆörKˆâÆöw2÷&uöFV'Vræ§6öæÎ8"  ¢&WGW&â°¢&6öFR#¢6öFRÀ¢'&V6öâ#¢&V6öâÀ¢'7VvvW7F–öâ#¢7VvvW7F–öâÀ¢'FV6†æ–6ÅöFWF–Â#¢FV6†æ–6ÅöFWF–ÂÀ¢Ð  ¦6Æ72&W&æµ'VÆU&WVW7B„&6TÖöFVÂ“ ¢&ö÷7E÷FW&×3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7BÂFW67&—F–öãÒ%FW&×2F†B&—6RÖF6†–ær76vW2–âF†R&W&æ²÷&FW""¢W†6ÇVFU÷FW&×3¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7BÂFW67&—F–öãÒ%FW&×2F†B&VÖ÷fRÖF6†–ær76vW2g&öÒ&W&æ²&W7VÇG2"  ¦6Æ72ç7vW%&WVW7B„&6TÖöFVÂ“ ¢""%VW7F–öâ–ÆöB66WFVB'’F†Rg&öçFVæB’ÖöFRâ""  ¢VW7F–öã¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ%W6W"VW7F–öâFòç7vW"g&öÒ–æFW†VBô5"ô4Ä•ÖFW&–Ç2"¢6W76–öåö–C¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ…öÆVæwFƒÓ#‚ÂFW67&—F–öãÒ$6öçfW'6F–öâ–B66†VB–â&VF—2æBW'6—7FVB–â×•5Â"¢6öçfW'6F–öåö–C¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ…öÆVæwFƒÓ3bÂFW67&—F–öãÒ%6W'fW"Ö÷væVB&—fFR6öçfW'6F–öâ–B"¢6öçfW'6F–öåö6öçFW‡C¢7G"Òf–VÆB‚""ÂÖ…öÆVæwFƒÓCÂFW67&—F–öãÒ%&V6VçBGW&ç2g&öÒF†R7W'&VçB6†B"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚ÂFW67&—F–öãÒ$¶æ÷vÆVFvRv÷&·76RFò6V&6‚"¢66÷S¢Æ—FW&Å²&ÆÂ"Â&6öÖÖöâ"Â'v÷&·76R%ÒÒf–VÆB€¢'v÷&·76R"À¢FW67&—F–öãÒ%&WVW7FVB6V&6‚66÷S²F†R6W'fW"&W6öÇfW2F†—2Fòv÷&·76W2F†R6–væVBÖ–âW6W"6â&VB"À¢¢&W&æµ÷'VÆW3¢&W&æµ'VÆU&WVW7BÒf–VÆB†FVfVÇEöf7F÷'“Õ&W&æµ'VÆU&WVW7B¢†ÆÇV6–æF–öå÷F‡&W6†öÆC¢fÆöBÒf–VÆBƒãsRÂvSÓãÂÆSÓã“RÂFW67&—F–öãÒ$Ö–æ–×VÒ6öæf–FVæ6R&WV—&VBFò66WB6÷W&6RÖ6†V6¶VBç7vW""  ¦6Æ72¶æ÷vÆVFvT&6U&WÆ6U&WVW7B„&6TÖöFVÂ“ ¢""$¥4ôâ¶æ÷vÆVFvRÖ&6RWFFR–ÆöBâ""  ¢6‡Væ·3¢Æ—7E´F–7E·7G"Âç•ÕÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7BÂFW67&—F–öãÒ$ô5"7G'V7GW&VB6‡Væ·2"¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB—2F†R6fRFVfVÇB"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72§6öæÄ–ævW7E&WVW7B„&6TÖöFVÂ“ ¢""$¥4ôäÂFW‡B–ævW7F–öâ–ÆöBf÷"'&÷w6W"÷"–çFVw&F–öâ6Æ–VçG2â""  ¢6öçFVçC¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$¥4ôäÂ6öçFVçC²öæRô5"6‡Væ²W"Æ–æR÷"¥4ôâ'&’"¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB—2F†R6fRFVfVÇB"¢6÷W&6UöæÖS¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂFW67&—F–öãÒ$÷F–öæÂÆöv–6Â6÷W&6RÆ&VÂW6VB–âW'&÷"ÖW76vW2"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72Fd–ævW7E&WVW7B„&6TÖöFVÂ“ ¢""$&6ScBDb–ævW7F–öâ–ÆöB6VçB'’F†R¦W&òÖFWVæFVæ7’g&öçFVæBâ""  ¢f–ÆVæÖS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$÷&–v–æÂDbf–ÆRæÖR"¢6öçFVçEö&6ScC¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$&6ScBVæ6öFVBDb'—FW2"¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB—2F†R6fRFVfVÇB"¢Ö…÷vW3¢÷F–öæÅ¶–çEÒÒf–VÆB„æöæRÂvSÓÂÆSÓÂFW67&—F–öãÒ$Ö†–×VÒô5"vW3²ÖVç2VæÆ–Ö—FVB"¢&VæFW%öG“¢÷F–öæÅ¶–çEÒÒf–VÆB„æöæRÂvSÓs"ÂÆSÓ3ÂFW67&—F–öãÒ%DbvR&VæFW"E’f÷"ô5"fÆÆ&6²"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72–ÖvTö7$–ævW7E&WVW7B„&6TÖöFVÂ“ ¢""$&6ScB–ÖvR–ævW7F–öâ–ÆöBf÷"ô5"&ö6W76–ærâ""  ¢f–ÆVæÖS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$÷&–v–æÂ–ÖvRf–ÆRæÖR"¢6öçFVçEö&6ScC¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$&6ScBVæ6öFVB–ÖvR'—FW2"¢ö7%÷FW‡C¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂFW67&—F–öãÒ$÷F–öæÂô5"FW‡BÇ&VG’W‡G&7FVB'’6Æ–VçB÷"æ÷F†W"FööÂ"¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB—2F†R6fRFVfVÇB"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72Fö7VÖVçD–ævW7E&WVW7B„&6TÖöFVÂ“ ¢""$&6ScBDbÂv÷&BÂ÷vW%ö–çBÂFW‡B÷"–ÖvR–ÆöBf÷"F†R×VÇF–ÖöFÂUDÂ6†–ââ""  ¢f–ÆVæÖS¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$÷&–v–æÂf–ÆRæÖRv—F‚W‡FVç6–öâ"¢6öçFVçEö&6ScC¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$&6ScBVæ6öFVBFö7VÖVçB'—FW2"¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB—2F†R6fRFVfVÇB"¢Ö…÷vW3¢÷F–öæÅ¶–çEÒÒf–VÆB„æöæRÂvSÓÂÆSÓÂFW67&—F–öãÒ$Ö†–×VÒDbô5"vW3²ÖVç2VæÆ–Ö—FVB"¢&VæFW%öG“¢÷F–öæÅ¶–çEÒÒf–VÆB„æöæRÂvSÓs"ÂÆSÓ3ÂFW67&—F–öãÒ%Db&VæFW"E’W6VB'’FFÆTô5"fÆÆ&6²"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72Fö7VÖVçDFVÆWFU&WVW7B„&6TÖöFVÂ“ ¢6÷W&6S¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ$W†7BFö7VÖVçB6÷W&6RæÖR&WGW&æVB'’F†R¶æ÷vÆVFvRÖ&6R7VÖÖ'’"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72fV7F÷$6öÆÆV7F–öå&WVW7B„&6TÖöFVÂ“ ¢""%¦–ÆÆ—¢6öÆÆV7F–öâ7&VF–öâ&WVW7Bâ""  ¢G&÷öW†—7F–æs¢&ööÂÒf–VÆB„fÇ6RÂFW67&—F–öãÒ$G&÷æB&V7&VFRF†R¦–ÆÆ—¢6öÆÆV7F–öâ"  ¦6Æ72fV7F÷$–ævW7E&WVW7B„&6TÖöFVÂ“ ¢""%fV7F÷"7–æ6‡&öæ—¦F–öâÖöFR6VçBgFW"¶æ÷vÆVFvRÖ&6RWÆöBâ""  ¢ÖöFS¢7G"Òf–VÆB‚&VæB"ÂFW67&—F–öãÒ&VæB÷"&WÆ6S²VæB&W6W'fW2W†—7F–ær&VÖ÷FR&÷w2"¢v÷&·76Uö–C¢÷F–öæÅ·7G%ÒÒf–VÆB„æöæRÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72fV7F÷%6V&6…&WVW7B„&6TÖöFVÂ“ ¢""%¦–ÆÆ—¢fV7F÷"×6V&6‚&WVW7Bâ""  ¢VW'“¢7G"Òf–VÆB‚âââÂÖ–åöÆVæwFƒÓÂFW67&—F–öãÒ%fV7F÷"6V&6‚VW'’"¢Æ–Ö—C¢–çBÒf–VÆBƒRÂvSÓÂÆSÓSÂFW67&—F–öãÒ$Ö†–×VÒ&W7VÇB6÷VçB"¢v÷&·76Uö–C¢7G"Òf–VÆB„DTdTÅEõtõ$µ54Uô”BÂÖ–åöÆVæwFƒÓÂÖ…öÆVæwFƒÓ#‚  ¦6Æ72†VÇF…&W7öç6R„&6TÖöFVÂ“ ¢7FGW3¢7G ¢6W'f–6S¢7G ¢¶%ö6‡Væµö6÷VçC¢–ç@¢ÖöFVÅöÖöFS¢7G ¢VÖ&VFF–æu÷&÷f–FW#¢7G ¢VÖ&VFF–æuöÖöFVÃ¢7G ¢&W&æµ÷&÷f–FW#¢7G ¢&W&æµöÖöFVÃ¢7G ¢ö7%÷&÷f–FW#¢7G ¢fV7F÷%÷7F÷&U÷&÷f–FW#¢7G ¢fV7F÷%ö6öÆÆV7F–öåöæÖS¢7G ¢7G&–7E÷6÷W&6U÷&WV—&VC¢&ööÀ¢FVfVÇEö¶%÷Fƒ¢7G ¢VW'•ö6Æ76–f–W#¢7G ¢VW'•övVçC¢7G ¢&VF—5÷7FGW3¢7G ¢×—7Å÷7FGW3¢7G   ¦6Æ72¶æ÷vÆVFvT&6U7VÖÖ'’„&6TÖöFVÂ“ ¢6‡Væµö6÷VçC¢–ç@¢6÷W&6W3¢Æ—7E·7G%Ð¢Fö5÷G—W3¢Æ—7E·7G%Ð¢&Wf–Wuö6‡Væµö6÷VçC¢–çBÒ ¢&VçEö6÷VçC¢–çBÒ   ¦6Æ72¶æ÷vÆVFvT&6UWFFU&W7öç6R„&6TÖöFVÂ“ ¢7FGW3¢7G ¢ÖöFS¢7G ¢6‡Væµö6÷VçC¢–ç@¢7VÖÖ'“¢¶æ÷vÆVFvT&6U7VÖÖ'¢fÆ–FF–öã¢F–7E·7G"Â–çEÒÒf–VÆB†FVfVÇEöf7F÷'“ÖF–7B¢'6W%ö6†–ã¢Æ—7E·7G%ÒÒf–VÆB†FVfVÇEöf7F÷'“ÖÆ—7B  ¦6Æ72¶æ÷vÆVFvT&6U7FFS ¢""%F‡&VB×6fR–âÖÖVÖ÷'’¶æ÷vÆVFvR&6RæB—VÆ–æR†öÆFW"â""  ¢FVbõö–æ—Eõò‡6VÆbÂ6öæf–s¢$t6öæf–rÒDTdTÅEô4ôäd”rÂ–æ—F–Åö6‡Væ·3¢÷F–öæÅ´—FW&&ÆU´Fö7VÖVçD6‡VæµÕÒÒæöæR’ÓâæöæS ¢6VÆbåö6öæf–rÒ6öæf–p¢6VÆbåöÆö6²Ò$Æö6²‚¢6VÆbå÷fW'6–öâÒ¢6VÆbæ–æg&7G'V7GW&RÒ'VçF–ÖT–æg&7G'V7GW&R†6öæf–r¢6VÆbåöÆ7E÷fÆ–FF–öâÒUDÅfÆ–FF–öå&W÷'BƒÂÂ¢6VÆbå÷W'6—7FVæ6UöVæ&ÆVBÒ–æ—F–Åö6‡Væ·2—2æöæRæB&ööÂ†6öæf–ræ¶%÷'VçF–ÖU÷F‚ç7G&—‚’¢&÷f–FVEö6‡Væ·2ÒÆ—7B†–æ—F–Åö6‡Væ·2’–b–æ—F–Åö6‡Væ·2—2æ÷BæöæRVÇ6RµÐ¢–b&÷f–FVEö6‡Væ·3 ¢6VÆbåö6‡Væ·2Ò&÷f–FVEö6‡Væ·0¢VÆ–b6VÆbå÷W'6—7FVæ6UöVæ&ÆVC ¢'VçF–ÖU÷F‚Ò6VÆbå÷'VçF–ÖU÷F‚‚¢–b'VçF–ÖU÷F‚—2æ÷BæöæRæB'VçF–ÖU÷F‚æW†—7G2‚“ ¢2âW†—7F–ærV×G’'VçF–ÖRf–ÆRÖVç2F†RW6W"–çFVçF–öæÆÇ¢26ÆV&VBF†R¶æ÷vÆVFvR&6S²Fòæ÷B&W÷VÆFR'VæFÆVB6×ÆW2à¢6VÆbåö6‡Væ·2Ò6VÆbåöÆöE÷'VçF–ÖUö6‡Væ·2‚¢VÇ6S ¢6VÆbåö6‡Væ·2Ò6VÆbåöÆöE÷7F'GWö6‡Væ·2‚¢VÇ6S ¢6VÆbåö6‡Væ·2Ò6VÆbåöÆöE÷7F'GWö6‡Væ·2‚¢6VÆbå÷v÷&·76U÷—VÆ–æW3¢F–7E·7G"ÂGWÆU¶–çBÂÖçVf7GW&–æu$u—VÆ–æUÕÒÒ·Ð ¢&÷W'G¢FVb6‡Væµö6÷VçB‡6VÆb’Óâ–çC ¢v—F‚6VÆbåöÆö6³ ¢&WGW&âÆVâ‡6VÆbåö6‡Væ·2 ¢FVbç7vW"€¢6VÆbÀ¢VW7F–öã¢7G"À¢6W76–öåö–C¢÷F–öæÅ·7G%ÒÒæöæRÀ¢&W&æµ÷'VÆW3¢÷F–öæÅ´F–7E·7G"ÂÆ—7E·7G%ÕÕÒÒæöæRÀ¢6öçfW'6F–öåö6öçFW‡C¢7G"Ò""À¢öå÷Fö¶Vã¢÷F–öæÅ´6ÆÆ&ÆUµ·7G%ÒÂæöæUÕÒÒæöæRÀ¢†ÆÇV6–æF–öå÷F‡&W6†öÆC¢fÆöBÒãsRÀ¢öå÷7FGW3¢÷F–öæÅ´6ÆÆ&ÆUµ·7G%ÒÂæöæUÕÒÒæöæRÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢v÷&·76Uö–G3¢÷F–öæÅ´—FW&&ÆU·7G%ÕÒÒæöæRÀ¢&–æ6—Å÷W6W%ö–C¢÷F–öæÅ·7G%ÒÒæöæRÀ¢W&Ö—76–öåö66†U÷66÷S¢÷F–öæÅ·7G%ÒÒæöæRÀ¢7G&–7E÷v÷&·76UöÖWFFF¢&ööÂÒfÇ6RÀ¢’Óâ$u&W7öç6S ¢v—F‚6VÆbåöÆö6³ ¢–bv÷&·76Uö–G2—2æöæS ¢—VÆ–æRÒ6VÆbå÷v÷&·76U÷—VÆ–æUöÆö6¶VB‡v÷&·76Uö–B¢VffV7F—fU÷v÷&·76Uö–G2Ò·v÷&·76Uö–EÐ¢VÇ6S ¢VffV7F—fU÷v÷&·76Uö–G2Ò6÷'FVB‡6WB‡7G"‡fÇVR’f÷"fÇVR–âv÷&·76Uö–G2–bfÇVR’¢—VÆ–æRÒ6VÆbå÷v÷&·76U÷66÷U÷—VÆ–æUöÆö6¶VB€¢VffV7F—fU÷v÷&·76Uö–G2À¢7G&–7E÷v÷&·76UöÖWFFF×7G&–7E÷v÷&·76UöÖWFFFÀ¢¢¶æ÷vÆVFvU÷fW'6–öâÒ6VÆbå÷fW'6–öà¢66÷Uö¶W’Ò"Â"æ¦ö–â†VffV7F—fU÷v÷&·76Uö–G2¢66÷VE÷6W76–öåö–BÒv÷&·76U÷6W76–öåö–B‡66÷Uö¶W’Â6W76–öåö–B¢7F÷&VEö6öçFW‡BÒ6VÆbæ–æg&7G'V7GW&RævWE÷6W76–öåö6öçFW‡B‡66÷VE÷6W76–öåö–B¢6W76–öåö6öçFW‡BÒ7G"†6öçfW'6F–öåö6öçFW‡B÷"""’ç7G&—‚•²ÓC¥Ò÷"7F÷&VEö6öçFW‡@¢–böå÷7FGW3 ¢öå÷7FGW2‚.jÚ>YÊŽŠønXŠ¾™zîš)Ž{¾Yè¾(
+b"¢–çFVçBÒ—VÆ–æRæ6Æ76–g•ö–çFVçB‡VW7F–öâÂ6W76–öåö6öçFW‡B¢66†Uö&6—2Ò6öçFW‡GVÆ—¦U÷VW7F–öâ‡VW7F–öâÂ6W76–öåö6öçFW‡B¢6fU÷&W&æµ÷'VÆW2Ò&W&æµ÷'VÆW2÷"²&&ö÷7E÷FW&×2#¢µÒÂ&W†6ÇVFU÷FW&×2#¢µ×Ð¢6fU÷F‡&W6†öÆBÒÖ–âƒã“RÂÖ‚ƒãÂfÆöB††ÆÇV6–æF–öå÷F‡&W6†öÆB’’¢66†Uö&6—2Ò€¢b'¶66†Uö&6—7ÕÆå¶–çFVçEö6FVv÷'“§¶–çFVçBæ6FVv÷'—ÕÒ ¢b%Æå·v÷&·76Uö–G3§²rÂræ¦ö–â†VffV7F—fU÷v÷&·76Uö–G2—ÕÒ ¢b%Æå·&–æ6—Å÷W6W%ö–C§·&–æ6—Å÷W6W%ö–B÷"væöç–Ö÷W2wÕÒ ¢b%Æå·W&Ö—76–öåö66†U÷66÷S§·W&Ö—76–öåö66†U÷66÷R÷"vÆVv7’wÕÒ ¢b%Æå·&W&æµ÷'VÆW3§¶§6öâæGV×2‡6fU÷&W&æµ÷'VÆW2ÂVç7W&Uö66–“ÔfÇ6RÂ6÷'Eö¶W—3ÕG'VR—ÕÒ ¢b%Æå¶†ÆÇV6–æF–öå÷F‡&W6†öÆC§·6fU÷F‡&W6†öÆC¢ã&gÕÒ ¢¢26†B&WÆ–W2FWVæBöâ6öçfW'6F–öâFöæRæB6†÷VÆBæ÷B&R&WÆ6V@¢2'’&Wf–÷W2vÆö&Â66†RVçG'’âF†W’&R7F–ÆÂW'6—7FVB–çFòF†P¢26VÆV7FVB6W76–öâw26öçfW'6F–öâ†—7F÷'’&VÆ÷rà¢66†VBÒæöæP¢–b–çFVçBæÆÆ÷vVBæB–çFVçBæ6FVv÷'’Ò&6†—Eö6†B# ¢66†VBÒ6VÆbæ–æg&7G'V7GW&RævWEö66†VEöç7vW"†66†Uö&6—2Â¶æ÷vÆVFvU÷fW'6–öâ¢–b66†VB—2æ÷BæöæRæB66†VBæ†ÆÇV6–æF–öåö6†V6²æB66†VBæ†ÆÇV6–æF–öåö6†V6²ç76VC ¢6VÆbæ–æg&7G'V7GW&Ræ66†Uöç7vW"†66†VBÂ¶æ÷vÆVFvU÷fW'6–öâÂ6W76–öåö–C×66÷VE÷6W76–öåö–BÂ66†Uö&6—3Ö66†Uö&6—2¢&WGW&â66†V@¢&W7öç6RÒ—VÆ–æRæç7vW"€¢VW7F–öâÀ¢6öçfW'6F–öåö6öçFW‡C×6W76–öåö6öçFW‡BÀ¢&W&æµ÷'VÆW3×6fU÷&W&æµ÷'VÆW2À¢öå÷Fö¶VãÖöå÷Fö¶VâÀ¢†ÆÇV6–æF–öå÷F‡&W6†öÆC×6fU÷F‡&W6†öÆBÀ¢öå÷7FGW3Ööå÷7FGW2À¢6Æ76–f–VEö–çFVçCÖ–çFVçBÀ¢¢6VÆbæ–æg&7G'V7GW&Ræ66†Uöç7vW"‡&W7öç6RÂ¶æ÷vÆVFvU÷fW'6–öâÂ6W76–öåö–C×66÷VE÷6W76–öåö–BÂ66†Uö&6—3Ö66†Uö&6—2¢&WGW&â&W7öç6P ¢FVbö6‡Væµ÷v÷&·76Uö–B‡6VÆbÂ6‡Væ³¢Fö7VÖVçD6‡Væ²’Óâ7G# ¢&WGW&â7G"‚†6‡Væ²æÖWFFF÷"·Ò’ævWB‚'v÷&·76Uö–B"’÷"DTdTÅEõtõ$µ54Uô”B ¢FVb÷v÷&·76U÷—VÆ–æUöÆö6¶VB‡6VÆbÂv÷&·76Uö–C¢7G"’ÓâÖçVf7GW&–æu$u—VÆ–æS ¢66†VBÒ6VÆbå÷v÷&·76U÷—VÆ–æW2ævWB‡v÷&·76Uö–B¢–b66†VBæB66†VE³ÒÓÒ6VÆbå÷fW'6–öã ¢&WGW&â66†VE³Ð¢6‡Væ·2Ò¶6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–EÐ¢—VÆ–æRÒÖçVf7GW&–æu$u—VÆ–æR€¢6‡Væ·2À¢6öæf–s×6VÆbåö6öæf–rÀ¢&VÖ÷FUö66†Uö6ÆÆ&6³×6VÆbåö66†U÷&VÖ÷FUö6‡Væ·2À¢v÷&·76Uö–C×v÷&·76Uö–BÀ¢¢6VÆbå÷v÷&·76U÷—VÆ–æW5·v÷&·76Uö–EÒÒ‡6VÆbå÷fW'6–öâÂ—VÆ–æR¢&WGW&â—VÆ–æP ¢FVb÷v÷&·76U÷66÷U÷—VÆ–æUöÆö6¶VB€¢6VÆbÀ¢v÷&·76Uö–G3¢—FW&&ÆU·7G%ÒÀ¢¢À¢7G&–7E÷v÷&·76UöÖWFFF¢&ööÂÒfÇ6RÀ¢’ÓâÖçVf7GW&–æu$u—VÆ–æS ¢æ÷&ÖÆ—¦VEö–G2ÒGWÆR‡6÷'FVB‡6WB‡7G"‡fÇVR’f÷"fÇVR–âv÷&·76Uö–G2–bfÇVR’’¢–bæ÷Bæ÷&ÖÆ—¦VEö–G3 ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓC2ÂFWF–ÃÒ.k*iÈžXúþj8{J.y¨N[z^KÙÎXË¢"¢–bÆVâ†æ÷&ÖÆ—¦VEö–G2’ÓÒæBæ÷B7G&–7E÷v÷&·76UöÖWFFF ¢&WGW&â6VÆbå÷v÷&·76U÷—VÆ–æUöÆö6¶VB†æ÷&ÖÆ—¦VEö–G5³Ò¢66†Uö¶W’Ò'66÷S¢"²†6†Æ–"ç6†#Sb‚%Ã"æ¦ö–â†æ÷&ÖÆ—¦VEö–G2’æVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚¢66†VBÒ6VÆbå÷v÷&·76U÷—VÆ–æW2ævWB†66†Uö¶W’¢–b66†VBæB66†VE³ÒÓÒ6VÆbå÷fW'6–öã ¢&WGW&â66†VE³Ð¢ÆÆ÷vVBÒg&÷¦Vç6WB†æ÷&ÖÆ—¦VEö–G2¢6‡Væ·2Ò¶6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’–âÆÆ÷vVEÐ¢—VÆ–æRÒÖçVf7GW&–æu$u—VÆ–æR€¢6‡Væ·2À¢6öæf–s×6VÆbåö6öæf–rÀ¢&VÖ÷FUö66†Uö6ÆÆ&6³×6VÆbåö66†U÷&VÖ÷FUö6‡Væ·2À¢v÷&·76Uö–G3Öæ÷&ÖÆ—¦VEö–G2À¢7G&–7E÷v÷&·76UöÖWFFF×7G&–7E÷v÷&·76UöÖWFFFÀ¢¢6VÆbå÷v÷&·76U÷—VÆ–æW5¶66†Uö¶W•ÒÒ‡6VÆbå÷fW'6–öâÂ—VÆ–æR¢&WGW&â—VÆ–æP ¢FVb6‡Væ·5÷6æ6†÷B‡6VÆbÂv÷&·76Uö–C¢÷F–öæÅ·7G%ÒÒæöæR’ÓâÆ—7E´Fö7VÖVçD6‡VæµÓ ¢v—F‚6VÆbåöÆö6³ ¢–bv÷&·76Uö–B—2æöæS ¢&WGW&âÆ—7B‡6VÆbåö6‡Væ·2¢&WGW&â¶6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–EÐ ¢FVbFö7VÖVçEö6‡Væµö–G2‡6VÆbÂ6÷W&6S¢7G"Âv÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”B’ÓâÆ—7E·7G%Ó ¢v—F‚6VÆbåöÆö6³ ¢&WGW&â°¢6‡Væ²æ–Bf÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6‡Væ²ç6÷W&6RÓÒ6÷W&6RæB6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð ¢FVbÆ—7Eö÷&–v–æÅöFö7VÖVçG2‡6VÆbÂv÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”B’ÓâF–7E·7G"Âç•Ó ¢v÷&·76Uö¶W’Ò†6†Æ–"ç6†#Sb‡v÷&·76Uö–BæVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚•³£#EÐ¢v÷&·76UöF—"ÒDô5TÔTåEôd”ÄU5ôD•"òv÷&·76Uö¶W¢Fö7VÖVçG2ÒµÐ¢–bæ÷Bv÷&·76UöF—"æ—5öF—"‚“ ¢&WGW&â²&Fö7VÖVçG2#¢Fö7VÖVçG2Â&6÷VçB#¢Â'v÷&·76Uö–B#¢v÷&·76Uö–GÐ¢f÷"ÖWFFF÷F‚–âv÷&·76UöF—"ævÆö"‚"¢æ§6öâ"“ ¢G'“ ¢ÖWFFFÒ§6öâæÆöG2†ÖWFFF÷F‚ç&VE÷FW‡B†Væ6öF–æsÒ'WFbÓ‚"’¢6÷W&6RÒ7G"†ÖWFFFævWB‚'6÷W&6R"’÷"""¢f–ÆVæÖRÒ6fUöFö7VÖVçEöf–ÆVæÖR‡7G"†ÖWFFFævWB‚&f–ÆVæÖR"’÷"6÷W&6R’¢–bæ÷B6÷W&6R÷"ÖWFFF÷F‚Ò7F÷&VEöFö7VÖVçEöÖWFFF÷F‚‡v÷&·76Uö–BÂ6÷W&6R“ ¢6öçF–çVP¢F‚Ò7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–BÂ6÷W&6R¢–bæ÷BF‚æ—5öf–ÆR‚“ ¢6öçF–çVP¢Fö7VÖVçG2æVæB‡°¢'6÷W&6R#¢6÷W&6RÀ¢&f–ÆVæÖR#¢f–ÆVæÖRÀ¢'6—¦Uö'—FW2#¢F‚ç7FB‚’ç7E÷6—¦RÀ¢Ò¢W†6WB„õ4W'&÷"ÂfÇVTW'&÷"ÂG—TW'&÷"“ ¢6öçF–çVP¢Fö7VÖVçG2ç6÷'B†¶W“ÖÆÖ&F—FVÓ¢—FVÕ²&f–ÆVæÖR%Òæ66VföÆB‚’¢&WGW&â²&Fö7VÖVçG2#¢Fö7VÖVçG2Â&6÷VçB#¢ÆVâ†Fö7VÖVçG2’Â'v÷&·76Uö–B#¢v÷&·76Uö–GÐ ¢FVbFö7VÖVçEö6öçFVçB€¢6VÆbÀ¢6÷W&6S¢7G"À¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢Ö…ö6†'3¢–çBÒSóÀ¢’ÓâF–7E·7G"Âç•Ó ¢v—F‚6VÆbåöÆö6³ ¢6‡Væ·2Ò°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6‡Væ²ç6÷W&6RÓÒ6÷W&6RæB6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð¢–bæ÷B6‡Væ·3 ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓCBÂFWF–ÃÖb.yú^Šøn[©>KŠÞKˆÞZÙŽYÊŽ‹XNiižûÉ§·6÷W&6WÒ"¢6öçFVçBÒ%ÆåÆâ"æ¦ö–â†6‡Væ²çFW‡Bç7G&—‚’f÷"6‡Væ²–â6‡Væ·2–b6‡Væ²çFW‡BæB6‡Væ²çFW‡Bç7G&—‚’¢6fUöÆ–Ö—BÒÖ‚ƒÂÖ–â†–çB†Ö…ö6†'2’ÂSó’¢G'Væ6FVBÒ&ööÂ‡6fUöÆ–Ö—BæBÆVâ†6öçFVçB’â6fUöÆ–Ö—B¢–bG'Væ6FVC ¢6öçFVçBÒ6öçFVçE³§6fUöÆ–Ö—EÐ¢&WGW&â°¢'6÷W&6R#¢6÷W&6RÀ¢&f–ÆVæÖR#¢7F÷&VEöFö7VÖVçEöf–ÆVæÖR‡v÷&·76Uö–BÂ6÷W&6R’À¢&6öçFVçB#¢6öçFVçBÀ¢&6‡Væµö6÷VçB#¢ÆVâ†6‡Væ·2’À¢&÷&–v–æÅöf–Æ&ÆR#¢7F÷&VEöFö7VÖVçE÷F‚‡v÷&·76Uö–BÂ6÷W&6R’æ—5öf–ÆR‚’À¢'G'Væ6FVB#¢G'Væ6FVBÀ¢Ð ¢FVbv÷&·76Uö6‡Væµö–G2‡6VÆbÂv÷&·76Uö–C¢7G"’ÓâÆ—7E·7G%Ó ¢v—F‚6VÆbåöÆö6³ ¢&WGW&â°¢6‡Væ²æ–Bf÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð ¢FVbFVÆWFU÷v÷&·76R‡6VÆbÂv÷&·76Uö–C¢7G"’ÓâF–7E·7G"Âç•Ó ¢–bv÷&·76Uö–BÓÒDTdTÅEõtõ$µ54Uô”C ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓCÂFWF–ÃÒ.›¹ŽŠêN[z^KÙÎXË®KˆÞˆ;ÞXŠ™šB" ¢v÷&·76Uö¶W’Ò†6†Æ–"ç6†#Sb‡v÷&·76Uö–BæVæ6öFR‚'WFbÓ‚"’’æ†W†F–vW7B‚•³£#EÐ¢v÷&·76UöF—"ÒDô5TÔTåEôd”ÄU5ôD•"òv÷&·76Uö¶W¢v—F‚6VÆbåöÆö6³ ¢&VÖ÷fVBÒ¶6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–EÐ¢&VÖ÷fVEö6‡Væµö6÷VçBÒÆVâ‡&VÖ÷fVB¢&VÖ÷fVEöFö7VÖVçEö6÷VçBÒ  ¢G'“ ¢–bv÷&·76UöF—"æ—5÷7–ÖÆ–æ²‚“ ¢v÷&·76UöF—"çVæÆ–æ²†Ö—76–æuöö³ÕG'VR¢VÆ–bv÷&·76UöF—"æ—5öF—"‚“ ¢7F÷&VEöf–ÆW2ÒÆ—7B‡v÷&·76UöF—"æ—FW&F—"‚’¢&VÖ÷fVEöFö7VÖVçEö6÷VçBÒ7VÒƒf÷"F‚–â7F÷&VEöf–ÆW2–bF‚ç7Vff—‚ÓÒ"æ§6öâ"¢f÷"F‚–â7F÷&VEöf–ÆW3 ¢–bF‚æ—5öf–ÆR‚’÷"F‚æ—5÷7–ÖÆ–æ²‚“ ¢F‚çVæÆ–æ²†Ö—76–æuöö³ÕG'VR¢VÇ6S ¢&—6Rõ4W'&÷"‚'VæW‡V7FVBF—&V7F÷'’–âv÷&·76RFö7VÖVçB7F÷&R"¢v÷&·76UöF—"ç&ÖF—"‚¢W†6WBõ4W'&÷"2W†3 ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓSÂFWF–ÃÒ.izk9^kˆ^yn[z^KÙÎXË®KŠÞy¨NXéþZx¾ih~j2"’g&öÒW†0 ¢æW‡Eö6‡Væ·2Ò°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’Òv÷&·76Uö–@¢Ð¢6VÆbå÷W'6—7E÷'VçF–ÖUö6‡Væ·5öÆö6¶VB†æW‡Eö6‡Væ·2Â7G&–7CÕG'VR¢6VÆbåö6‡Væ·2ÒæW‡Eö6‡Væ·0¢6VÆbå÷fW'6–öâ³Ò¢6VÆbåö–çfÆ–FFU÷v÷&·76U÷—VÆ–æW5öÆö6¶VB‚¢w&—FUöFV'VuöÆör€¢6VÆbåö6öæf–rÀ¢&¶%÷v÷&·76UöFVÆWFVB"À¢v÷&·76Uö–C×v÷&·76Uö–BÀ¢FVÆWFVEö6‡Væµö6÷VçC×&VÖ÷fVEö6‡Væµö6÷VçBÀ¢FVÆWFVEöFö7VÖVçEö6÷VçC×&VÖ÷fVEöFö7VÖVçEö6÷VçBÀ¢¢&WGW&â°¢'v÷&·76Uö–B#¢v÷&·76Uö–BÀ¢'&VÖ÷fVEö6‡Væµö6÷VçB#¢&VÖ÷fVEö6‡Væµö6÷VçBÀ¢'&VÖ÷fVEöFö7VÖVçEö6÷VçB#¢&VÖ÷fVEöFö7VÖVçEö6÷VçBÀ¢Ð ¢FVbFVÆWFUöFö7VÖVçB€¢6VÆbÀ¢6÷W&6S¢7G"À¢W‡V7FVEö6‡Væµö–G3¢—FW&&ÆU·7G%ÒÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’ÓâF–7E·7G"Âç•Ó ¢W‡V7FVEö–G2Ò6WB†W‡V7FVEö6‡Væµö–G2¢v—F‚6VÆbåöÆö6³ ¢&VÖ÷fVBÒ°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6‡Væ²ç6÷W&6RÓÒ6÷W&6RæB6‡Væ²æ–B–âW‡V7FVEö–G2æB6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð¢–bæ÷B&VÖ÷fVC ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓCBÂFWF–ÃÖb.yú^Šøn[©>KŠÞKˆÞZÙŽYÊŽ‹XNiižûÉ§·6÷W&6WÒ"¢&VÖ÷fVEö–G2Ò¶6‡Væ²æ–Bf÷"6‡Væ²–â&VÖ÷fVGÐ¢6VÆbåö6‡Væ·2Ò°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–bæ÷B€¢6‡Væ²ç6÷W&6RÓÒ6÷W&6P¢æB6‡Væ²æ–B–â&VÖ÷fVEö–G0¢æB6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢¢Ð¢&VÖ÷fU÷7F÷&VEöFö7VÖVçB‡v÷&·76Uö–BÂ6÷W&6R¢6VÆbå÷fW'6–öâ³Ò¢6VÆbå÷W'6—7E÷'VçF–ÖUö6‡Væ·5öÆö6¶VB‚¢6VÆbåö–çfÆ–FFU÷v÷&·76U÷—VÆ–æW5öÆö6¶VB‚¢7VÖÖ'’Ò6VÆbç7VÖÖ'•öÆö6¶VB‡v÷&·76Uö–B¢w&—FUöFV'VuöÆör€¢6VÆbåö6öæf–rÀ¢&¶%öFö7VÖVçEöFVÆWFVB"À¢6÷W&6S×6÷W&6RÀ¢FVÆWFVEö6‡Væµö6÷VçCÖÆVâ‡&VÖ÷fVB’À¢&VÖ–æ–æuö6‡Væµö6÷VçC×7VÒƒf÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–B’À¢¢&WGW&â°¢'6÷W&6R#¢6÷W&6RÀ¢'&VÖ÷fVEö6‡Væµö6÷VçB#¢ÆVâ‡&VÖ÷fVB’À¢'7VÖÖ'’#¢7VÖÖ'’æÖöFVÅöGV×‚’–b†6GG"‡7VÖÖ'’Â&ÖöFVÅöGV×"’VÇ6R7VÖÖ'’æF–7B‚’À¢Ð ¢FVbÆ—7Eö6‡Væ·2€¢6VÆbÀ¢Æ–Ö—C¢–çBÒSÀ¢öfg6WC¢–çBÒÀ¢v÷&·76Uö–C¢÷F–öæÅ·7G%ÒÒæöæRÀ¢’ÓâF–7E·7G"Âç•Ó ¢v—F‚6VÆbåöÆö6³ ¢6fUööfg6WBÒÖ‚†öfg6WBÂ¢6fUöÆ–Ö—BÒÖ‚†Ö–â†Æ–Ö—BÂ#’Â¢6‡Væ·2Ò6VÆbåö6‡Væ·2–bv÷&·76Uö–B—2æöæRVÇ6R°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð¢&÷w2Ò6‡Væ·5·6fUööfg6WB¢6fUööfg6WB²6fUöÆ–Ö—EÐ¢&WGW&â°¢'F÷FÂ#¢ÆVâ†6‡Væ·2’À¢&öfg6WB#¢6fUööfg6WBÀ¢&Æ–Ö—B#¢6fUöÆ–Ö—BÀ¢&6‡Væ·2#¢¶6‡Væµ÷FõöF–7B†6‡Væ²’f÷"6‡Væ²–â&÷w5ÒÀ¢Ð ¢FVbWFFUö6‡Væ·2€¢6VÆbÀ¢–ÆöG3¢—FW&&ÆU´F–7E·7G"Âç•ÕÒÀ¢ÖöFS¢7G"Ò&VæB"À¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢æ÷&ÖÆ—¦VEöÖöFRÒfÆ–FFUöÖöFR†ÖöFR¢6‡Væ·2Â&W÷'BÒ&W&Uö6‡Væ·2‚„Fö7VÖVçD6‡Væ²æg&öÕöÖ–ær‡–ÆöB’f÷"–ÆöB–â–ÆöG2’Â6VÆbåö6öæf–r¢Æöuö6‡Væ·5öf÷%ö–ævW7B‡6VÆbåö6öæf–rÂ&¶%ö6‡Væ·5÷–ÆöB"Â6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFR¢&WGW&â6VÆbåöÇ•ö6‡Væ·5öÆö6¶VB†6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFRÂfÆ–FF–öã×&W÷'BÂv÷&·76Uö–C×v÷&·76Uö–B ¢FVb–ævW7E÷Fb€¢6VÆbÀ¢f–ÆVæÖS¢7G"À¢6öçFVçEö&6ScC¢7G"À¢ÖöFS¢7G"Ò&VæB"À¢Ö…÷vW3¢÷F–öæÅ¶–çEÒÒæöæRÀ¢&VæFW%öG“¢÷F–öæÅ¶–çEÒÒæöæRÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢æ÷&ÖÆ—¦VEöÖöFRÒfÆ–FFUöÖöFR†ÖöFR¢Feö'—FW2ÒFV6öFU÷Feö&6ScB†6öçFVçEö&6ScB¢&uö6‡Væ·2ÒFeö'—FW5÷Fõö6‡Væ·2€¢Feö'—FW2À¢f–ÆVæÖSÖf–ÆVæÖRÀ¢6öæf–s×6VÆbåö6öæf–rÀ¢Ö…÷vW3ÖÖ…÷vW2À¢&VæFW%öG“×&VæFW%öG’À¢¢6‡Væ·2Â&W÷'BÒ&W&Uö6‡Væ·2‡&uö6‡Væ·2Â6VÆbåö6öæf–r¢Æöuö6‡Væ·5öf÷%ö–ævW7B‡6VÆbåö6öæf–rÂ'Feö–ævW7E÷–ÆöB"Â6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFRÂf–ÆVæÖSÖf–ÆVæÖR¢&WGW&â6VÆbåöÇ•ö6‡Væ·5öÆö6¶VB€¢6‡Væ·2À¢æ÷&ÖÆ—¦VEöÖöFRÀ¢fÆ–FF–öã×&W÷'BÀ¢'6W%ö6†–ãÕ²%Dnih~iÊÎŠz>ié"Â6VÆbåö6öæf–ræö7%÷&÷f–FW%ÒÀ¢v÷&·76Uö–C×v÷&·76Uö–BÀ¢ ¢FVb–ævW7Eö–ÖvUöö7"€¢6VÆbÀ¢f–ÆVæÖS¢7G"À¢6öçFVçEö&6ScC¢7G"À¢ö7%÷FW‡C¢÷F–öæÅ·7G%ÒÒæöæRÀ¢ÖöFS¢7G"Ò&VæB"À¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢æ÷&ÖÆ—¦VEöÖöFRÒfÆ–FFUöÖöFR†ÖöFR¢&uö6‡Væ·2Ò–ÖvU÷–ÆöE÷Fõö6‡Væ·2€¢f–ÆVæÖSÖf–ÆVæÖRÀ¢6öçFVçEö&6ScCÖ6öçFVçEö&6ScBÀ¢ö7%÷FW‡CÖö7%÷FW‡BÀ¢6öæf–s×6VÆbåö6öæf–rÀ¢¢6‡Væ·2Â&W÷'BÒ&W&Uö6‡Væ·2‡&uö6‡Væ·2Â6VÆbåö6öæf–r¢Æöuö6‡Væ·5öf÷%ö–ævW7B‡6VÆbåö6öæf–rÂ&–ÖvUöö7%ö–ævW7E÷–ÆöB"Â6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFRÂf–ÆVæÖSÖf–ÆVæÖR¢&WGW&â6VÆbåöÇ•ö6‡Væ·5öÆö6¶VB€¢6‡Væ·2À¢æ÷&ÖÆ—¦VEöÖöFRÀ¢fÆ–FF–öã×&W÷'BÀ¢'6W%ö6†–ãÕ·6VÆbåö6öæf–ræö7%÷&÷f–FW"Â%vVâÕdÂ%ÒÀ¢v÷&·76Uö–C×v÷&·76Uö–BÀ¢ ¢FVb–ævW7EöFö7VÖVçB€¢6VÆbÀ¢f–ÆVæÖS¢7G"À¢6öçFVçEö&6ScC¢7G"À¢ÖöFS¢7G"Ò&VæB"À¢Ö…÷vW3¢÷F–öæÅ¶–çEÒÒæöæRÀ¢&VæFW%öG“¢÷F–öæÅ¶–çEÒÒæöæRÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢æ÷&ÖÆ—¦VEöÖöFRÒfÆ–FFUöÖöFR†ÖöFR¢6öçFVçBÒFV6öFUöFö7VÖVçEö&6ScB†6öçFVçEö&6ScB¢WFÅö6öæf–rÒ&WÆ6R€¢6VÆbåö6öæf–rÀ¢&–GUöö7%÷FeöÖ…÷vW3×6VÆbåö6öæf–ræ&–GUöö7%÷FeöÖ…÷vW2–bÖ…÷vW2—2æöæRVÇ6RÖ…÷vW2À¢&–GUöö7%÷Fe÷&VæFW%öG“×6VÆbåö6öæf–ræ&–GUöö7%÷Fe÷&VæFW%öG’–b&VæFW%öG’—2æöæRVÇ6R&VæFW%öG’À¢¢G'“ ¢&W7VÇBÒ×VÇF–ÖöFÄUDÅ—VÆ–æR†WFÅö6öæf–r’ç'6Uö'—FW2€¢6öçFVçBÀ¢f–ÆVæÖSÖf–ÆVæÖRÀ¢Ö…÷vW3ÖÖ…÷vW2À¢&VæFW%öG“×&VæFW%öG’À¢¢W†6WBW†6WF–öâ2W†3¢2æ÷¢$ÄSÒ6öçfW'B'6W"×7V6–f–2f–ÇW&W2Fò7F&ÆR’W'&÷"à¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓCÂFWF–ÃÖb.ZI®jŠhUDÂZK‹J^ûÉ§¶W†7Ò"’g&öÒW†0¢Æöuö6‡Væ·5öf÷%ö–ævW7B‡6VÆbåö6öæf–rÂ&×VÇF–ÖöFÅöFö7VÖVçEö–ævW7B"Â&W7VÇBæ6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFRÂf–ÆVæÖSÖf–ÆVæÖR¢&W7öç6RÒ6VÆbåöÇ•ö6‡Væ·5öÆö6¶VB€¢&W7VÇBæ6‡Væ·2À¢æ÷&ÖÆ—¦VEöÖöFRÀ¢fÆ–FF–öã×&W7VÇBçfÆ–FF–öâÀ¢'6W%ö6†–ã×&W7VÇBç'6W%ö6†–âÀ¢v÷&·76Uö–C×v÷&·76Uö–BÀ¢¢Fö7VÖVçE÷6÷W&6RÒæW‡B‚†6‡Væ²ç6÷W&6Rf÷"6‡Væ²–â&W7VÇBæ6‡Væ·2–b6‡Væ²ç6÷W&6R’Âf–ÆVæÖR¢6fU÷7F÷&VEöFö7VÖVçB‡v÷&·76Uö–BÂFö7VÖVçE÷6÷W&6RÂf–ÆVæÖRÂ6öçFVçB¢&WGW&â&W7öç6P ¢FVböÇ•ö6‡Væ·5öÆö6¶VB€¢6VÆbÀ¢6‡Væ·3¢Æ—7E´Fö7VÖVçD6‡VæµÒÀ¢æ÷&ÖÆ—¦VEöÖöFS¢7G"À¢fÆ–FF–öã¢÷F–öæÅ´UDÅfÆ–FF–öå&W÷'EÒÒæöæRÀ¢'6W%ö6†–ã¢÷F–öæÅ´Æ—7E·7G%ÕÒÒæöæRÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢–bæ÷B6‡Væ·2æBæ÷&ÖÆ—¦VEöÖöFRÓÒ'&WÆ6R# ¢&—6R…EEW†6WF–öâ‡7FGW5ö6öFSÓCÂFWF–ÃÒ'&WÆ6RÖöFR&WV—&W2BÆV7BöæR6‡Væ²"¢6‡Væ·2ÒFuö6‡Væ·5öf÷%÷v÷&·76R†6‡Væ·2Âv÷&·76Uö–B¢v—F‚6VÆbåöÆö6³ ¢–bæ÷&ÖÆ—¦VEöÖöFRÓÒ'&WÆ6R# ¢&Wf–÷W5÷6÷W&6W2Ò°¢6‡Væ²ç6÷W&6Rf÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–BæB6‡Væ²ç6÷W&6P¢Ð¢–æ6öÖ–æu÷6÷W&6W2Ò¶6‡Væ²ç6÷W&6Rf÷"6‡Væ²–â6‡Væ·2–b6‡Væ²ç6÷W&6WÐ¢6VÆbåö6‡Væ·2Ò°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’Òv÷&·76Uö–@¢Ò²6‡Væ·0¢f÷"&VÖ÷fVE÷6÷W&6R–â&Wf–÷W5÷6÷W&6W2Ò–æ6öÖ–æu÷6÷W&6W3 ¢&VÖ÷fU÷7F÷&VEöFö7VÖVçB‡v÷&·76Uö–BÂ&VÖ÷fVE÷6÷W&6R¢VÇ6S ¢2¶VWF–ffW&VçBFö7VÖVçG26V&6†&ÆRv†–ÆRG&VF–ær¢2&WVFVBWÆöBöbF†R6ÖR6÷W&6R2âWFFRâF†—0¢2fö–G27FÆRvW2æBGWÆ–6FR6‡Væ·2–âVæBÖöFRà¢–æ6öÖ–æuö'•ö–BÒ¶6‡Væ²æ–C¢6‡Væ²f÷"6‡Væ²–â6‡Væ·7Ð¢–æ6öÖ–æuö6‡Væ·2ÒÆ—7B†–æ6öÖ–æuö'•ö–BçfÇVW2‚’¢–æ6öÖ–æu÷6÷W&6W2Ò°¢6‡Væ²ç6÷W&6P¢f÷"6‡Væ²–â–æ6öÖ–æuö6‡Væ·0¢–b6‡Væ²ç6÷W&6RæB6‡Væ²ç6÷W&6RÒ'Væ¶æ÷vâ ¢Ð¢6VÆbåö6‡Væ·2Ò°¢6‡Væ°¢f÷"6‡Væ²–â6VÆbåö6‡Væ·0¢–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’Òv÷&·76Uö–@¢÷"†6‡Væ²æ–Bæ÷B–â–æ6öÖ–æuö'•ö–BæB6‡Væ²ç6÷W&6Ræ÷B–â–æ6öÖ–æu÷6÷W&6W2¢Ð¢6VÆbåö6‡Væ·2æW‡FVæB†–æ6öÖ–æuö6‡Væ·2¢6VÆbå÷fW'6–öâ³Ò¢6VÆbåöÆ7E÷fÆ–FF–öâÒfÆ–FF–öâ÷"UDÅfÆ–FF–öå&W÷'B†ÆVâ†6‡Væ·2’ÂÂ¢6VÆbå÷W'6—7E÷'VçF–ÖUö6‡Væ·5öÆö6¶VB‚¢Æöuö6‡Væ·5öf÷%ö–ævW7B‡6VÆbåö6öæf–rÂ&¶%ö&Vf÷&U÷—VÆ–æU÷&V'V–ÆB"Â6VÆbåö6‡Væ·2Âæ÷&ÖÆ—¦VEöÖöFR¢6VÆbåö–çfÆ–FFU÷v÷&·76U÷—VÆ–æW5öÆö6¶VB‚¢&WGW&â¶æ÷vÆVFvT&6UWFFU&W7öç6R€¢7FGW3Ò&ö²"À¢ÖöFSÖæ÷&ÖÆ—¦VEöÖöFRÀ¢6‡Væµö6÷VçC×7VÒƒf÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–B’À¢7VÖÖ'“×6VÆbç7VÖÖ'•öÆö6¶VB‡v÷&·76Uö–B’À¢fÆ–FF–öã×6VÆbåöÆ7E÷fÆ–FF–öâçFõöF–7B‚’À¢'6W%ö6†–ãÖÆ—7B‡'6W%ö6†–â÷"µÒ’À¢ ¢FVb–ævW7Eö§6öæÂ€¢6VÆbÀ¢6öçFVçC¢7G"À¢ÖöFS¢7G"Ò&VæB"À¢6÷W&6UöæÖS¢÷F–öæÅ·7G%ÒÒæöæRÀ¢v÷&·76Uö–C¢7G"ÒDTdTÅEõtõ$µ54Uô”BÀ¢’Óâ¶æ÷vÆVFvT&6UWFFU&W7öç6S ¢–ÆöG2Ò'6Uö§6öæÅö÷%ö'&’†6öçFVçBÂ6÷W&6UöæÖS×6÷W&6UöæÖR÷"'&WVW7Bæ6öçFVçB"¢&WGW&â6VÆbçWFFUö6‡Væ·2‡–ÆöG2ÂÖöFSÖÖöFRÂv÷&·76Uö–C×v÷&·76Uö–B ¢FVb7VÖÖ'’‡6VÆbÂv÷&·76Uö–C¢÷F–öæÅ·7G%ÒÒDTdTÅEõtõ$µ54Uô”B’Óâ¶æ÷vÆVFvT&6U7VÖÖ'“ ¢v—F‚6VÆbåöÆö6³ ¢&WGW&â6VÆbç7VÖÖ'•öÆö6¶VB‡v÷&·76Uö–B ¢FVb7VÖÖ'•öÆö6¶VB‡6VÆbÂv÷&·76Uö–C¢÷F–öæÅ·7G%ÒÒDTdTÅEõtõ$µ54Uô”B’Óâ¶æ÷vÆVFvT&6U7VÖÖ'“ ¢6‡Væ·2Ò6VÆbåö6‡Væ·2–bv÷&·76Uö–B—2æöæRVÇ6R°¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·2–b6VÆbåö6‡Væµ÷v÷&·76Uö–B†6‡Væ²’ÓÒv÷&·76Uö–@¢Ð¢6÷W&6W2Ò6÷'FVB‡¶6‡Væ²ç6÷W&6Rf÷"6‡Væ²–â6‡Væ·2–b6‡Væ²ç6÷W&6WÒ¢Fö5÷G—W2Ò6÷'FVB‡·7G"†6‡Væ²æÖWFFFævWB‚&Fö5÷G—R"’’f÷"6‡Væ²–â6‡Væ·2–b6‡Væ²æÖWFFFævWB‚&Fö5÷G—R"—Ò¢&VçEö–G2Ò¶6‡Væ²ç&VçEö–Bf÷"6‡Væ²–â6‡Væ·2–b6‡Væ²ç&VçEö–GÐ¢&WGW&â¶æ÷vÆVFvT&6U7VÖÖ'’€¢6‡Væµö6÷VçCÖÆVâ†6‡Væ·2’À¢6÷W&6W3×6÷W&6W2À¢Fö5÷G—W3ÖFö5÷G—W2À¢&Wf–Wuö6‡Væµö6÷VçC×7VÒƒf÷"6‡Væ²–â6‡Væ·2–b6‡Væ²ææVVG5÷&Wf–Wr’À¢&VçEö6÷VçCÖÆVâ‡&VçEö–G2’À¢ ¢FVbö–çfÆ–FFU÷v÷&·76U÷—VÆ–æW5öÆö6¶VB‡6VÆb’ÓâæöæS ¢6VÆbå÷v÷&·76U÷—VÆ–æW2æ6ÆV"‚ ¢FVbö66†U÷&VÖ÷FUö6‡Væ·2‡6VÆbÂ6‡Væ·3¢—FW&&ÆU´Fö7VÖVçD6‡VæµÒ’ÓâæöæS ¢""%W'6—7BfÆ–FFVB&VÖ÷FR6öçFW‡G2f÷"ÆFW"Æö6ÂÖf—'7BVW&–W2â""  ¢–æ6öÖ–æuö'•ö–BÒ¶6‡Væ²æ–C¢6‡Væ²f÷"6‡Væ²–â6‡Væ·2–b6‡Væ²æ–GÐ¢–bæ÷B–æ6öÖ–æuö'•ö–C ¢&WGW&à¢v—F‚6VÆbåöÆö6³ ¢7W'&VçEö'•ö–BÒ¶6‡Væ²æ–C¢6‡Væ²f÷"6‡Væ²–â6VÆbåö6‡Væ·7Ð¢6†ævVBÒ°¢6‡Væ°¢f÷"6‡Væµö–BÂ6‡Væ²–â–æ6öÖ–æuö'•ö–Bæ—FV×2‚¢–b7W'&VçEö'•ö–BævWB†6‡Væµö–B’Ò6‡Væ°¢Ð¢–bæ÷B6†ævVC ¢&WGW&à¢7W'&VçEö'•ö–BçWFFR†–æ6öÖ–æuö'•ö–B¢6VÆbåö6‡Væ·2ÒÆ—7B†7W'&VçEö'•ö–BçfÇVW2‚’¢6VÆbå÷fW'6–öâ³Ò¢6VÆbåö–çfÆ–FFU÷v÷&·76U÷—VÆ–æW5öÆö6¶VB‚¢6VÆbå÷W'6—7E÷'VçF–ÖUö6‡Væ·5öÆö6¶VB‚¢w&—FUöFV'VuöÆör€¢6VÆbåö6öæf–rÀ¢&¶%÷&VÖ÷FUö6öçFW‡Eö66†R"À¢66†VEö6÷VçCÖÆVâ†6†ævVB’À¢F÷FÅö6÷VçCÖÆVâ‡6VÆbåö6‡Væ·2’À¢6‡Væ·3Ö6‡Væ·5öf÷%öFV'Vr†6†ævVBÂFW‡Eö6†'3×6VÆbåö6öæf–ræFV'VuöÆöu÷FW‡Eö6†'2’À¢ ¢FVböÆöE÷7F'GWö6‡Væ·2‡6VÆb’ÓâÆ—7E´Fö7VÖVçD6‡VæµÓ ¢F‡2Ò7F'GWö¶%÷F‡2‚¢6‡Væ·3¢Æ—7E´Fö7VÖVçD6‡VæµÒÒµÐ¢f÷"F‚–âF‡3 ¢–bæ÷BF‚æW†—7G2‚“ ¢6öçF–çVP¢6öçFVçBÒF‚ç&VE÷FW‡B†Væ6öF–æsÒ'WFbÓ‚×6–r"¢6‡Væ·2æW‡FVæB„Fö7VÖVçD6‡Væ²æg&öÕöÖ–ær‡–ÆöB’f÷"–ÆöB–â'6Uö§6öæÅö÷%ö'&’†6öçFVçBÂ6÷W&6UöæÖS×7G"‡F‚’’¢&WGW&â6‡Væ·0 ¢FVb÷'VçF–ÖU÷F‚‡6VÆb’Óâ÷F–öæÅµF…Ó ¢&u÷F‚Ò6VÆbåö6öæf–ræ¶%÷'VçF–ÖU÷F‚ç7G&—‚¢–bæ÷B&u÷Fƒ ¢&WGW&âæöæP¢&WGW&âF‚‡&u÷F‚’æW‡æGW6W"‚’ç&W6öÇfR‚ ¢FVböÆöE÷'VçF–ÖUö6‡Væ·2‡6VÆb’ÓâÆ—7E´Fö7VÖVçD6‡VæµÓ ¢F‚Ò6VÆbå÷'VçF–ÖU÷F‚‚¢–bF‚—2æöæR÷"æ÷BF‚æW†—7G2‚“ ¢&WGW&âµÐ¢G'“ ¢6öçFVçBÒF‚ç&VE÷FW‡B†Væ6öF–æsÒ'WFbÓ‚×6–r"¢&WGW&â°¢Fö7VÖVçD6‡Væ²æg&öÕöÖ–ær‡–ÆöB¢f÷"–ÆöB–â'6Uö§6öæÅö÷%ö'&’†6öçFVçBÂ6÷W&6UöæÖS×7G"‡F‚’¢Ð¢W†6WB„õ4W'&÷"ÂfÇVTW'&÷"Â…EEW†6WF–öâ’2W†3 ¢w&—FUöFV'VuöÆör‡6VÆbåö6öæf–rÂ&¶%÷'VçF–ÖUöÆöEöW'&÷""ÂFƒ×7G"‡F‚’ÂW'&÷#×7G"†W†2’¢&WGW&âµÐ ¢FVb÷W'6—7E÷'VçF–ÖUö6‡Væ·5öÆö6¶VB€¢6VÆbÀ¢6‡Væ·3¢÷F–öæÅ´Æ—7E´Fö7VÖVçD6‡VæµÕÒÒæöæRÀ¢¢À¢7G&–7C¢&ööÂÒfÇ6RÀ¢’ÞùÓÛh‘éì¶»§q«^tÝ]\×ØÛÙOMLËˆ]Z[H¹méy/g9c.¹d$zaãùí(¹o%yb(:fi9i,z-){ï#:+íù¨à9§éyd$zaãù¥l9£k¹n¤ú/ç¹£©yd#ºaãz+åH‹ˆ
+Hœ›ÛH^Â‚ˆ™]\›ˆØ—ÜÝ]K™[]WÝÛÜšÜÜXÙJÛÜšÜÜXÙWÚY
+B‚ˆ\œÝ]K™[]WÝÛÜšÜÜXÙWÙ]HH[]WÝÛÜšÜÜXÙWÙ]BˆÛÜœ×ÛÜšYÚ[œÈH\œÙWØÛÜœ×ÛÜšYÚ[œÊ
+Bˆ\˜YÛZY]Ø\™JˆÓÔ”ÓZY]Ø\™Kˆ[Ý×ÛÜšYÚ[œÏXÛÜœ×ÛÜšYÚ[œËˆ[Ý×ØÜ™Y[X[ÏHŠˆˆ›Ý[ˆÛÜœ×ÛÜšYÚ[œËˆ[Ý×ÛY]ÙÏVÈŠˆ—Kˆ[Ý×ÚXY\œÏVÈŠˆ—Kˆ
+Bˆ\š[˜ÛYWÜ›Ý]\Š]]Ü›Ý]\‹™Yš^H‹Ø\KØ]]ŠBˆ\š[˜ÛYWÜ›Ý]\ŠÛÛ™\œØ][Û—Ü›Ý]\ŠBˆ\š[˜ÛYWÜ›Ý]\ŠÛÜšÜÜXÙWÜ›Ý]\ŠBˆ\š[˜ÛYWÜ›Ý]\ŠÛÜšÜÜXÙWØYZ[—Ü›Ý]\ŠB‚ˆ\Þ[˜ÈYˆ]]Üš^™WÛYØXÞWÜ™\]Y\Ý
+™\]Y\Ýˆ™\]Y\Ý
+HOˆÜ[Û˜[Ô™\ÜÛœÙWN‚ˆ]H™\]Y\Ý\›œ]ˆYˆ™\]Y\Ý›Y]ÙOH“ÔSÓ”ÈŽ‚ˆÈ]ÓÔ”ÓZY]Ø\™H[œÝÙ\ˆœ›ÝÜÙ\ˆ™Y›YÚ™Y›Ü™H™\]Z\š[™ÈHÙ\ÜÚ[Û‹‚ˆ™]\›ˆ›Û™BˆYˆ›ÝÛYØXÞWÙ]WÙ[™Ú[
+]
+N‚ˆ™]\›ˆ›Û™Bˆ[™›Ü˜Ù[Y[Ù[˜X›YH]]Ù[™›Ü˜Ù[Y[Ù[˜X›Y
+
+BˆYˆ›Ý[™›Ü˜Ù[Y[Ù[˜X›Y[™]›Ý[ˆÈ‹Ø[œÝÙ\ˆ‹‹Ø[œÝÙ\‹ÜÝ™X[HŸN‚ˆ™]\›ˆ›Û™B‚ˆžN‚ˆÝÜ™HHØ]]ÜÝÜ™J™\]Y\Ý
+Bˆš[˜Ú\[H]ØZ][—Ú[—Ý™XYÛÛ
+ÝÜ™K˜Ý\œ™[Üš[˜Ú\[™\]Y\Ý˜ÛÛÚÚY\Ë™Ù]
+šÝZšYWÜÙ\ÜÚ[ÛˆŠJBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJÝ]\×ØÛÙOMLËÛÛ[^È™]Z[Žˆº-)¹cíù§#yb¨y¦ ¹.#ycëùå*ŸJBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJÝ]\×ØÛÙOY^ËœÝ]\×ØÛÙKÛÛ[^È™]Z[ŽˆÝŠ^Ë™]Z[
+_JBˆYˆš[˜Ú\[\È›Û™N‚ˆYˆ[™›Ü˜Ù[Y[Ù[˜X›Y‚ˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJÝ]\×ØÛÙOMKÛÛ[^È™]Z[Žˆº+íùab9ænùoeHŸJBˆ™]\›ˆ›Û™Bˆ™\]Y\ÝœÝ]K˜]]Üš[˜Ú\[Hš[˜Ú\[ˆ\×Ü]›Ü›WØYZ[ˆHš[˜Ú\[\Ù\‹™Ù]
+œ]›Ü›WÜ›ÛHŠHOHœ]›Ü›WØYZ[ˆ‚ˆÛÜšÜÜXÙWÜÝÜ™HHÛÜšÜÜXÙTÝÜ™JÝÜ™JB‚ˆYˆ[šYY
+Ý]\×ØÛÙNˆ[]Z[ˆÝŠHOˆ”ÓÓ”™\ÜÛœÙN‚ˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJÝ]\×ØÛÙO\Ý]\×ØÛÙKÛÛ[^È™]Z[Žˆ]Z[JB‚ˆÛØ˜[ØYZ[—Ü]ÈHÈ‹Ý™XÝÜ‹ÜÝ]\È‹‹Ý™XÝÜ‹ØÛÛXÝ[ÛˆŸBˆ\×ÛYØXÞWÝÛÜšÜÜXÙWÙ[]HH™\]Y\Ý›Y]ÙOH‘SUHˆ[™]œÝ\ÝÚ]
+‹ÝÛÜšÜÜXÙ\ËÈŠBˆYˆ][ˆÛØ˜[ØYZ[—Ü]ÈÜˆ\×ÛYØXÞWÝÛÜšÜÜXÙWÙ[]N‚ˆYˆ›Ý\×Ü]›Ü›WØYZ[Ž‚ˆ™]\›ˆ[šYY
+Ëºg :) ynlùcì9ë¨yä!¹df9§`úfdŠB‚ˆ\×ÝÜš]HH™\]Y\Ý›Y]Ù[ˆÈ”ÔÕ‹”U‹”UÒ‹‘SUHŸBˆYˆ\×ÝÜš]N‚ˆžN‚ˆÜ™\]Z\™WØœ›ÝÜÙ\—Ü™\]Y\Ý
+™\]Y\Ý™\]Z\™WÚœÛÛ\™\]Y\Ý›Y]ÙOH‘SUHŠBˆÜ™\]Z\™WØÜÜ™Š™\]Y\Ýš[˜Ú\[
+Bˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ™]\›ˆ[šYY
+^ËœÝ]\×ØÛÙKÝŠ^Ë™]Z[
+JB‚ˆ^[ØYˆXÝÜÝ‹[žWHHßBˆYˆ™\]Y\Ý›Y]Ù[ˆÈ”ÔÕ‹”U‹”UÒŸN‚ˆ˜]×Ø›ÙHH]ØZ]™\]Y\Ý˜›ÙJ
+BˆžN‚ˆ\œÙYHœÛÛ‹›ØYÊ˜]×Ø›ÙJHYˆ˜]×Ø›ÙH[ÙHßBˆ^Ù\
+œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Ü‹[šXÛÙQXÛÙQ\œ›ÜŠN‚ˆ™]\›ˆ[šYY
+º+íù¬`¹/dù.#y¦+ù§"y¥b9æ¡”ÓÓˆŠBˆYˆ›Ý\Ú[œÝ[˜ÙJ\œÙYXÝ
+N‚ˆ™]\›ˆ[šYY
+º+íù¬`¹/dù¨/9o#ù¥è9¥bŠBˆ^[ØYH\œÙY‚ˆ\Þ[˜ÈYˆ™\^WØ›ÙJ
+N‚ˆ™]\›ˆÈ\HŽˆšœ™\]Y\Ý‹˜›ÙHŽˆ˜]×Ø›ÙK›[Ü™WØ›ÙHŽˆ˜[Ù_B‚ˆ™\]Y\Ý—Ü™XÙZ]™HH™\^WØ›ÙB‚ˆYˆ][ˆÈ‹Ø[œÝÙ\ˆ‹‹Ø[œÝÙ\‹ÜÝ™X[HŸN‚ˆØÛÜHHÝŠ^[ØY™Ù]
+œØÛÜHŠHÜˆÛÜšÜÜXÙHŠBˆÛÜšÜÜXÙWÚYHÝŠ^[ØY™Ù]
+ÛÜšÜÜXÙWÚYŠHÜˆQUSÕÓÔ’ÔÔPÑWÒQ
+BˆžN‚ˆ™\ÛÛ™YH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙWÜÝÜ™Kœ™\ÛÛ™WÜ™XYX›WÜØÛÜKˆš[˜Ú\[\Ù\–ÈšY—KˆØÛÜKˆÛÜšÜÜXÙWÚYˆ
+Bˆ^Ù\ÛÜšÜÜXÙS›Ý›Ý[™\È^Î‚ˆ™]\›ˆ[šYY
+ÝŠ^ÊJBˆ^Ù\ÛÜšÜÜXÙQ›Ü˜šY[ˆ\È^Î‚ˆ™]\›ˆ[šYY
+ËÝŠ^ÊJBˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ™]\›ˆ[šYY
+Œ‹ÝŠ^ÊJBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆ[šYY
+LËº-)¹cíù¢%¹méy/g9c.¹§`úfd9§#yb¨y¦ ¹.#ycëùå*ŠBˆ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÜØÛÜHHÊŠœ™\ÛÛ™YœØÛÜHŽˆØÛÜ_Bˆ™\]Y\ÝœÝ]K˜]]Ü™\]Y\ÝYÝÛÜšÜÜXÙWÚYHÛÜšÜÜXÙWÚYˆ[Yˆ]OH‹Ý™XÝÜ‹Ú[™Ù\ÝŽ‚ˆÛÜšÜÜXÙWÚYHÝŠ^[ØY™Ù]
+ÛÜšÜÜXÙWÚYŠHÜˆˆŠKœÝš\
+
+Bˆ[ÙHHÝŠ^[ØY™Ù]
+›[ÙHŠHÜˆ˜\[™ŠKœÝš\
+
+K›ÝÙ\Š
+BˆYˆ[ÙHOHœ™\XÙHŽ‚ˆYˆÛÜšÜÜXÙWÚY‚ˆ™]\›ˆ[šYY
+Œ‹¹d$zaãùí(¹o%y¦ïù£h¹.áy¥+ù£ ynlùcì9î©ù¤ãy/gŠBˆYˆ›Ý\×Ü]›Ü›WØYZ[Ž‚ˆ™]\›ˆ[šYY
+Ë¹aj:aãúaãynî¹d$zaãùí(¹o%zg :) ynlùcì9ë¨yä!¹df9§`úfdŠBˆ[YˆÛÜšÜÜXÙWÚY‚ˆžN‚ˆXØÙ\ÜÈH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙWÜÝÜ™K™Ù]ÝÛÜšÜÜXÙKˆš[˜Ú\[\Ù\–ÈšY—KˆÛÜšÜÜXÙWÚYˆ
+Bˆ^Ù\ÛÜšÜÜXÙS›Ý›Ý[™\È^Î‚ˆ™]\›ˆ[šYY
+ÝŠ^ÊJBˆ^Ù\ÛÜšÜÜXÙQ›Ü˜šY[ˆ\È^Î‚ˆ™]\›ˆ[šYY
+ËÝŠ^ÊJBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆ[šYY
+LËº-)¹cíù¢%¹méy/g9c.¹§`úfd9§#yb¨y¦ ¹.#ycëùå*ŠBˆYˆ›ÝXØÙ\ÜË™Ù]
+˜Ø[—ÛX[˜YÙWØÛÛ[ŠN‚ˆ™]\›ˆ[šYY
+Ëºg :) y§+9méy/g9c.¹ë¨yä!¹§`úfdŠBˆ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚYHÛÜšÜÜXÙWÚYˆ[Yˆ›Ý\×Ü]›Ü›WØYZ[Ž‚ˆ™]\›ˆ[šYY
+Ë¹aj9n¤ùd$zaãùd#9«izg :) ynlùcì9ë¨yä!¹df9§`úfdŠBˆ[Yˆ][ˆÛØ˜[ØYZ[—Ü]ÈÜˆ\×ÛYØXÞWÝÛÜšÜÜXÙWÙ[]N‚ˆÈH]›Ü›HYZ[š\Ý˜]ÜˆX^H[ˆÛØ˜[XZ[[˜[˜ÙHÜ\˜][ÛœË‚ˆ\ÜÂˆ[Yˆ]OH‹ÚØ‹ÙØÝ[Y[ËÙ[]HˆÜˆ]œÝ\ÝÚ]
+‹ÚØ‹ÙØÝ[Y[ËÙ[]KÈŠN‚ˆYˆ™\]Y\Ý›Y]ÙOH‘ÑUŽ‚ˆ›Ø—ÚYH]œœÜ]
+‹È‹JVËLWBˆÚ]ØÝ[Y[Ù[]WÚ›Øœ×ÛØÚÎ‚ˆ›ØˆHØÝ[Y[Ù[]WÚ›ØœË™Ù]
+›Ø—ÚY
+Bˆ›Ø—ÜÛ˜\ÚÝHXÝ
+›ØŠHYˆ›Øˆ[ÙH›Û™BˆYˆ›Ø—ÜÛ˜\ÚÝ\È›Û™N‚ˆ™]\›ˆ[šYY
+¹b(:fi9.îùb¨y.#ykf9g*9¢%¹mìº/áù§'ÈŠBˆYˆ›Ø—ÜÛ˜\ÚÝ™Ù]
+˜Ü™X]YØžWÝ\Ù\—ÚYŠHOHš[˜Ú\[\Ù\–ÈšY—N‚ˆžN‚ˆXØÙ\ÜÈH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙWÜÝÜ™K™Ù]ÝÛÜšÜÜXÙKˆš[˜Ú\[\Ù\–ÈšY—KˆÝŠ›Ø—ÜÛ˜\ÚÝ™Ù]
+ÛÜšÜÜXÙWÚYŠHÜˆˆŠKˆ
+Bˆ^Ù\
+ÛÜšÜÜXÙS›Ý›Ý[™ÛÜšÜÜXÙQ›Ü˜šY[ŠN‚ˆ™]\›ˆ[šYY
+¹b(:fi9.îùb¨y.#ykf9g*9¢%¹mìº/áù§'ÈŠBˆYˆ›ÝXØÙ\ÜË™Ù]
+˜Ø[—ÛX[˜YÙWØÛÛ[ŠN‚ˆ™]\›ˆ[šYY
+¹b(:fi9.îùb¨y.#ykf9g*9¢%¹mìº/áù§'ÈŠBˆ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚYHÝŠ›Ø—ÜÛ˜\ÚÝ™Ù]
+ÛÜšÜÜXÙWÚYŠHÜˆˆŠBˆ[ÙN‚ˆÛÜšÜÜXÙWÚYHÝŠ^[ØY™Ù]
+ÛÜšÜÜXÙWÚYŠHÜˆQUSÕÓÔ’ÔÔPÑWÒQ
+BˆžN‚ˆXØÙ\ÜÈH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙWÜÝÜ™K™Ù]ÝÛÜšÜÜXÙKˆš[˜Ú\[\Ù\–ÈšY—KˆÛÜšÜÜXÙWÚYˆ
+Bˆ^Ù\ÛÜšÜÜXÙS›Ý›Ý[™\È^Î‚ˆ™]\›ˆ[šYY
+ÝŠ^ÊJBˆ^Ù\ÛÜšÜÜXÙQ›Ü˜šY[ˆ\È^Î‚ˆ™]\›ˆ[šYY
+ËÝŠ^ÊJBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆ[šYY
+LËº-)¹cíù¢%¹méy/g9c.¹§`úfd9§#yb¨y¦ ¹.#ycëùå*ŠBˆYˆ›ÝXØÙ\ÜË™Ù]
+˜Ø[—ÛX[˜YÙWØÛÛ[ŠN‚ˆ™]\›ˆ[šYY
+Ëºg :) y§+9méy/g9c.¹ë¨yä!¹§`úfdŠBˆ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚYHÛÜšÜÜXÙWÚYˆ[ÙN‚ˆÛÜšÜÜXÙWÚYHÝŠˆ^[ØY™Ù]
+ÛÜšÜÜXÙWÚYŠBˆÜˆ™\]Y\Ýœ]Y\žWÜ\˜[\Ë™Ù]
+ÛÜšÜÜXÙWÚYŠBˆÜˆQUSÕÓÔ’ÔÔPÑWÒQˆ
+BˆžN‚ˆXØÙ\ÜÈH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙWÜÝÜ™K™Ù]ÝÛÜšÜÜXÙKˆš[˜Ú\[\Ù\–ÈšY—KˆÛÜšÜÜXÙWÚYˆ
+Bˆ^Ù\ÛÜšÜÜXÙS›Ý›Ý[™\È^Î‚ˆ™]\›ˆ[šYY
+ÝŠ^ÊJBˆ^Ù\ÛÜšÜÜXÙQ›Ü˜šY[ˆ\È^Î‚ˆ™]\›ˆ[šYY
+ËÝŠ^ÊJBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆ[šYY
+LËº-)¹cíù¢%¹méy/g9c.¹§`úfd9§#yb¨y¦ ¹.#ycëùå*ŠBˆYˆ\×ÝÜš]H[™›ÝXØÙ\ÜË™Ù]
+˜Ø[—ÛX[˜YÙWØÛÛ[ŠN‚ˆ™]\›ˆ[šYY
+Ëºg :) y§+9méy/g9c.¹ë¨yä!¹§`úfdŠBˆYˆ›Ý\×ÝÜš]H[™›ÝXØÙ\ÜË™Ù]
+˜Ø[—Ü™XYŠN‚ˆ™]\›ˆ[šYY
+Ë¹¥è9§`ú+îùcåº+éyméy/g9c.ˆŠBˆ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚYHÛÜšÜÜXÙWÚYˆ™\]Y\ÝœÝ]K˜]]Ü\›Z\ÜÚ[Û—ØØXÚWÜØÛÜHH
+ˆˆ^Üš[˜Ú\[\Ù\‹™Ù]
+	Ü\›Z\ÜÚ[Ûœ×Ý™\œÚ[Û‰Ë
+_Nˆ‚ˆˆžÝÛÜšÜÜXÙWÚYO^ØXØÙ\ÜË™Ù]
+	Ý™\œÚ[Û‰Ê_NžØXØÙ\ÜË™Ù]
+	Ü›ÛIÊ_H‚ˆ
+B‚ˆ™]\›ˆ›Û™B‚ˆ\Þ[˜ÈYˆ[œÝÙ\—ÜØÛÜWØÚ[™ÙJ™\]Y\Ýˆ™\]Y\Ý
+HOˆÝˆ›Û™N‚ˆÜšYÚ[˜[ÜØÛÜHHÙ]]Š™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÜØÛÜH‹›Û™JBˆYˆÜšYÚ[˜[ÜØÛÜH\È›Û™N‚ˆ™]\›ˆ›Û™BˆžN‚ˆÝÜ™HHØ]]ÜÝÜ™J™\]Y\Ý
+BˆÝ\œ™[H]ØZ][—Ú[—Ý™XYÛÛ
+ÝÜ™K˜Ý\œ™[Üš[˜Ú\[™\]Y\Ý˜ÛÛÚÚY\Ë™Ù]
+šÝZšYWÜÙ\ÜÚ[ÛˆŠJBˆYˆÝ\œ™[\È›Û™HÜˆÝ\œ™[\Ù\‹™Ù]
+šYŠHOHÜšYÚ[˜[ÜØÛÜK™Ù]
+\Ù\—ÚYŠN‚ˆ™]\›ˆœÙ\ÜÚ[Û—Ü™]›ÚÙY‚ˆYˆÝ\œ™[\Ù\‹™Ù]
+œ\›Z\ÜÚ[Ûœ×Ý™\œÚ[ÛˆŠHOHÜšYÚ[˜[ÜØÛÜK™Ù]
+\Ù\—Ü\›Z\ÜÚ[Ûœ×Ý™\œÚ[ÛˆŠN‚ˆ™]\›ˆœ\›Z\ÜÚ[Û—ØÚ[™ÙY‚ˆ™\ÛÛ™YH]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÜšÜÜXÙTÝÜ™JÝÜ™JKœ™\ÛÛ™WÜ™XYX›WÜØÛÜKˆÝ\œ™[\Ù\–ÈšY—KˆÝŠÜšYÚ[˜[ÜØÛÜK™Ù]
+œØÛÜHŠHÜˆÛÜšÜÜXÙHŠKˆ™\]Y\ÝœÝ]K˜]]Ü™\]Y\ÝYÝÛÜšÜÜXÙWÚYˆ
+BˆYˆ™\ÛÛ™Y™Ù]
+˜ØXÚWÜØÛÜHŠHOHÜšYÚ[˜[ÜØÛÜK™Ù]
+˜ØXÚWÜØÛÜHŠN‚ˆ™]\›ˆœ\›Z\ÜÚ[Û—ØÚ[™ÙY‚ˆ™]\›ˆ›Û™Bˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›N‚ˆ™]\›ˆœ\›Z\ÜÚ[Û—ØÚ[™ÙY‚ˆ^Ù\
+ÛÜšÜÜXÙQ›Ü˜šY[‹ÛÜšÜÜXÙS›Ý›Ý[™˜[YQ\œ›ÜŠN‚ˆ™]\›ˆœ\›Z\ÜÚ[Û—ØÚ[™ÙY‚‚ˆ\›ZY]Ø\™JšŠBˆ\Þ[˜ÈYˆ™\Ù\™WÙ\œ›Ü—Ü™X\ÛÛ—Ù›Ü—Øœ›ÝÜÙ\Š™\]Y\Ýˆ™\]Y\ÝØ[Û™^
+N‚ˆˆˆ’ÙY\TH\œ›ÜœÈ™XYX›HžHœ›ÝÜÙ\œÈœ›ÛHÛÛ™šYÝ\™Yœ›Û[™ÜšYÚ[œËˆˆˆ‚‚ˆÜ\˜][Û—ÛØÚÈH›Û™BˆžN‚ˆ]]Ü™\ÜÛœÙHH]ØZ]]]Üš^™WÛYØXÞWÜ™\]Y\Ý
+™\]Y\Ý
+BˆYˆ]]Ü™\ÜÛœÙH\È›Û™N‚ˆÛÜšÜÜXÙWÚYHÙ]]Š™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚY‹›Û™JBˆYˆÛÜšÜÜXÙWÚY[™™\]Y\Ý›Y]Ù[ˆÈ”ÔÕ‹”U‹”UÒ‹‘SUHŸN‚ˆÜ\˜][Û—ÛØÚÈHÛÜšÜÜXÙWÛÜ\˜][Û—ÛØÚÊÝŠÛÜšÜÜXÙWÚY
+JBˆ]ØZ][—Ú[—Ý™XYÛÛ
+Ü\˜][Û—ÛØÚË˜XÜ]Z\™JBˆžN‚ˆ™\ÜÛœÙHH]ØZ]Ø[Û™^
+™\]Y\Ý
+Bˆš[˜[N‚ˆYˆÜ\˜][Û—ÛØÚÈ\È›Ý›Û™N‚ˆÜ\˜][Û—ÛØÚËœ™[X\ÙJ
+Bˆ[ÙN‚ˆ™\ÜÛœÙHH]]Ü™\ÜÛœÙBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆ™\ÜÛœÙHH”ÓÓ”™\ÜÛœÙJÝ]\×ØÛÙOY^ËœÝ]\×ØÛÙKÛÛ[^È™]Z[ŽˆÝŠ^Ë™]Z[
+_JBˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHš[˜[THØY™]H™]‚ˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ^ËL\J^ÊK—×Û˜[YW×ÊBˆÜš]WÙXY×ÛÙÊÛÛ™šYË[š[™YØ\WÙ\œ›Üˆ‹\œ›Ü—Ý\O]\J^ÊK—×Û˜[YW×Ë\œ›ÜY\œ›Ü–ÈXÚšXØ[Ù]Z[—JBˆ™\ÜÛœÙHH”ÓÓ”™\ÜÛœÙJˆÝ]\×ØÛÙOMLˆÛÛ[^È™]Z[Žˆˆ¹c§ùfè;ï&žÙ\œ›Ü–ÉÜ™X\ÛÛ‰×_H9i!9ä!¹nîº+«»ï&žÙ\œ›Ü–ÉÜÝYÙÙ\Ý[Û‰×_H‹™\œ›ÜˆŽˆ\œ›ÜŸKˆ
+B‚ˆÜšYÚ[ˆH™\]Y\ÝšXY\œË™Ù]
+›ÜšYÚ[ˆ‹ˆŠBˆYˆÜšYÚ[ˆ[™
+ÜšYÚ[ˆ[ˆÛÜœ×ÛÜšYÚ[œÈÜˆŠˆˆ[ˆÛÜœ×ÛÜšYÚ[œÊN‚ˆ™\ÜÛœÙKšXY\œËœÙ]Y˜][
+XØÙ\ÜËPÛÛ›ÛP[ÝËSÜšYÚ[ˆ‹ÜšYÚ[ŠBˆ˜\žHH™\ÜÛœÙKšXY\œË™Ù]
+•˜\žH‹ˆŠBˆYˆ›ÜšYÚ[ˆˆ›Ý[ˆÜ\œÝš\
+
+K›ÝÙ\Š
+H›Üˆ\[ˆ˜\žKœÜ]
+‹Š_N‚ˆ™\ÜÛœÙKšXY\œÖÈ•˜\žH—HHˆžÝ˜\ž_KÜšYÚ[ˆˆYˆ˜\žH[ÙH“ÜšYÚ[ˆ‚ˆ™]\›ˆ™\ÜÛœÙB‚ˆ\™^Ù\[Û—Ú[™\Š^Ù\[ÛŠBˆ\Þ[˜ÈYˆ^Z[—ÚÙ^Ù\[ÛŠÜ™\]Y\Ýˆ™\]Y\Ý^Îˆ^Ù\[ÛŠHOˆ”ÓÓ”™\ÜÛœÙN‚ˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ^Ë™]Z[^ËœÝ]\×ØÛÙK\J^ÊK—×Û˜[YW×ÊBˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJˆÝ]\×ØÛÙOY^ËœÝ]\×ØÛÙKˆÛÛ[^È™]Z[Žˆˆ¹c§ùfè;ï&žÙ\œ›Ü–ÉÜ™X\ÛÛ‰×_H9i!9ä!¹nîº+«»ï&žÙ\œ›Ü–ÉÜÝYÙÙ\Ý[Û‰×_H‹™\œ›ÜˆŽˆ\œ›ÜŸKˆXY\œÏY^ËšXY\œËˆ
+B‚ˆ\™^Ù\[Û—Ú[™\Š™\]Y\Ý˜[Y][Û‘\œ›ÜŠBˆ\Þ[˜ÈYˆ^Z[—Ý˜[Y][Û—Ù^Ù\[ÛŠÜ™\]Y\Ýˆ™\]Y\Ý^Îˆ™\]Y\Ý˜[Y][Û‘\œ›ÜŠHOˆ”ÓÓ”™\ÜÛœÙN‚ˆšY[ÈH×Bˆ›Üˆ][H[ˆ^Ë™\œ›ÜœÊ
+N‚ˆØØ][ÛˆH‹ˆ‹š›Ú[ŠÝŠ\
+H›Üˆ\[ˆ][K™Ù]
+›ØÈ‹×JHYˆ\OH˜›ÙHŠBˆY\ÜØYÙHHÝŠ][K™Ù]
+›\ÙÈŠHÜˆ¹cà¹¥l9¥è9¥bŠBˆšY[Ë˜\[™
+ˆžÛØØ][ÛˆÜˆ	ú+íù¬`¹/dÉßNˆÛY\ÜØYÙ_HŠBˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ»ï&È‹š›Ú[ŠšY[ÊKŒ‹\J^ÊK—×Û˜[YW×ÊBˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJˆÝ]\×ØÛÙOMŒ‹ˆÛÛ[^È™]Z[Žˆˆ¹c§ùfè;ï&žÙ\œ›Ü–ÉÜ™X\ÛÛ‰×_H9i!9ä!¹nîº+«»ï&žÙ\œ›Ü–ÉÜÝYÙÙ\Ý[Û‰×_H‹™\œ›ÜˆŽˆ\œ›ÜŸKˆ
+B‚ˆ\™^Ù\[Û—Ú[™\Š^Ù\[ÛŠBˆ\Þ[˜ÈYˆ^Z[—Ý[š[™YÙ^Ù\[ÛŠÜ™\]Y\Ýˆ™\]Y\Ý^Îˆ^Ù\[ÛŠHOˆ”ÓÓ”™\ÜÛœÙN‚ˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ^ËL\J^ÊK—×Û˜[YW×ÊBˆÜš]WÙXY×ÛÙÊÛÛ™šYË[š[™YØ\WÙ\œ›Üˆ‹\œ›Ü—Ý\O]\J^ÊK—×Û˜[YW×Ë\œ›ÜY\œ›Ü–ÈXÚšXØ[Ù]Z[—JBˆ™]\›ˆ”ÓÓ”™\ÜÛœÙJˆÝ]\×ØÛÙOMLˆÛÛ[^È™]Z[Žˆˆ¹c§ùfè;ï&žÙ\œ›Ü–ÉÜ™X\ÛÛ‰×_H9i!9ä!¹nîº+«»ï&žÙ\œ›Ü–ÉÜÝYÙÙ\Ý[Û‰×_H‹™\œ›ÜˆŽˆ\œ›ÜŸKˆ
+B‚ˆYˆ”“Ó•S‘ÑT‹™^\ÝÊ
+N‚ˆ\›[Ý[
+‹Ùœ›Û[™‹Ý]XÑš[\Ê\™XÝÜžO\ÝŠ”“Ó•S‘ÑTŠK[UYJK˜[YOH™œ›Û[™ŠB‚ˆYˆ™XÛÜ™Ø]Y]Ù]™[
+ˆXÝÜ—Ý\Ù\—ÚYˆÝˆ›Û™KˆXÝ[ÛŽˆÝ‹ˆ\™Ù]Ý\NˆÝ‹ˆ\™Ù]ÚYˆÝˆ›Û™Kˆ]Z[ÎˆXÝÜÝ‹[žWKˆ
+HOˆ›Û™N‚ˆYˆ›ÝXÝÜ—Ý\Ù\—ÚY‚ˆ™]\›‚ˆÝÜ™HHÙ]]Š\œÝ]K˜]]ÜÝÜ™H‹›Û™JBˆYˆÝÜ™H\È›Û™N‚ˆ™]\›‚ˆžN‚ˆÝÜ™Kœ™XÛÜ™Ø]Y]Ù]™[
+XÝÜ—Ý\Ù\—ÚYXÝ[Û‹\™Ù]Ý\K\™Ù]ÚY]Z[ÊBˆ^Ù\]]Ù\šXÙU[˜]˜Z[X›H\È^Î‚ˆÜš]WÙXY×ÛÙÊˆÛÛ™šYËˆ˜]]Ø]Y]ÝÜš]WÙ˜Z[Y‹ˆXÝ[ÛXXÝ[Û‹ˆ\™Ù]Ý\O]\™Ù]Ý\Kˆ\œ›Ü—Ý\O]\J^ÊK—×Û˜[YW×Ëˆ
+B‚ˆYˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\Ýˆ™\]Y\ÝXÝ[ÛŽˆÝ‹]Z[ÎˆXÝÜÝ‹[žWJHOˆ›Û™N‚ˆš[˜Ú\[HÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]Üš[˜Ú\[‹›Û™JBˆYˆš[˜Ú\[\È›Û™N‚ˆ™]\›‚ˆÛÜšÜÜXÙWÚYHÝŠÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÚY‹QUSÕÓÔ’ÔÔPÑWÒQ
+JBˆ™XÛÜ™Ø]Y]Ù]™[
+š[˜Ú\[\Ù\–ÈšY—KXÝ[Û‹ÛÜšÜÜXÙH‹ÛÜšÜÜXÙWÚY]Z[ÊB‚ˆYˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠ›Ø—ÚYˆÝ‹
+Š\]\Îˆ[žJHOˆ›Û™N‚ˆÚ]ØÝ[Y[Ù[]WÚ›Øœ×ÛØÚÎ‚ˆ›ØˆHØÝ[Y[Ù[]WÚ›ØœË™Ù]
+›Ø—ÚY
+BˆYˆ›Øˆ\È›Ý›Û™N‚ˆ›Ø‹\]J\]\ÊB‚ˆYˆ[—ÙØÝ[Y[Ù[]WÚ›ØŠ›Ø—ÚYˆÝ‹ÛÝ\˜ÙNˆÝ‹ÛÜšÜÜXÙWÚYˆÝ‹XÝÜ—Ý\Ù\—ÚYˆÝˆ›Û™JHOˆ›Û™N‚ˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠÝ]\ÏHœ[›š[™È‹›ÙÜ™\ÜÏMK\ÙOH¹«hùg*9¨à9§éz-a9¥¦yí(¹o%HŠBˆžN‚ˆÚ[š×ÚYÈHØ—ÜÝ]K™ØÝ[Y[ØÚ[š×ÚYÊÛÝ\˜ÙKÛÜšÜÜXÙWÚY
+BˆYˆ›ÝÚ[š×ÚYÎ‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[Yˆ¹çéz+á¹n¤ù.+y.#ykf9g*:-a9¥¦{ï&žÜÛÝ\˜Ù_HŠB‚ˆYˆÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\ˆOH›Y[[ÜžHŽ‚ˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠ›ÙÜ™\ÜÏMÎ\ÙOH¹«hùg*9¦í9¥¬9§+9g,9d$zaãùí(¹o%HŠBˆ[ÙN‚ˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠ›ÙÜ™\ÜÏLL‹\ÙOH¹«hùg*:/ç¹£©y§+9g,9d$zaãùn¤ÈŠBˆ™XÝÜ—ÜÝÜ™HHZ[\Õ™XÝÜ”ÝÜ™JÛÛ™šYÏXÛÛ™šYË[X™Y[™ÏR\Ú[X™Y[™ÐY\\ŠÛÛ™šYÊJB‚ˆYˆ™\ÜÝ™XÝÜ—Ü›ÙÜ™\ÜÊÛ™Nˆ[Ý[ˆ[
+HOˆ›Û™N‚ˆ˜][ÈHÛ™HÈX^
+Ý[JBˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠˆ›ÙÜ™\ÜÏLŒ
+È›Ý[™
+˜][È
+ˆŒŠKˆ\ÙOYˆ¹«hùg*9b(:fi9d$zaãùí(¹o%{ï"ÙÛ™_KÞÝÝ[{ï"H‹ˆ
+B‚ˆ™XÝÜ—ÜÝÜ™K™[]WØÚ[š×ÚYÊÚ[š×ÚYË›ÙÜ™\Ü×ØØ[˜XÚÏ\™\ÜÝ™XÝÜ—Ü›ÙÜ™\ÜÊB‚ˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠ›ÙÜ™\ÜÏN\ÙOH¹«hùg*9.ã¹çéz+á¹n¤ùéîúfi:-a9¥¦HŠBˆ™\Ý[HØ—ÜÝ]K™[]WÙØÝ[Y[
+ÛÝ\˜ÙKÚ[š×ÚYËÛÜšÜÜXÙWÚY
+Bˆ™XÛÜ™Ø]Y]Ù]™[
+ˆXÝÜ—Ý\Ù\—ÚYˆÛÜšÜÜXÙWÙØÝ[Y[Ù[]Y‹ˆÛÜšÜÜXÙH‹ˆÛÜšÜÜXÙWÚYˆÈœÛÝ\˜ÙHŽˆÛÝ\˜ÙKœ™[[Ý™YØÚ[š×ØÛÝ[Žˆ™\Ý[Èœ™[[Ý™YØÚ[š×ØÛÝ[—_Kˆ
+Bˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠˆÝ]\ÏH˜ÛÛ\]Y‹ˆ›ÙÜ™\ÜÏLLˆ\ÙOH¹b(:fi9k£9¢$‹ˆ™[[Ý™YØÚ[š×ØÛÝ[\™\Ý[Èœ™[[Ý™YØÚ[š×ØÛÝ[—KˆÝ[[X\žO\™\Ý[ÈœÝ[[X\žH—Kˆ\œ›ÜHˆ‹ˆ
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHÙY\›ØˆÝ]HÛX›HÚ[ˆ˜XÚÙ[™Ü\˜][ÛœÈ˜Z[‚ˆ]Z[H^Ë™]Z[Yˆ\Ú[œÝ[˜ÙJ^Ë^Ù\[ÛŠH[ÙH^ÂˆÝ]\×ØÛÙHH^ËœÝ]\×ØÛÙHYˆ\Ú[œÝ[˜ÙJ^Ë^Ù\[ÛŠH[ÙHLÂˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ]Z[Ý]\×ØÛÙK\J^ÊK—×Û˜[YW×ÊVÈœ™X\ÛÛˆ—Bˆ\]WÙØÝ[Y[Ù[]WÚ›ØŠÝ]\ÏH™˜Z[Y‹\ÙOH¹b(:fi9i,z-)H‹\œ›ÜY\œ›ÜŠB‚ˆ\™Ù]
+‹ÈŠBˆYˆ›ÛÝ
+
+HOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆÂˆœÙ\šXÙHŽˆ™YXØ][Û‹\˜YËX\H‹ˆšX[Žˆ‹ÚX[‹ˆ˜[œÝÙ\ˆŽˆ‹Ø[œÝÙ\ˆ‹ˆ˜[œÝÙ\—ÜÝ™X[HŽˆ‹Ø[œÝÙ\‹ÜÝ™X[H‹ˆ™ØÝ[Y[Ú[™Ù\ÝŽˆ‹ÚØ‹ÙØÝ[Y[‹ˆ™œ›Û[™Žˆ‹Ùœ›Û[™ÈˆYˆ”“Ó•S‘ÑT‹™^\ÝÊ
+H[ÙH›Û™KˆB‚ˆ\™Ù]
+‹ÚX[‹™\ÜÛœÙWÛ[Ù[RX[™\ÜÛœÙJBˆYˆX[
+
+HOˆX[™\ÜÛœÙN‚ˆ[™œ˜\ÝXÝ\™WÜÝ]\ÈHØ—ÜÝ]Kš[™œ˜\ÝXÝ\™KœÝ]\Ê
+Bˆ™]\›ˆX[™\ÜÛœÙJˆÝ]\ÏH›ÚÈ‹ˆÙ\šXÙOH™YXØ][Û‹\˜YËX\H‹ˆØ—ØÚ[š×ØÛÝ[ZØ—ÜÝ]K˜Ú[š×ØÛÝ[ˆ[Ù[Û[ÙOYˆžØÛÛ™šYË›WÜ›ÝšY\ŸNžØÛÛ™šYË›WÛ[Ù[H‹ˆ[X™Y[™×Ü›ÝšY\XÛÛ™šYË™[X™Y[™×Ü›ÝšY\‹ˆ[X™Y[™×Û[Ù[XÛÛ™šYË™[X™Y[™×Û[Ù[ˆ™\˜[š×Ü›ÝšY\XÛÛ™šYËœ™\˜[š×Ü›ÝšY\‹ˆ™\˜[š×Û[Ù[XÛÛ™šYËœ™\˜[š×Û[Ù[ˆØÜ—Ü›ÝšY\XÛÛ™šYË›ØÜ—Ü›ÝšY\‹ˆ™XÝÜ—ÜÝÜ™WÜ›ÝšY\XÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\‹ˆ™XÝÜ—ØÛÛXÝ[Û—Û˜[YOXÛÛ™šYËžš[^—ØÛÛXÝ[Û—Û˜[YKˆÝšXÝÜÛÝ\˜ÙWÜ™\]Z\™YXÛÛ™šYËœÝšXÝÜÛÝ\˜ÙWÜ™\]Z\™YˆY˜][ÚØ—Ü]\ÝŠQUSÒÐ—ÔU
+Kˆ]Y\žWØÛ\ÜÚYšY\YˆžØÛÛ™šYËœ]Y\žWØÛ\ÜÚYšY\—Ü›ÝšY\ŸNžØÛÛ™šYËœ]Y\žWØÛ\ÜÚYšY\—Û[Ù[H‹ˆ]Y\žWØYÙ[XÛÛ™šYËœ]Y\žWØYÙ[Ü›ÝšY\‹ˆ™Y\×ÜÝ]\Ï\ÝŠ[™œ˜\ÝXÝ\™WÜÝ]\ÖÈœ™Y\È—JKˆ^\Ü[ÜÝ]\Ï\ÝŠ[™œ˜\ÝXÝ\™WÜÝ]\ÖÈ›^\Ü[—JKˆ
+B‚ˆ\œÜÝ
+‹Ø[œÝÙ\ˆŠBˆ\Þ[˜ÈYˆ[œÝÙ\Š^[ØYˆ[œÝÙ\”™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆXÝÜÝ‹[žWN‚ˆØÛÜHHÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÜØÛÜH‹›Û™JBˆš[˜Ú\[HÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]Üš[˜Ú\[‹›Û™JBˆ[œÝÙ\—ÛÜ[ÛœÎˆXÝÜÝ‹[žWHHßBˆYˆØÛÜH\È›Ý›Û™N‚ˆ[œÝÙ\—ÛÜ[ÛœÈHÂˆÛÜšÜÜXÙWÚYÈŽˆØÛÜVÈÛÜšÜÜXÙWÚYÈ—Kˆœš[˜Ú\[Ý\Ù\—ÚYŽˆØÛÜVÈ\Ù\—ÚY—Kˆœ\›Z\ÜÚ[Û—ØØXÚWÜØÛÜHŽˆØÛÜVÈ˜ØXÚWÜØÛÜH—KˆœÝšXÝÝÛÜšÜÜXÙWÛY]Y]HŽˆYKˆBˆÙ\ÜÚ[Û—ÚYH^[ØYœÙ\ÜÚ[Û—ÚYˆÛÛ™\œØ][Û—ØÛÛ^H^[ØY˜ÛÛ™\œØ][Û—ØÛÛ^ˆÛÛ™\œØ][Û—ÜÝÜ™HH›Û™BˆÛÛ™\œØ][Û—ÚYH^[ØY˜ÛÛ™\œØ][Û—ÚYˆYˆØÛÜH\È›Ý›Û™H[™š[˜Ú\[\È›Ý›Û™N‚ˆYˆ›ÝÛÛ™\œØ][Û—ÚY‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[Hº+íùab9b&ùnî¹§#yb¨yfj9kîz+çHŠBˆÛÛ™\œØ][Û—ÜÝÜ™HHÛÛ™\œØ][Û”ÝÜ™JØ]]ÜÝÜ™JÜ™\]Y\Ý
+JBˆžN‚ˆÛÛ™\œØ][Û—ØÛÛ^H]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜™YÚ[—Ý\›‹ˆØÛÜVÈ\Ù\—ÚY—KˆÛÛ™\œØ][Û—ÚYˆ^[ØYœØÛÜKˆ^[ØYÛÜšÜÜXÙWÚYYˆ^[ØYœØÛÜHOHÛÜšÜÜXÙHˆ[ÙH›Û™KˆØÛÜVÈÛÜšÜÜXÙWÚYÈ—Kˆ^[ØYœ]Y\Ý[Û‹œÝš\
+
+Kˆ
+Bˆ^Ù\ÛÛ™\œØ][Û“›Ý›Ý[™\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[H¹kîz+çy.#ykf9g*ŠHœ›ÛH^Âˆ^Ù\ÛÛ™\œØ][Û“ØÚÙY\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[\ÝŠ^ÊJHœ›ÛH^Âˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMŒ‹]Z[\ÝŠ^ÊJHœ›ÛH^ÂˆYˆÛÛ™\œØ][Û—ØÛÛ^\È›Û™N‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[Hº-a9¥¦y§`úfd9mì¹cæ9¦í;ï#:+íù¥¬9nî¹kîz+çHŠBˆÙ\ÜÚ[Û—ÚYH]][XØ]YÜÙ\ÜÚ[Û—ÚY
+ØÛÜVÈ\Ù\—ÚY—KÛÛ™\œØ][Û—ÚY
+Bˆ™\ÜÛœÙHH]ØZ][—Ú[—Ý™XYÛÛ
+ˆØ—ÜÝ]K˜[œÝÙ\‹ˆ^[ØYœ]Y\Ý[Û‹œÝš\
+
+KˆÙ\ÜÚ[Û—ÚYˆ^[ØYœ™\˜[š×Ü[\Ë™XÝ
+
+KˆÛÛ™\œØ][Û—ØÛÛ^XÛÛ™\œØ][Û—ØÛÛ^ˆ[XÚ[˜][Û—Ý™\ÚÛ\^[ØYš[XÚ[˜][Û—Ý™\ÚÛˆÛÜšÜÜXÙWÚY\^[ØYÛÜšÜÜXÙWÚYˆ
+Š˜[œÝÙ\—ÛÜ[ÛœËˆ
+BˆÚ[™ÙHH]ØZ][œÝÙ\—ÜØÛÜWØÚ[™ÙJÜ™\]Y\Ý
+BˆYˆÚ[™ÙHOHœÙ\ÜÚ[Û—Ü™]›ÚÙYŽ‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMK]Z[H¹ænùoeyâ­¹  ymì¹i,y¥b;ï#:+íúaãy¥¬9ænùoeHŠBˆYˆÚ[™ÙHOHœ\›Z\ÜÚ[Û—ØÚ[™ÙYŽ‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[Hº-a9¥¦y§`úfd9mì¹cæ9¦í;ï#:+íúaãy¥¬9£ä:eëˆŠBˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Ý›Û™H[™ØÛÜH\È›Ý›Û™H[™ÛÛ™\œØ][Û—ÚY‚ˆÙ\šX[^™YH™\ÜÛœÙK×ÙXÝ
+
+BˆžN‚ˆ]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜\[™Ø\ÜÚ\Ý[ˆØÛÜVÈ\Ù\—ÚY—KˆÛÛ™\œØ][Û—ÚYˆÝŠÙ\šX[^™Y™Ù]
+˜[œÝÙ\ˆŠHÜˆˆŠKˆÙ\šX[^™Y™Ù]
+œÛÝ\˜Ù\ÈŠHÜˆ×Kˆ
+Bˆ^Ù\ÛÛ™\œØ][Û“›Ý›Ý[™\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[H¹kîz+çy.#ykf9g*ŠHœ›ÛH^Âˆ^Ù\ÛÛ™\œØ][Û“ØÚÙY\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[\ÝŠ^ÊJHœ›ÛH^ÂˆÚ[™ÙHH]ØZ][œÝÙ\—ÜØÛÜWØÚ[™ÙJÜ™\]Y\Ý
+BˆYˆÚ[™ÙHOHœÙ\ÜÚ[Û—Ü™]›ÚÙYŽ‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMK]Z[H¹ænùoeyâ­¹  ymì¹i,y¥b;ï#:+íúaãy¥¬9ænùoeHŠBˆYˆÚ[™ÙHOHœ\›Z\ÜÚ[Û—ØÚ[™ÙYŽ‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[Hº-a9¥¦y§`úfd9mì¹cæ9¦í;ï#:+íúaãy¥¬9£ä:eëˆŠBˆ™]\›ˆ™\ÜÛœÙK×ÙXÝ
+
+B‚ˆ\œÜÝ
+‹Ø[œÝÙ\‹ÜÝ™X[HŠBˆ\Þ[˜ÈYˆ[œÝÙ\—ÜÝ™X[J^[ØYˆ[œÝÙ\”™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÝ™X[Z[™Ô™\ÜÛœÙN‚ˆØÛÜHHÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]ÝÛÜšÜÜXÙWÜØÛÜH‹›Û™JBˆš[˜Ú\[HÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]Üš[˜Ú\[‹›Û™JBˆ[œÝÙ\—ÛÜ[ÛœÎˆXÝÜÝ‹[žWHHßBˆYˆØÛÜH\È›Ý›Û™N‚ˆ[œÝÙ\—ÛÜ[ÛœÈHÂˆÛÜšÜÜXÙWÚYÈŽˆØÛÜVÈÛÜšÜÜXÙWÚYÈ—Kˆœš[˜Ú\[Ý\Ù\—ÚYŽˆØÛÜVÈ\Ù\—ÚY—Kˆœ\›Z\ÜÚ[Û—ØØXÚWÜØÛÜHŽˆØÛÜVÈ˜ØXÚWÜØÛÜH—KˆœÝšXÝÝÛÜšÜÜXÙWÛY]Y]HŽˆYKˆBˆÙ\ÜÚ[Û—ÚYH^[ØYœÙ\ÜÚ[Û—ÚYˆÛÛ™\œØ][Û—ØÛÛ^H^[ØY˜ÛÛ™\œØ][Û—ØÛÛ^ˆÛÛ™\œØ][Û—ÜÝÜ™HH›Û™BˆÛÛ™\œØ][Û—ÚYH^[ØY˜ÛÛ™\œØ][Û—ÚYˆYˆØÛÜH\È›Ý›Û™H[™š[˜Ú\[\È›Ý›Û™N‚ˆYˆ›ÝÛÛ™\œØ][Û—ÚY‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[Hº+íùab9b&ùnî¹§#yb¨yfj9kîz+çHŠBˆÛÛ™\œØ][Û—ÜÝÜ™HHÛÛ™\œØ][Û”ÝÜ™JØ]]ÜÝÜ™JÜ™\]Y\Ý
+JBˆžN‚ˆÛÛ™\œØ][Û—ØÛÛ^H]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜™YÚ[—Ý\›‹ˆØÛÜVÈ\Ù\—ÚY—KˆÛÛ™\œØ][Û—ÚYˆ^[ØYœØÛÜKˆ^[ØYÛÜšÜÜXÙWÚYYˆ^[ØYœØÛÜHOHÛÜšÜÜXÙHˆ[ÙH›Û™KˆØÛÜVÈÛÜšÜÜXÙWÚYÈ—Kˆ^[ØYœ]Y\Ý[Û‹œÝš\
+
+Kˆ
+Bˆ^Ù\ÛÛ™\œØ][Û“›Ý›Ý[™\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[H¹kîz+çy.#ykf9g*ŠHœ›ÛH^Âˆ^Ù\ÛÛ™\œØ][Û“ØÚÙY\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[\ÝŠ^ÊJHœ›ÛH^Âˆ^Ù\˜[YQ\œ›Üˆ\È^Î‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMŒ‹]Z[\ÝŠ^ÊJHœ›ÛH^ÂˆYˆÛÛ™\œØ][Û—ØÛÛ^\È›Û™N‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMË]Z[Hº-a9¥¦y§`úfd9mì¹cæ9¦í;ï#:+íù¥¬9nî¹kîz+çHŠBˆÙ\ÜÚ[Û—ÚYH]][XØ]YÜÙ\ÜÚ[Û—ÚY
+ØÛÜVÈ\Ù\—ÚY—KÛÛ™\œØ][Û—ÚY
+B‚ˆ\Þ[˜ÈYˆ]™[Ê
+HOˆ\Þ[˜Ò]\˜]Ü–ÜÝ—N‚ˆZY[ÜÙWÙ]™[
+œÝ]\È‹ÈœÝYÙHŽˆš[[‹›Y\ÜØYÙHŽˆ¹«hùg*:+á¹b*úeëºh¦9ìnùg¢ø )ˆŸJBˆ]™[Ü]Y]YNˆ]Y]YVÝ\VÜÝ‹XÝÜÝ‹[žWWWHH]Y]YJ
+BˆÝ™X[YYH˜[ÙBˆÝÜÜÝ™X[HH]™[
+
+B‚ˆYˆ[œ]Y]YWÝÚÙ[ŠÚÙ[ŽˆÝŠHOˆ›Û™N‚ˆYˆÚÙ[ˆ[™›ÝÝÜÜÝ™X[Kš\×ÜÙ]
+
+N‚ˆ]™[Ü]Y]YKœ]
+
+ÚÙ[ˆ‹È^ŽˆÚÙ[ŸJJB‚ˆYˆ[œ]Y]YWÜÝ]\ÊY\ÜØYÙNˆÝŠHOˆ›Û™N‚ˆYˆY\ÜØYÙH[™›ÝÝÜÜÝ™X[Kš\×ÜÙ]
+
+N‚ˆ]™[Ü]Y]YKœ]
+
+œÝ]\È‹È›Y\ÜØYÙHŽˆY\ÜØYÙ_JJB‚ˆÛÜšÙ\ˆH\Þ[˜Ú[Ë˜Ü™X]WÝ\ÚÊˆ[—Ú[—Ý™XYÛÛ
+ˆØ—ÜÝ]K˜[œÝÙ\‹ˆ^[ØYœ]Y\Ý[Û‹œÝš\
+
+KˆÙ\ÜÚ[Û—ÚYˆ^[ØYœ™\˜[š×Ü[\Ë™XÝ
+
+KˆÛÛ™\œØ][Û—ØÛÛ^XÛÛ™\œØ][Û—ØÛÛ^ˆÛ—ÝÚÙ[Y[œ]Y]YWÝÚÙ[‹ˆ[XÚ[˜][Û—Ý™\ÚÛ\^[ØYš[XÚ[˜][Û—Ý™\ÚÛˆÛ—ÜÝ]\ÏY[œ]Y]YWÜÝ]\ËˆÛÜšÜÜXÙWÚY\^[ØYÛÜšÜÜXÙWÚYˆ
+Š˜[œÝÙ\—ÛÜ[ÛœËˆ
+Bˆ
+BˆÛÜH\Þ[˜Ú[Ë™Ù]Ü[›š[™×ÛÛÜ
+
+Bˆ\ÝÜ\›Z\ÜÚ[Û—ØÚXÚÈHÛÜ[YJ
+BˆžN‚ˆÚ[H›ÝÛÜšÙ\‹™Û™J
+HÜˆ›Ý]™[Ü]Y]YK™[\J
+N‚ˆYˆØÛÜH\È›Ý›Û™H[™ÛÜ[YJ
+HH\ÝÜ\›Z\ÜÚ[Û—ØÚXÚÈH‹Œ‚ˆ\ÝÜ\›Z\ÜÚ[Û—ØÚXÚÈHÛÜ[YJ
+BˆÚ[™ÙHH]ØZ][œÝÙ\—ÜØÛÜWØÚ[™ÙJÜ™\]Y\Ý
+BˆYˆÚ[™ÙN‚ˆÝÜÜÝ™X[KœÙ]
+
+BˆÚ[H›Ý]™[Ü]Y]YK™[\J
+N‚ˆžN‚ˆ]™[Ü]Y]YK™Ù]Û›ÝØZ]
+
+Bˆ^Ù\[\N‚ˆœ™XZÂˆÛÜšÙ\‹˜Ø[˜Ù[
+
+Bˆ]ØZ]\Þ[˜Ú[Ë™Ø]\ŠÛÜšÙ\‹™]\›—Ù^Ù\[ÛœÏUYJBˆZY[ÜÙWÙ]™[
+Ú[™ÙKÈ›Y\ÜØYÙHŽˆ¹ænùoeyâ­¹  y¢%º-a9¥¦y§`úfd9mì¹cæ9¦íŸJBˆ™]\›‚ˆžN‚ˆ]™[Û˜[YK]™[Ü^[ØYH]™[Ü]Y]YK™Ù]Û›ÝØZ]
+
+Bˆ^Ù\[\N‚ˆ]ØZ]\Þ[˜Ú[ËœÛY\
+ŒMJBˆÛÛ[YBˆYˆ]™[Û˜[YHOHÚÙ[ˆŽ‚ˆÝ™X[YYHYBˆZY[ÜÙWÙ]™[
+]™[Û˜[YK]™[Ü^[ØY
+Bˆ™\ÜÛœÙHH]ØZ]ÛÜšÙ\‚ˆÚ[™ÙHH]ØZ][œÝÙ\—ÜØÛÜWØÚ[™ÙJÜ™\]Y\Ý
+BˆYˆÚ[™ÙN‚ˆZY[ÜÙWÙ]™[
+Ú[™ÙKÈ›Y\ÜØYÙHŽˆ¹ænùoeyâ­¹  y¢%º-a9¥¦y§`úfd9mì¹cæ9¦íŸJBˆ™]\›‚ˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHÙY\˜Z[\™\Èš\ÚX›H[ˆ[ˆÔÑHÝ™X[K‚ˆ\œ›ÜˆH^Z[—Ø\WÙ\œ›ÜŠ^ËL\J^ÊK—×Û˜[YW×ÊBˆÜš]WÙXY×ÛÙÊˆÛÛ™šYËˆ˜[œÝÙ\—ÜÝ™X[WÙ\œ›Üˆ‹ˆ\œ›Ü—Ý\O]\J^ÊK—×Û˜[YW×Ëˆ\œ›ÜY\œ›Ü–ÈXÚšXØ[Ù]Z[—Kˆ
+BˆZY[ÜÙWÙ]™[
+™\œ›Üˆ‹Âˆ˜ÛÙHŽˆ\œ›Ü–È˜ÛÙH—Kˆœ™X\ÛÛˆŽˆ\œ›Ü–Èœ™X\ÛÛˆ—KˆœÝYÙÙ\Ý[ÛˆŽˆ\œ›Ü–ÈœÝYÙÙ\Ý[Ûˆ—KˆJBˆ™]\›‚ˆY]Y]HH™\ÜÛœÙK×ÙXÝ
+
+Bˆ[œÝÙ\—Ý^HÝŠY]Y]KœÜ
+˜[œÝÙ\ˆ‹ˆŠJBˆYˆÛÛ™\œØ][Û—ÜÝÜ™H\È›Ý›Û™H[™ØÛÜH\È›Ý›Û™H[™ÛÛ™\œØ][Û—ÚY‚ˆžN‚ˆ]ØZ][—Ú[—Ý™XYÛÛ
+ˆÛÛ™\œØ][Û—ÜÝÜ™K˜\[™Ø\ÜÚ\Ý[ˆØÛÜVÈ\Ù\—ÚY—KˆÛÛ™\œØ][Û—ÚYˆ[œÝÙ\—Ý^ˆY]Y]K™Ù]
+œÛÝ\˜Ù\ÈŠHÜˆ×Kˆ
+Bˆ^Ù\ÛÛ™\œØ][Û“ØÚÙY‚ˆZY[ÜÙWÙ]™[
+œ\›Z\ÜÚ[Û—ØÚ[™ÙY‹È›Y\ÜØYÙHŽˆº-a9¥¦y§`úfd9mì¹cæ9¦íŸJBˆ™]\›‚ˆÚ[™ÙHH]ØZ][œÝÙ\—ÜØÛÜWØÚ[™ÙJÜ™\]Y\Ý
+BˆYˆÚ[™ÙN‚ˆZY[ÜÙWÙ]™[
+Ú[™ÙKÈ›Y\ÜØYÙHŽˆ¹ænùoeyâ­¹  y¢%º-a9¥¦y§`úfd9mì¹cæ9¦íŸJBˆ™]\›‚ˆZY[ÜÙWÙ]™[
+›Y]Y]H‹Y]Y]JBˆYˆ›ÝÝ™X[YY‚ˆ›ÜˆÚÙ[—ØÚ[šÈ[ˆ^ÜÝ™X[WØÚ[šÜÊ[œÝÙ\—Ý^
+N‚ˆZY[ÜÙWÙ]™[
+ÚÙ[ˆ‹È^ŽˆÚÙ[—ØÚ[šßJBˆZY[ÜÙWÙ]™[
+™Û™H‹È˜[œÝÙ\ˆŽˆ[œÝÙ\—Ý^˜ØXÚWÚ]Žˆ™\ÜÛœÙK˜ØXÚWÚ]JB‚ˆ™]\›ˆÝ™X[Z[™Ô™\ÜÛœÙJˆ]™[Ê
+KˆYYXWÝ\OH^Ù]™[\Ý™X[H‹ˆXY\œÏ^ÈØXÚKPÛÛ›ÛŽˆ››ËXØXÚH‹–PXØÙ[PY™™\š[™ÈŽˆ››ÈŸKˆ
+B‚ˆ\™Ù]
+‹ÚØ‹ÜÝ[[X\žH‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙTÝ[[X\žJBˆYˆØ—ÜÝ[[X\žJÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQ
+HOˆÛ›ÝÛYÙP˜\ÙTÝ[[X\žN‚ˆ™]\›ˆØ—ÜÝ]KœÝ[[X\žJÛÜšÜÜXÙWÚY
+B‚ˆ\™[]J‹ÝÛÜšÜÜXÙ\ËÞÝÛÜšÜÜXÙWÚYHŠBˆYˆ[]WÝÛÜšÜÜXÙJÛÜšÜÜXÙWÚYˆÝŠHOˆXÝÜÝ‹[žWN‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOML]Z[Hº+íù/oùå*9méy/g9c.¹ë¨yä!ºhmzgh¹¬.9.ayb(:fi9£¢9§`ùméy/g9c.ˆŠB‚ˆ\™Ù]
+‹ÚØ‹ÙØÝ[Y[ÈŠBˆYˆ\ÝÝ\ØYYÙØÝ[Y[ÊÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQ
+HOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆØ—ÜÝ]K›\ÝÛÜšYÚ[˜[ÙØÝ[Y[ÊÛÜšÜÜXÙWÚY
+B‚ˆ\™Ù]
+‹ÚØ‹ÙØÝ[Y[ËØÛÛ[ŠBˆYˆÙ]ÙØÝ[Y[ØÛÛ[
+ˆÛÝ\˜ÙNˆÝ‹ˆÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQˆX^ØÚ\œÎˆ[HMLÌˆ
+HOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆØ—ÜÝ]K™ØÝ[Y[ØÛÛ[
+ÛÝ\˜ÙKÛÜšÜÜXÙWÚYX^ØÚ\œÊB‚ˆ\™Ù]
+‹ÚØ‹ÙØÝ[Y[ËÜ™]šY]ÈŠBˆYˆ™]šY]×ÙØÝ[Y[
+ÛÝ\˜ÙNˆÝ‹ÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQ
+HOˆš[T™\ÜÛœÙN‚ˆÜšYÚ[˜[Ü]HÝÜ™YÙØÝ[Y[Ü]
+ÛÜšÜÜXÙWÚYÛÝ\˜ÙJBˆYˆ›ÝÜšYÚ[˜[Ü]š\×Ùš[J
+N‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[H¹c§ùiâù¥¡ù¨hù.#ykf9g*;ï#:+íúaãy¥¬9."¹/(9d#ºh¡:)âŠB‚ˆš[[˜[YHHÝÜ™YÙØÝ[Y[Ùš[[˜[YJÛÜšÜÜXÙWÚYÛÝ\˜ÙJBˆ™]\›ˆš[T™\ÜÛœÙJˆÜšYÚ[˜[Ü]ˆYYXWÝ\O[Z[Y]\\Ë™ÝY\Ü×Ý\Jš[[˜[YJVÌHÜˆ˜\XØ][Û‹ÛØÝ]\Ý™X[H‹ˆXY\œÏ^ÂˆÛÛ[Q\ÜÜÚ][ÛˆŽˆˆš[›[™NÈš[[˜[YJUU‹N	ÉÞÜ][ÝJš[[˜[YJ_H‹ˆ–SÜšYÚ[˜[QØÝ[Y[ŽˆYH‹ˆKˆ
+B‚ˆ\™Ù]
+‹ÚØ‹ÙØÝ[Y[ËÙÝÛ›ØYŠBˆYˆÝÛ›ØYÙØÝ[Y[
+ÛÝ\˜ÙNˆÝ‹ÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQ
+HOˆ™\ÜÛœÙN‚ˆØÝ[Y[HØ—ÜÝ]K™ØÝ[Y[ØÛÛ[
+ÛÝ\˜ÙKÛÜšÜÜXÙWÚYX^ØÚ\œÏL
+BˆÜšYÚ[˜[Ü]HÝÜ™YÙØÝ[Y[Ü]
+ÛÜšÜÜXÙWÚYÛÝ\˜ÙJBˆš[[˜[YHHÝÜ™YÙØÝ[Y[Ùš[[˜[YJÛÜšÜÜXÙWÚYÛÝ\˜ÙJBˆYˆÜšYÚ[˜[Ü]š\×Ùš[J
+N‚ˆ™]\›ˆš[T™\ÜÛœÙJˆÜšYÚ[˜[Ü]ˆYYXWÝ\O[Z[Y]\\Ë™ÝY\Ü×Ý\Jš[[˜[YJVÌHÜˆ˜\XØ][Û‹ÛØÝ]\Ý™X[H‹ˆš[[˜[YOYš[[˜[YKˆXY\œÏ^È–SÜšYÚ[˜[QØÝ[Y[ŽˆYHŸKˆ
+Bˆ^ÜÛ˜[YHHš[[˜[YHYˆš[[˜[YK›ÝÙ\Š
+K™[™ÝÚ]
+‹ŠH[ÙHˆžÙš[[˜[Y_K‚ˆ™]\›ˆ™\ÜÛœÙJˆÛÛ[YØÝ[Y[È˜ÛÛ[—K™[˜ÛÙJ]‹NŠKˆYYXWÝ\OH^ÜZ[ŽÈÚ\œÙ]]]‹N‹ˆXY\œÏ^ÂˆÛÛ[Q\ÜÜÚ][ÛˆŽˆˆ˜]XÚY[Èš[[˜[YJUU‹N	ÉÞÜ][ÝJ^ÜÛ˜[YJ_H‹ˆ–SÜšYÚ[˜[QØÝ[Y[Žˆ™˜[ÙH‹ˆKˆ
+B‚ˆ\œÜÝ
+‹ÚØ‹ÙØÝ[Y[ËÙ[]HŠBˆYˆ™YÚ[—ÙØÝ[Y[Ù[]Jˆ™\]Y\ÝˆØÝ[Y[[]T™\]Y\Ýˆ˜XÚÙÜ›Ý[™Ý\ÚÜÎˆ˜XÚÙÜ›Ý[™\ÚÜËˆÜ™\]Y\Ýˆ™\]Y\Ýˆ
+HOˆXÝÜÝ‹[žWN‚ˆÛÝ\˜ÙHH™\]Y\ÝœÛÝ\˜ÙKœÝš\
+
+BˆYˆ›ÝÛÝ\˜ÙN‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[Hº-a9¥¦yd#yéì9.#z ïy..¹ênˆŠBˆYˆ›ÝØ—ÜÝ]K™ØÝ[Y[ØÚ[š×ÚYÊÛÝ\˜ÙK™\]Y\ÝÛÜšÜÜXÙWÚY
+N‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[Yˆ¹çéz+á¹n¤ù.+y.#ykf9g*:-a9¥¦{ï&žÜÛÝ\˜Ù_HŠBˆ›Ø—ÚYH]ZY
+
+Kš^ˆš[˜Ú\[HÙ]]ŠÜ™\]Y\ÝœÝ]K˜]]Üš[˜Ú\[‹›Û™JBˆ›ØˆHÂˆš›Ø—ÚYŽˆ›Ø—ÚYˆœÛÝ\˜ÙHŽˆÛÝ\˜ÙKˆÛÜšÜÜXÙWÚYŽˆ™\]Y\ÝÛÜšÜÜXÙWÚYˆ˜Ü™X]YØžWÝ\Ù\—ÚYŽˆš[˜Ú\[\Ù\–ÈšY—HYˆš[˜Ú\[[ÙH›Û™KˆœÝ]\ÈŽˆœ]Y]YY‹ˆœ›ÙÜ™\ÜÈŽˆˆœ\ÙHŽˆ¹ëbyo¡yb(:fi‹ˆœ™[[Ý™YØÚ[š×ØÛÝ[Žˆˆ™\œ›ÜˆŽˆˆ‹ˆBˆÚ]ØÝ[Y[Ù[]WÚ›Øœ×ÛØÚÎ‚ˆYˆ[ŠØÝ[Y[Ù[]WÚ›ØœÊHHL‚ˆ›ÜˆÛÚ›Ø—ÚYÛÚ›Øˆ[ˆ\Ý
+ØÝ[Y[Ù[]WÚ›ØœËš][\Ê
+JN‚ˆYˆÛÚ›Ø‹™Ù]
+œÝ]\ÈŠH[ˆÈ˜ÛÛ\]Y‹™˜Z[YŸN‚ˆØÝ[Y[Ù[]WÚ›ØœËœÜ
+ÛÚ›Ø—ÚY›Û™JBˆYˆ[ŠØÝ[Y[Ù[]WÚ›ØœÊHL‚ˆœ™XZÂˆØÝ[Y[Ù[]WÚ›ØœÖÚ›Ø—ÚYHH›Ø‚ˆ˜XÚÙÜ›Ý[™Ý\ÚÜË˜YÝ\ÚÊ[—ÙØÝ[Y[Ù[]WÚ›Ø‹›Ø—ÚYÛÝ\˜ÙK™\]Y\ÝÛÜšÜÜXÙWÚY›Ø–È˜Ü™X]YØžWÝ\Ù\—ÚY—JBˆ™]\›ˆXÝ
+›ØŠB‚ˆ\™Ù]
+‹ÚØ‹ÙØÝ[Y[ËÙ[]KÞÚ›Ø—ÚYHŠBˆYˆÙ]ÙØÝ[Y[Ù[]WÜ›ÙÜ™\ÜÊ›Ø—ÚYˆÝŠHOˆXÝÜÝ‹[žWN‚ˆÚ]ØÝ[Y[Ù[]WÚ›Øœ×ÛØÚÎ‚ˆ›ØˆHØÝ[Y[Ù[]WÚ›ØœË™Ù]
+›Ø—ÚY
+BˆYˆ›Øˆ\È›Û™N‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOM]Z[H¹b(:fi9.îùb¨y.#ykf9g*9¢%¹mìº/áù§'ÈŠBˆ™]\›ˆXÝ
+›ØŠB‚ˆ\™Ù]
+‹ÚØ‹ØÚ[šÜÈŠBˆYˆ\ÝÚØ—ØÚ[šÜÊ[Z]ˆ[HLÙ™œÙ]ˆ[HÛÜšÜÜXÙWÚYˆÝˆHQUSÕÓÔ’ÔÔPÑWÒQ
+HOˆXÝÜÝ‹[žWN‚ˆ™]\›ˆØ—ÜÝ]K›\ÝØÚ[šÜÊ[Z][[Z]Ù™œÙ][Ù™œÙ]ÛÜšÜÜXÙWÚY]ÛÜšÜÜXÙWÚY
+B‚ˆ\œÜÝ
+‹ÚØ‹ØÚ[šÜÈ‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙJBˆYˆ\]WÚØ—ØÚ[šÜÊ™\]Y\ÝˆÛ›ÝÛYÙP˜\ÙT™\XÙT™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙN‚ˆ™\Ý[HØ—ÜÝ]K\]WØÚ[šÜÊ™\]Y\Ý˜Ú[šÜË[ÙO\™\]Y\Ý›[ÙKÛÜšÜÜXÙWÚY\™\]Y\ÝÛÜšÜÜXÙWÚY
+Bˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\ÝÛÜšÜÜXÙWÙØÝ[Y[×Ý\]Y‹È›[ÙHŽˆ™\Ý[›[ÙK˜Ú[š×ØÛÝ[Žˆ™\Ý[˜Ú[š×ØÛÝ[JBˆ™]\›ˆ™\Ý[‚ˆ\œÜÝ
+‹ÚØ‹ÚœÛÛ›‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙJBˆYˆ[™Ù\ÝÚØ—ÚœÛÛ›
+™\]Y\ÝˆœÛÛ›[™Ù\Ý™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙN‚ˆ™\Ý[HØ—ÜÝ]Kš[™Ù\ÝÚœÛÛ›
+ˆ™\]Y\Ý˜ÛÛ[ˆ[ÙO\™\]Y\Ý›[ÙKˆÛÝ\˜ÙWÛ˜[YO\™\]Y\ÝœÛÝ\˜ÙWÛ˜[YKˆÛÜšÜÜXÙWÚY\™\]Y\ÝÛÜšÜÜXÙWÚYˆ
+Bˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\ÝÛÜšÜÜXÙWÙØÝ[Y[Ú[™Ù\ÝY‹ÈœÛÝ\˜ÙHŽˆØY™WÙØÝ[Y[Ùš[[˜[YJ™\]Y\ÝœÛÝ\˜ÙWÛ˜[YHÜˆ’”ÓÓ“:-a9¥¦HŠK›[ÙHŽˆ™\Ý[›[ÙK˜Ú[š×ØÛÝ[Žˆ™\Ý[˜Ú[š×ØÛÝ[JBˆ™]\›ˆ™\Ý[‚ˆ\œÜÝ
+‹ÚØ‹Üˆ‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙJBˆYˆ[™Ù\ÝÚØ—ÜŠ™\]Y\Ýˆ’[™Ù\Ý™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙN‚ˆ™\Ý[HØ—ÜÝ]Kš[™Ù\ÝÜŠˆ™\]Y\Ý™š[[˜[YKˆ™\]Y\Ý˜ÛÛ[Ø˜\ÙMˆ[ÙO\™\]Y\Ý›[ÙKˆX^ÜYÙ\Ï\™\]Y\Ý›X^ÜYÙ\Ëˆ™[™\—ÙO\™\]Y\Ýœ™[™\—ÙKˆÛÜšÜÜXÙWÚY\™\]Y\ÝÛÜšÜÜXÙWÚYˆ
+Bˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\ÝÛÜšÜÜXÙWÙØÝ[Y[Ú[™Ù\ÝY‹ÈœÛÝ\˜ÙHŽˆØY™WÙØÝ[Y[Ùš[[˜[YJ™\]Y\Ý™š[[˜[YJK›[ÙHŽˆ™\Ý[›[ÙK˜Ú[š×ØÛÝ[Žˆ™\Ý[˜Ú[š×ØÛÝ[JBˆ™]\›ˆ™\Ý[‚ˆ\œÜÝ
+‹ÚØ‹Ú[XYÙK[ØÜˆ‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙJBˆYˆ[™Ù\ÝÚØ—Ú[XYÙWÛØÜŠ™\]Y\Ýˆ[XYÙSØÜ’[™Ù\Ý™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙN‚ˆ™\Ý[HØ—ÜÝ]Kš[™Ù\ÝÚ[XYÙWÛØÜŠˆ™\]Y\Ý™š[[˜[YKˆ™\]Y\Ý˜ÛÛ[Ø˜\ÙMˆØÜ—Ý^\™\]Y\Ý›ØÜ—Ý^ˆ[ÙO\™\]Y\Ý›[ÙKˆÛÜšÜÜXÙWÚY\™\]Y\ÝÛÜšÜÜXÙWÚYˆ
+Bˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\ÝÛÜšÜÜXÙWÙØÝ[Y[Ú[™Ù\ÝY‹ÈœÛÝ\˜ÙHŽˆØY™WÙØÝ[Y[Ùš[[˜[YJ™\]Y\Ý™š[[˜[YJK›[ÙHŽˆ™\Ý[›[ÙK˜Ú[š×ØÛÝ[Žˆ™\Ý[˜Ú[š×ØÛÝ[JBˆ™]\›ˆ™\Ý[‚ˆ\œÜÝ
+‹ÚØ‹ÙØÝ[Y[‹™\ÜÛœÙWÛ[Ù[RÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙJBˆYˆ[™Ù\ÝÚØ—ÙØÝ[Y[
+™\]Y\ÝˆØÝ[Y[[™Ù\Ý™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆÛ›ÝÛYÙP˜\ÙU\]T™\ÜÛœÙN‚ˆ™\Ý[HØ—ÜÝ]Kš[™Ù\ÝÙØÝ[Y[
+ˆ™\]Y\Ý™š[[˜[YKˆ™\]Y\Ý˜ÛÛ[Ø˜\ÙMˆ[ÙO\™\]Y\Ý›[ÙKˆX^ÜYÙ\Ï\™\]Y\Ý›X^ÜYÙ\Ëˆ™[™\—ÙO\™\]Y\Ýœ™[™\—ÙKˆÛÜšÜÜXÙWÚY\™\]Y\ÝÛÜšÜÜXÙWÚYˆ
+Bˆ™XÛÜ™Ü™\]Y\ÝÝÛÜšÜÜXÙWØ]Y]
+Ü™\]Y\ÝÛÜšÜÜXÙWÙØÝ[Y[Ú[™Ù\ÝY‹ÈœÛÝ\˜ÙHŽˆØY™WÙØÝ[Y[Ùš[[˜[YJ™\]Y\Ý™š[[˜[YJK›[ÙHŽˆ™\Ý[›[ÙK˜Ú[š×ØÛÝ[Žˆ™\Ý[˜Ú[š×ØÛÝ[JBˆ™]\›ˆ™\Ý[‚ˆ\™Ù]
+‹Ý™XÝÜ‹ÜÝ]\ÈŠBˆYˆ™XÝÜ—ÜÝ]\Ê
+HOˆXÝÜÝ‹[žWN‚ˆYˆÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\ˆOH›Y[[ÜžHŽ‚ˆ™]\›ˆÂˆœ›ÝšY\ˆŽˆ›Y[[ÜžH‹ˆ˜ÛÛ›™XÝYŽˆYKˆ™[™Ú[ØÛÛ™šYÝ\™YŽˆ˜[ÙKˆÚÙ[—ØÛÛ™šYÝ\™YŽˆ˜[ÙKˆ˜ÛÛXÝ[Û—Û˜[YHŽˆš[—ÛY[[ÜžWÚXœšYÚ[™^‹ˆ˜ÛÛXÝ[Û—Ù^\ÝÈŽˆYKˆœ›Ý×ØÛÝ[ŽˆØ—ÜÝ]K˜Ú[š×ØÛÝ[ˆ›Y\ÜØYÙHŽˆš[‹[Y[[ÜžH“LH
+È[œÙKÜÜ\œÙH[™^™XYH‹ˆBˆ™]\›ˆZ[\Õ™XÝÜ”ÝÜ™JÛÛ™šYÏXÛÛ™šYÊKœÝ]\Ê
+K×ÙXÝ
+
+B‚ˆ\œÜÝ
+‹Ý™XÝÜ‹ØÛÛXÝ[ÛˆŠBˆYˆÜ™X]WÝ™XÝÜ—ØÛÛXÝ[ÛŠ™\]Y\Ýˆ™XÝÜÛÛXÝ[Û”™\]Y\Ý
+HOˆXÝÜÝ‹[žWN‚ˆYˆÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\ˆOH›Y[[ÜžHŽ‚ˆ™]\›ˆÂˆœ›ÝšY\ˆŽˆ›Y[[ÜžH‹ˆ˜ÛÛ›™XÝYŽˆYKˆ˜ÛÛXÝ[Û—Û˜[YHŽˆš[—ÛY[[ÜžWÚXœšYÚ[™^‹ˆ˜ÛÛXÝ[Û—Ù^\ÝÈŽˆYKˆœ›Ý×ØÛÝ[ŽˆØ—ÜÝ]K˜Ú[š×ØÛÝ[ˆ›Y\ÜØYÙHŽˆ›Y[[ÜžH[ÙH\È›È™[[ÝHÛÛXÝ[ÛˆÈ™XÜ™X]H‹ˆBˆžN‚ˆ™]\›ˆZ[\Õ™XÝÜ”ÝÜ™JÛÛ™šYÏXÛÛ™šYÊK™[œÝ\™WØÛÛXÝ[ÛŠ›ÜÙ^\Ý[™Ï\™\]Y\Ý™›ÜÙ^\Ý[™ÊK×ÙXÝ
+
+Bˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHÝ\™˜XÙHØ[š]^™YÜ\˜][Û˜[\œ›ÜˆÈTHÛY[‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMLË]Z[\ÝŠ^ÊJHœ›ÛH^Â‚ˆ\œÜÝ
+‹Ý™XÝÜ‹Ú[™Ù\ÝŠBˆYˆ[™Ù\ÝÝ™XÝÜ—ØÛÛXÝ[ÛŠ™\]Y\Ýˆ™XÝÜ’[™Ù\Ý™\]Y\ÝH™XÝÜ’[™Ù\Ý™\]Y\Ý
+
+JHOˆXÝÜÝ‹[žWN‚ˆ›Ü›X[^™YÛ[ÙHH˜[Y]WÛ[ÙJ™\]Y\Ý›[ÙJBˆYˆ›Ü›X[^™YÛ[ÙHOHœ™\XÙHˆ[™™\]Y\ÝÛÜšÜÜXÙWÚY‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMŒ‹]Z[H¹d$zaãùí(¹o%y¦ïù£h¹.áy¥+ù£ ynlùcì9î©ù¤ãy/gŠBˆÚ[šÜÈHØ—ÜÝ]K˜Ú[šÜ×ÜÛ˜\ÚÝ
+™\]Y\ÝÛÜšÜÜXÙWÚY
+HYˆ™\]Y\ÝÛÜšÜÜXÙWÚY[ÙHØ—ÜÝ]K˜Ú[šÜ×ÜÛ˜\ÚÝ
+
+BˆYˆÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\ˆOH›Y[[ÜžHŽ‚ˆ™]\›ˆÂˆœÝ]\ÈŽˆ›ÚÈ‹ˆš[œÙ\YŽˆ[ŠÚ[šÜÊKˆ˜ÛÛXÝ[Û—Û˜[YHŽˆš[—ÛY[[ÜžWÚXœšYÚ[™^‹ˆ›[ÙHŽˆ›Ü›X[^™YÛ[ÙKˆœ›ÝšY\ˆŽˆ›Y[[ÜžH‹ˆBˆžN‚ˆÝÜ™HHZ[\Õ™XÝÜ”ÝÜ™JÛÛ™šYÏXÛÛ™šYÊBˆYˆ›Ü›X[^™YÛ[ÙHOHœ™\XÙHŽ‚ˆÙ×ØÚ[šÜ×Ù›Ü—Ú[™Ù\Ý
+ÛÛ™šYË™XÝÜ—Ü™\XÙWÜ^[ØY‹Ú[šÜË[ÙO[›Ü›X[^™YÛ[ÙJBˆ™\Ý[HÝÜ™Kœ™\XÙWØÚ[šÜÊÚ[šÜÊBˆ™\Ý[Ù]™[H™XÝÜ—Ü™\XÙWÜ™\Ý[‚ˆ[ÙN‚ˆÙ×ØÚ[šÜ×Ù›Ü—Ú[™Ù\Ý
+ÛÛ™šYË™XÝÜ—Ø\[™Ü^[ØY‹Ú[šÜË[ÙO[›Ü›X[^™YÛ[ÙJBˆ™\Ý[HÝÜ™K\Ù\ØÚ[šÜÊÚ[šÜÊBˆ™\Ý[È›[ÙH—HH›Ü›X[^™YÛ[ÙBˆ™\Ý[Ù]™[H™XÝÜ—Ø\[™Ü™\Ý[‚ˆÜš]WÙXY×ÛÙÊÛÛ™šYË™\Ý[Ù]™[
+Šœ™\Ý[
+Bˆ™]\›ˆ™\Ý[ˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHÝ\™˜XÙHØ[š]^™YÜ\˜][Û˜[\œ›ÜˆÈTHÛY[‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMLË]Z[\ÝŠ^ÊJHœ›ÛH^Â‚ˆ\œÜÝ
+‹Ý™XÝÜ‹ÜÙX\˜ÚŠBˆYˆÙX\˜ÚÝ™XÝÜ—ØÛÛXÝ[ÛŠ^[ØYˆ™XÝÜ”ÙX\˜Ú™\]Y\ÝÜ™\]Y\Ýˆ™\]Y\Ý
+HOˆXÝÜÝ‹[žWN‚ˆžN‚ˆ›ØÙ\ÜÛÜˆHY\]™T]Y\žSÜ[Z^™\ŠZ[ÛWÜ›Ý]\ŠÛÛ™šYÊKÛÛ™šYÊBˆ[[H›ØÙ\ÜÛÜ‹˜Û\ÜÚYžWÚ[[
+^[ØYœ]Y\žJBˆ[]Y\ÈH›ØÙ\ÜÛÜ‹™^˜XÝÙ[]Y\Ê^[ØYœ]Y\žJBˆ]Y\žWÝ˜\šX[ÈH›ØÙ\ÜÛÜ‹™^[™Ü]Y\šY\Ê^[ØYœ]Y\žK[[[]Y\ÊBˆYˆ›Ý]Y\žWÝ˜\šX[Î‚ˆ]Y\žWÝ˜\šX[ÈHÜ^[ØYœ]Y\žWBˆÜ[Z^™YÜ]Y\žHH]Y\žWÝ˜\šX[ÖÌWHYˆ[Š]Y\žWÝ˜\šX[ÊHˆH[ÙH]Y\žWÝ˜\šX[ÖÌBˆÛÜšÜÜXÙWØÚ[šÜÈHØ—ÜÝ]K˜Ú[šÜ×ÜÛ˜\ÚÝ
+^[ØYÛÜšÜÜXÙWÚY
+BˆYˆÛÛ™šYË™XÝÜ—ÜÝÜ™WÜ›ÝšY\ˆOH›Y[[ÜžHŽ‚ˆ™]šY]™\ˆHXœšY™]šY]™\ŠˆÛÜšÜÜXÙWØÚ[šÜËˆ[X™Y[™ÏXZ[Ù[X™Y[™×ØY\\ŠÛÛ™šYÊKˆÛÛ™šYÏXÛÛ™šYËˆ
+Bˆ[ÙN‚ˆØØ[Ù[X™Y[™ÈH
+ˆ\Ú[X™Y[™ÐY\\ŠÛÛ™šYÊBˆYˆÛÛ™šYË™[X™Y[™×Ü›ÝšY\ˆ[ˆÈ˜˜Z[X[ˆ‹™\ÚØÛÜH‹˜[^][ˆŸBˆ[ÙHZ[Ù[X™Y[™×ØY\\ŠÛÛ™šYÊBˆ
+Bˆ™]šY]™\ˆHZ[\ÒXœšY™]šY]™\ŠˆZ[\Õ™XÝÜ”ÝÜ™JÛÛ™šYÏXÛÛ™šYÊKˆÛÜšÜÜXÙWØÚ[šÜËˆ[X™Y[™Ï[ØØ[Ù[X™Y[™ËˆÛÛ™šYÏXÛÛ™šYËˆÛÜšÜÜXÙWÚY\^[ØYÛÜšÜÜXÙWÚYˆÛÜšÜÜXÙWÚYÏJ^[ØYÛÜšÜÜXÙWÚY
+HYˆ]]Ù[™›Ü˜Ù[Y[Ù[˜X›Y
+
+H[ÙH›Û™KˆÝšXÝÝÛÜšÜÜXÙWÛY]Y]OX]]Ù[™›Ü˜Ù[Y[Ù[˜X›Y
+
+Kˆ
+Bˆ™\Ý[ÈH™]šY]™WÝÚ]Ü]Y\žWÝ˜\šX[Êˆ™]šY]™\‹ˆ]Y\žWÝ˜\šX[Ëˆ[]Y\Ëˆ[Z]\^[ØY›[Z]ˆœ™—ÚÏXÛÛ™šYËœœ™—ÚËˆ
+BˆÜš]WÙXY×ÛÙÊˆÛÛ™šYËˆ™XÝÜ—ÜÙX\˜ÚÜ™\Ý[È‹ˆ]Y\žO\^[ØYœ]Y\žKˆÜ[Z^™YÜ]Y\žO[Ü[Z^™YÜ]Y\žKˆ]Y\žWÝ˜\šX[Ï\]Y\žWÝ˜\šX[Ëˆ™\Ý[ØÛÝ[[[Š™\Ý[ÊKˆ™\Ý[Ï\™]šY]˜[Ü™\Ý[×Ù›Ü—ÙXYÊ™\Ý[Ë^ØÚ\œÏXÛÛ™šYË™XY×ÛÙ×Ý^ØÚ\œÊKˆ
+Bˆ™]\›ˆÂˆœ]Y\žHŽˆ^[ØYœ]Y\žKˆ›Ü[Z^™YÜ]Y\žHŽˆÜ[Z^™YÜ]Y\žKˆœ]Y\žWÝ˜\šX[ÈŽˆ]Y\žWÝ˜\šX[Ëˆ™[]Y\ÈŽˆ[]Y\Ë×ÙXÝ
+
+Kˆœ™\Ý[ÈŽˆÂˆÂˆœ˜[šÈŽˆ™\Ý[œ˜[šËˆœØÛÜ™HŽˆ™\Ý[œØÛÜ™KˆœÛÝ\˜ÙHŽˆ™\Ý[˜Ú[šË×ÜÛÝ\˜ÙWÜ™YŠØÛÜ™O\™\Ý[œØÛÜ™JK×ÙXÝ
+
+Kˆ^Žˆ™\Ý[˜Ú[šË^ˆBˆ›Üˆ™\Ý[[ˆ™\Ý[ÂˆKˆBˆ^Ù\^Ù\[Ûˆ\È^ÎˆÈ›ÜXNˆ“LHHÝ\™˜XÙHØ[š]^™YÜ\˜][Û˜[\œ›ÜˆÈTHÛY[‚ˆ˜Z\ÙH^Ù\[ÛŠÝ]\×ØÛÙOMLË]Z[\ÝŠ^ÊJHœ›ÛH^Â‚ˆ™]\›ˆ\‚‚™Yˆ\œÙWØÛÜœ×ÛÜšYÚ[œÊ
+HOˆ\ÝÜÝ—N‚ˆÛÛ™šYÝ\™YHÜË™Ù][Š”Q×ÐÓÔ”×ÓÔ’QÒS”È‹ˆŠKœÝš\
+
+BˆYˆÛÛ™šYÝ\™Y‚ˆ™]\›ˆÛÜšYÚ[‹œÝš\
+
+H›ÜˆÜšYÚ[ˆ[ˆÛÛ™šYÝ\™YœÜ]
+‹ŠHYˆÜšYÚ[‹œÝš\
+
+WBˆ™]\›ˆÈŠˆ—B‚‚˜\HÜ™X]WØ\
+
+B

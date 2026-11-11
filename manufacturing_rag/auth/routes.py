@@ -15,7 +15,6 @@ from manufacturing_rag.auth.store import (
     AuthStore,
     CurrentPasswordIncorrect,
     InvalidCredentials,
-    InvalidInvitation,
     LastPlatformAdminError,
     LoginTemporarilyLimited,
     NewPasswordUnchanged,
@@ -38,7 +37,6 @@ class RegisterPayload(StrictPayload):
     username: str = Field(min_length=1, max_length=128)
     display_name: str | None = Field(default=None, max_length=120)
     password: str = Field(min_length=1, max_length=512)
-    invite_code: str = Field(min_length=1, max_length=32)
 
 
 class LoginPayload(StrictPayload):
@@ -49,10 +47,6 @@ class LoginPayload(StrictPayload):
 class ChangePasswordPayload(StrictPayload):
     current_password: str = Field(min_length=1, max_length=512)
     new_password: str = Field(min_length=1, max_length=512)
-
-
-class ResetInvitationPayload(StrictPayload):
-    confirm: bool
 
 
 class RegistrationTogglePayload(StrictPayload):
@@ -208,17 +202,16 @@ def register(payload: RegisterPayload, request: Request, response: Response) -> 
             payload.username,
             payload.display_name,
             payload.password,
-            payload.invite_code,
             ip_address,
         )
     except LoginTemporarilyLimited as exc:
         raise HTTPException(status_code=429, detail="注册请求过于频繁，请稍后再试") from exc
-    except (InvalidInvitation, RegistrationClosed) as exc:
+    except RegistrationClosed as exc:
         try:
             store.record_registration_failure(ip_address)
         except AuthServiceUnavailable as service_exc:
             raise HTTPException(status_code=503, detail="账号服务暂不可用") from service_exc
-        raise HTTPException(status_code=400, detail="邀请码无效或注册暂未开放") from exc
+        raise HTTPException(status_code=403, detail="当前暂未开放注册") from exc
     except AccountAlreadyExists as exc:
         raise HTTPException(status_code=409, detail="该账号已被使用") from exc
     except ValueError as exc:
@@ -298,39 +291,6 @@ def change_password(payload: ChangePasswordPayload, request: Request, response: 
     return {"ok": True}
 
 
-@router.get("/admin/invitation")
-def invitation_status(request: Request) -> dict[str, Any]:
-    store = _auth_store(request)
-    principal = _principal(request, store)
-    assert principal is not None
-    _require_platform_admin(principal)
-    try:
-        return store.invitation_status(principal.user["id"])
-    except PlatformAdminRequired as exc:
-        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
-    except AuthServiceUnavailable as exc:
-        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
-
-
-@router.post("/admin/invitation/reset")
-def reset_invitation(payload: ResetInvitationPayload, request: Request) -> dict[str, Any]:
-    _require_browser_request(request)
-    store = _auth_store(request)
-    principal = _principal(request, store)
-    assert principal is not None
-    _require_csrf(request, principal)
-    _require_platform_admin(principal)
-    if not payload.confirm:
-        raise HTTPException(status_code=422, detail="请确认重置邀请码")
-    try:
-        code, status = store.reset_invitation(principal.user["id"])
-    except PlatformAdminRequired as exc:
-        raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
-    except AuthServiceUnavailable as exc:
-        raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
-    return {**status, "invite_code": code}
-
-
 @router.patch("/admin/registration")
 def set_registration_enabled(payload: RegistrationTogglePayload, request: Request) -> dict[str, Any]:
     _require_browser_request(request)
@@ -343,8 +303,6 @@ def set_registration_enabled(payload: RegistrationTogglePayload, request: Reques
         return store.set_registration_enabled(principal.user["id"], payload.enabled)
     except PlatformAdminRequired as exc:
         raise HTTPException(status_code=403, detail="需要平台管理员权限") from exc
-    except RegistrationClosed as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except AuthServiceUnavailable as exc:
         raise HTTPException(status_code=503, detail="账号服务暂不可用") from exc
 

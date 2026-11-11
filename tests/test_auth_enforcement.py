@@ -20,11 +20,11 @@ def _headers(csrf: str | None = None) -> dict[str, str]:
     return headers
 
 
-def _register(client: TestClient, username: str, invite_code: str) -> str:
+def _register(client: TestClient, username: str) -> str:
     response = client.post(
         "/api/auth/register",
         headers=_headers(),
-        json={"username": username, "password": USER_PASSWORD, "invite_code": invite_code},
+        json={"username": username, "password": USER_PASSWORD},
     )
     assert response.status_code == 201
     return response.json()["user"]["id"]
@@ -51,11 +51,9 @@ def test_legacy_data_routes_require_session_and_workspace_permission(monkeypatch
     try:
         admin = store.create_initial_platform_admin("admin", ADMIN_PASSWORD)
         platform_admin, _admin_id, admin_csrf = _login(app, "admin", ADMIN_PASSWORD)
-        invite, _status = store.reset_invitation(admin["id"])
-        store.set_registration_enabled(admin["id"], True)
         bootstrap_client = TestClient(app)
-        _owner_id = _register(bootstrap_client, "workspaceowner", invite)
-        reader_id = _register(bootstrap_client, "workspacereader", invite)
+        _owner_id = _register(bootstrap_client, "workspaceowner")
+        reader_id = _register(bootstrap_client, "workspacereader")
         owner, owner_id, owner_csrf = _login(app, "workspaceowner", USER_PASSWORD)
         reader, _reader_id, reader_csrf = _login(app, "workspacereader", USER_PASSWORD)
         anonymous = TestClient(app)

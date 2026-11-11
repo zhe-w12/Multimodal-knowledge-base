@@ -6,7 +6,7 @@ import Modal from "antd/es/modal";
 import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
-import { Archive, ArrowLeft, Building2, ClipboardList, FileText, RefreshCw, Search, Shield, Users } from "lucide-react";
+import { Archive, ArrowLeft, Building2, ClipboardList, FileText, RefreshCw, Search, Shield, Trash2, Users } from "lucide-react";
 import { apiFetch, apiResponse } from "../api.js";
 import "./AdminPortal.css";
 
@@ -54,6 +54,8 @@ const AUDIT_ACTION_LABELS = {
   workspace_owner_transferred: "转交工作区负责人",
   workspace_archived: "归档工作区",
   workspace_restored: "恢复工作区",
+  workspace_deletion_started: "开始删除工作区",
+  workspace_deleted: "永久删除工作区",
   department_created: "创建部门",
   department_updated: "修改部门",
   user_department_changed: "调整用户部门",
@@ -159,9 +161,10 @@ export default function AdminPortal({
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceDescription, setWorkspaceDescription] = useState("");
   const [workspaceSaving, setWorkspaceSaving] = useState(false);
+  const [deleteWorkspaceOpen, setDeleteWorkspaceOpen] = useState(false);
+  const [deleteWorkspaceName, setDeleteWorkspaceName] = useState("");
+  const [workspaceDeleting, setWorkspaceDeleting] = useState(false);
   const [documentJob, setDocumentJob] = useState(null);
-  const [invitation, setInvitation] = useState(null);
-  const [inviteCode, setInviteCode] = useState("");
   const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [departments, setDepartments] = useState([]);
   const [newDepartment, setNewDepartment] = useState("");
@@ -182,7 +185,7 @@ export default function AdminPortal({
 
   const platformAdmin = user?.platform_role === "platform_admin";
   const manageableWorkspaces = useMemo(
-    () => workspaces.filter((workspace) => workspace.can_manage),
+    () => workspaces.filter((workspace) => workspace.can_manage || workspace.can_delete),
     [workspaces],
   );
   const workspace = manageableWorkspaces.find((item) => item.id === activeWorkspaceId) || manageableWorkspaces[0] || null;
@@ -196,6 +199,15 @@ export default function AdminPortal({
     setWorkspaceError("");
     try {
       if (workspace.status === "archived") {
+        setWorkspaceSummary(null);
+        setDocuments([]);
+        setMembers([]);
+        setDepartmentOptions([]);
+        setWorkspaceName(workspace.name);
+        setWorkspaceDescription(workspace.description || "");
+        return;
+      }
+      if (!workspace.can_manage) {
         setWorkspaceSummary(null);
         setDocuments([]);
         setMembers([]);
@@ -244,14 +256,13 @@ export default function AdminPortal({
       setPlatformLoading(true);
       setPlatformError("");
       try {
-        const [invite, departmentPayload, userPayload] = await Promise.all([
-          apiFetch(url(apiBase, "/api/auth/admin/invitation")).then(apiResponse),
+        const [registration, departmentPayload, userPayload] = await Promise.all([
+          apiFetch(url(apiBase, "/api/auth/registration")).then(apiResponse),
           apiFetch(url(apiBase, "/api/admin/departments")).then(apiResponse),
           apiFetch(url(apiBase, `/api/auth/admin/users?q=${encodeURIComponent(userQuery.trim())}`)).then(apiResponse),
         ]);
         if (cancelled) return;
-        setInvitation(invite);
-        setRegistrationEnabled(Boolean(invite.registration_enabled));
+        setRegistrationEnabled(Boolean(registration.registration_enabled));
         setDepartments(Array.isArray(departmentPayload.departments) ? departmentPayload.departments : []);
         setPlatformUsers(Array.isArray(userPayload.users) ? userPayload.users : []);
       } catch (error) {
@@ -429,6 +440,31 @@ export default function AdminPortal({
     }
   }
 
+  async function deleteWorkspace() {
+    if (!workspace || workspace.workspace_type !== "authorized") return;
+    if (deleteWorkspaceName.trim() !== workspace.name) {
+      setWorkspaceError("输入的工作区名称不一致，请核对后重试。");
+      return;
+    }
+    setWorkspaceDeleting(true);
+    setWorkspaceError("");
+    try {
+      await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}`), {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, workspace_name: deleteWorkspaceName.trim() }),
+      }, csrfToken).then(apiResponse);
+      setDeleteWorkspaceOpen(false);
+      setDeleteWorkspaceName("");
+      await onRefreshSession();
+      onReturnToChat();
+    } catch (error) {
+      setWorkspaceError(apiError(error, "永久删除工作区失败。"));
+    } finally {
+      setWorkspaceDeleting(false);
+    }
+  }
+
   async function restoreWorkspace() {
     if (!workspace || workspace.workspace_type !== "authorized" || workspace.status !== "archived") return;
     try {
@@ -470,17 +506,7 @@ export default function AdminPortal({
   async function toggleRegistration(enabled) {
     try {
       const result = await runWrite("/api/auth/admin/registration", "PATCH", { enabled }, "保存注册状态失败。");
-      setInvitation(result);
       setRegistrationEnabled(Boolean(result.registration_enabled));
-    } catch { /* The error is shown in the platform panel. */ }
-  }
-
-  async function resetInvitation() {
-    if (!window.confirm("重置邀请码后，旧邀请码将立即失效。确认继续？")) return;
-    try {
-      const result = await runWrite("/api/auth/admin/invitation/reset", "POST", { confirm: true }, "重置邀请码失败。");
-      setInvitation(result);
-      setInviteCode(result.invite_code || "");
     } catch { /* The error is shown in the platform panel. */ }
   }
 
@@ -601,9 +627,9 @@ export default function AdminPortal({
   }
 
   const workspaceTabs = [
-    ...(workspace?.status === "active" ? [{ key: "documents", label: "资料管理", icon: <FileText size={16} /> }] : []),
-    ...(workspace?.status === "active" && workspace?.workspace_type === "authorized" ? [{ key: "members", label: "成员与部门", icon: <Users size={16} /> }] : []),
-    { key: "audit", label: "操作记录", icon: <ClipboardList size={16} /> },
+    ...(workspace?.can_manage && workspace?.status === "active" ? [{ key: "documents", label: "资料管理", icon: <FileText size={16} /> }] : []),
+    ...(workspace?.can_manage && workspace?.status === "active" && workspace?.workspace_type === "authorized" ? [{ key: "members", label: "成员与部门", icon: <Users size={16} /> }] : []),
+    ...(workspace?.can_manage ? [{ key: "audit", label: "操作记录", icon: <ClipboardList size={16} /> }] : []),
     { key: "settings", label: "工作区设置", icon: <Building2 size={16} /> },
   ];
 
@@ -636,7 +662,7 @@ export default function AdminPortal({
             onChange={onWorkspaceChange}
             options={manageableWorkspaces.map((item) => ({
               value: item.id,
-              label: `${item.name}${item.workspace_type === "general" ? " · 通用" : item.is_owner ? " · 负责人" : " · 管理员"}`,
+              label: `${item.name}${item.workspace_type === "general" ? " · 通用" : item.is_owner ? " · 负责人" : item.can_manage ? " · 管理员" : " · 创建者"}`,
             }))}
           />
           {workspace && <span className="admin-workspace-meta">{workspace.status === "archived" ? "已归档" : workspace.workspace_type === "general" ? "所有启用用户均可检索" : "受授权成员可检索"}</span>}
@@ -708,14 +734,15 @@ export default function AdminPortal({
           </section>
         </div> : <div className="admin-workspace-settings">
           <form className="admin-card" onSubmit={saveWorkspace}>
-          <div className="admin-card-heading"><div><h2>工作区设置</h2><p>{workspace?.workspace_type === "general" ? "通用区由平台管理员维护。" : "工作区创建者自动成为负责人。"}</p></div></div>
-          <label>名称</label><Input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} maxLength={50} disabled={workspace?.workspace_type === "general"} />
-          <label>说明</label><Input.TextArea value={workspaceDescription} onChange={(event) => setWorkspaceDescription(event.target.value)} maxLength={500} rows={4} disabled={workspace?.workspace_type === "general"} />
-          {workspace?.workspace_type !== "general" && <div className="admin-workspace-actions">
-            <Button type="primary" htmlType="submit" loading={workspaceSaving}>保存设置</Button>
+          <div className="admin-card-heading"><div><h2>工作区设置</h2><p>{workspace?.deletion_in_progress ? "工作区正在永久删除；清理失败时可再次尝试。" : workspace?.workspace_type === "general" ? "通用区由平台管理员维护。" : workspace?.can_manage ? "工作区创建者自动成为负责人。" : "你是此工作区的创建者，可以永久删除。"}</p></div></div>
+          <label>名称</label><Input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} maxLength={50} disabled={workspace?.workspace_type === "general" || !workspace?.can_manage} />
+          <label>说明</label><Input.TextArea value={workspaceDescription} onChange={(event) => setWorkspaceDescription(event.target.value)} maxLength={500} rows={4} disabled={workspace?.workspace_type === "general" || !workspace?.can_manage} />
+          {workspace && workspace.workspace_type !== "general" && <div className="admin-workspace-actions">
+            {workspace?.can_manage && <Button type="primary" htmlType="submit" loading={workspaceSaving}>保存设置</Button>}
             {workspace.status === "archived"
-              ? <Button type="primary" onClick={() => void restoreWorkspace()}>恢复工作区</Button>
+              ? !workspace.deletion_in_progress && (workspace.is_owner || platformAdmin) && <Button type="primary" onClick={() => void restoreWorkspace()}>恢复工作区</Button>
               : workspace.is_owner && <Button danger icon={<Archive size={15} />} onClick={() => void archiveWorkspace()}>归档工作区</Button>}
+            {workspace?.workspace_type === "authorized" && workspace.can_delete && <Button danger icon={<Trash2 size={15} />} onClick={() => { setDeleteWorkspaceName(""); setDeleteWorkspaceOpen(true); }}>永久删除工作区</Button>}
           </div>}
           </form>
           {workspace?.workspace_type === "authorized" && workspace.status === "active" && (workspace.is_owner || platformAdmin) && <section className="admin-card admin-owner-transfer">
@@ -736,8 +763,6 @@ export default function AdminPortal({
         </div>}
       </>}
     </> : <PlatformPanel
-      invitation={invitation}
-      inviteCode={inviteCode}
       registrationEnabled={registrationEnabled}
       departments={departments}
       newDepartment={newDepartment}
@@ -746,7 +771,6 @@ export default function AdminPortal({
       userQuery={userQuery}
       setUserQuery={setUserQuery}
       onToggleRegistration={toggleRegistration}
-      onResetInvitation={resetInvitation}
       onCreateDepartment={createDepartment}
       onUpdateDepartment={updateDepartment}
       onAssignDepartment={previewDepartmentChange}
@@ -801,12 +825,24 @@ export default function AdminPortal({
         <p>工作区权限版本：{memberPreview.workspace_version}。提交时版本变化会拒绝保存并要求刷新。</p>
       </div>}
     </Modal>
+    <Modal
+      title="永久删除工作区"
+      open={deleteWorkspaceOpen}
+      confirmLoading={workspaceDeleting}
+      okText="永久删除"
+      okButtonProps={{ danger: true, disabled: deleteWorkspaceName.trim() !== workspace?.name }}
+      cancelText="取消"
+      onCancel={() => { if (!workspaceDeleting) setDeleteWorkspaceOpen(false); }}
+      onOk={() => void deleteWorkspace()}
+    >
+      <p>删除后将清除工作区内的资料原件、片段、向量索引及该区对话，且无法恢复。操作记录会保留。</p>
+      <p>请输入工作区名称 <strong>{workspace?.name}</strong> 以确认：</p>
+      <Input value={deleteWorkspaceName} onChange={(event) => setDeleteWorkspaceName(event.target.value)} autoComplete="off" />
+    </Modal>
   </section>;
 }
 
 function PlatformPanel({
-  invitation,
-  inviteCode,
   registrationEnabled,
   departments,
   newDepartment,
@@ -815,7 +851,6 @@ function PlatformPanel({
   userQuery,
   setUserQuery,
   onToggleRegistration,
-  onResetInvitation,
   onCreateDepartment,
   onUpdateDepartment,
   onAssignDepartment,
@@ -839,10 +874,8 @@ function PlatformPanel({
     {error && <div className="admin-error" role="alert">{error}</div>}
     {notice && <div className="admin-success" role="status">{notice}</div>}
     <section className="admin-card">
-      <div className="admin-card-heading"><div><h2>注册与邀请码</h2><p>邀请码为 6 位字母或数字，重置后旧码立即失效。</p></div></div>
-      <div className="admin-registration-row"><div><strong>开放新用户注册</strong><span>关闭后，现有账号仍可正常登录。</span></div><Switch checked={registrationEnabled} disabled={saving || !invitation?.configured} onChange={onToggleRegistration} /></div>
-      <div className="admin-invite-row"><div><strong>{invitation?.configured ? `邀请码版本 ${invitation.version}` : "尚未生成邀请码"}</strong><span>{invitation?.updated_at ? `最近更新：${new Date(invitation.updated_at).toLocaleString()}` : "重置后只显示一次新邀请码。"}</span></div><Button danger onClick={onResetInvitation} loading={saving}>{invitation?.configured ? "重置邀请码" : "生成邀请码"}</Button></div>
-      {inviteCode && <div className="admin-invite-code"><code>{inviteCode}</code><Button onClick={() => navigator.clipboard?.writeText(inviteCode)}>复制邀请码</Button><small>请妥善发送给需要注册的用户。</small></div>}
+      <div className="admin-card-heading"><div><h2>用户注册</h2><p>用户可以自行创建账号；关闭注册后，现有账号仍可正常登录。</p></div></div>
+      <div className="admin-registration-row"><div><strong>开放用户注册</strong><span>注册账号默认没有部门或授权工作区权限。</span></div><Switch checked={registrationEnabled} disabled={saving} onChange={onToggleRegistration} /></div>
     </section>
 
     <div className="admin-grid">

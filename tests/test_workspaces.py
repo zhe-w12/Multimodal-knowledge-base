@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
+from sqlalchemy import select
 
 from manufacturing_rag.auth.store import AuthStore
+from manufacturing_rag.auth.models import AuditLog, ConversationMessage
+from manufacturing_rag.auth.conversation_store import ConversationStore
 from manufacturing_rag.api import create_app
+from manufacturing_rag.schemas import DEFAULT_WORKSPACE_ID, DocumentChunk
 
 
 ORIGIN = "http://testserver"
@@ -18,11 +23,11 @@ def _headers(csrf_token: str | None = None) -> dict[str, str]:
     return headers
 
 
-def _create_account(client: TestClient, username: str, invite_code: str) -> tuple[str, str]:
+def _create_account(client: TestClient, username: str) -> tuple[str, str]:
     response = client.post(
         "/api/auth/register",
         headers=_headers(),
-        json={"username": username, "password": USER_PASSWORD, "invite_code": invite_code},
+        json={"username": username, "password": USER_PASSWORD},
     )
     assert response.status_code == 201
     body = response.json()
@@ -43,16 +48,14 @@ def _login(app, username: str, password: str) -> tuple[TestClient, str, str]:
 def _setup(monkeypatch):
     monkeypatch.setenv("AUTH_ALLOWED_ORIGINS", ORIGIN)
     monkeypatch.setenv("RAG_CORS_ORIGINS", ORIGIN)
-    app = create_app()
+    app = create_app(initial_chunks=[])
     store = AuthStore("sqlite://", b"w" * 32)
     app.state.auth_store = store
     admin = store.create_initial_platform_admin("admin", ADMIN_PASSWORD)
-    invite, _status = store.reset_invitation(admin["id"])
-    store.set_registration_enabled(admin["id"], True)
     bootstrap_client = TestClient(app)
-    user_a_id, user_a_csrf = _create_account(bootstrap_client, "workspace_owner", invite)
-    user_b_id, user_b_csrf = _create_account(bootstrap_client, "workspace_reader", invite)
-    user_c_id, _user_c_csrf = _create_account(bootstrap_client, "workspace_other", invite)
+    user_a_id, user_a_csrf = _create_account(bootstrap_client, "workspace_owner")
+    user_b_id, user_b_csrf = _create_account(bootstrap_client, "workspace_reader")
+    user_c_id, _user_c_csrf = _create_account(bootstrap_client, "workspace_other")
     user_a, _, user_a_csrf = _login(app, "workspace_owner", USER_PASSWORD)
     user_b, _, user_b_csrf = _login(app, "workspace_reader", USER_PASSWORD)
     admin_client, _, admin_csrf = _login(app, "admin", ADMIN_PASSWORD)
@@ -139,6 +142,7 @@ def test_any_active_user_can_create_an_authorized_workspace(monkeypatch):
 
         denied = user_b.get(f"/api/workspaces/{workspace['id']}")
         assert denied.status_code == 403
+
         assert all(item["id"] != workspace["id"] for item in user_b.get("/api/workspaces").json()["workspaces"])
 
         granted = user_a.put(
@@ -395,6 +399,209 @@ def test_workspace_owner_controls_administrators_transfer_and_archive(monkeypatc
         assert restored.json()["owner_user_id"] == user_b_id
         assert user_a.get(f"/api/workspaces/{workspace['id']}").status_code == 200
         assert user_a_id != user_b_id
+    finally:
+        store.engine.dispose()
+
+
+def test_workspace_creator_can_permanently_delete_after_transfer(monkeypatch, tmp_path):
+    (
+        app,
+        store,
+        creator,
+        creator_id,
+        creator_csrf,
+        reader,
+        reader_id,
+        reader_csrf,
+        _other_id,
+        admin_client,
+        _admin_csrf,
+    ) = _setup(monkeypatch)
+    try:
+        monkeypatch.setattr("manufacturing_rag.api.DOCUMENT_FILES_DIR", tmp_path)
+        workspace = creator.post(
+            "/api/workspaces",
+            headers=_headers(creator_csrf),
+            json={"name": "待删除资料区"},
+        ).json()
+        workspace_id = workspace["id"]
+
+        denied = reader.request(
+            "DELETE",
+            f"/api/workspaces/{workspace_id}",
+            headers=_headers(reader_csrf),
+            json={"confirm": True, "workspace_name": workspace["name"]},
+        )
+        assert denied.status_code == 403
+
+        missing_csrf = creator.request(
+            "DELETE",
+            f"/api/workspaces/{workspace_id}",
+            headers={"Origin": ORIGIN, "Content-Type": "application/json"},
+            json={"confirm": True, "workspace_name": workspace["name"]},
+        )
+        assert missing_csrf.status_code == 403
+
+        transferred = creator.post(
+            f"/api/workspaces/{workspace_id}/transfer",
+            headers=_headers(creator_csrf),
+            json={"new_owner_user_id": reader_id},
+        )
+        assert transferred.status_code == 200
+
+        wrong_name = creator.request(
+            "DELETE",
+            f"/api/workspaces/{workspace_id}",
+            headers=_headers(creator_csrf),
+            json={"confirm": True, "workspace_name": "错误名称"},
+        )
+        assert wrong_name.status_code == 422
+        assert creator.get(f"/api/workspaces/{workspace_id}").status_code == 200
+
+        blocked = reader.put(
+            f"/api/workspaces/{workspace_id}/members/{creator_id}",
+            headers=_headers(reader_csrf),
+            json={"role": "blocked"},
+        )
+        assert blocked.status_code == 200
+        creator_access = next(
+            item for item in creator.get("/api/workspaces").json()["workspaces"]
+            if item["id"] == workspace_id
+        )
+        assert creator_access["can_delete"] is True
+        assert creator_access["can_manage"] is False
+
+        app.state.kb.update_chunks(
+            [
+                {"id": "private-chunk", "text": "私有资料", "source": "private.pdf", "metadata": {"workspace_id": workspace_id}},
+            ],
+            workspace_id=workspace_id,
+        )
+        app.state.kb.update_chunks(
+            [{"id": "general-chunk", "text": "通用资料", "source": "general.pdf"}],
+            workspace_id=DEFAULT_WORKSPACE_ID,
+        )
+        assert app.state.kb.workspace_chunk_ids(workspace_id)
+        from manufacturing_rag.api import stored_document_metadata_path, stored_document_path
+
+        original = stored_document_path(workspace_id, "private.pdf")
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b"private source")
+        stored_document_metadata_path(workspace_id, "private.pdf").write_text("{}", encoding="utf-8")
+
+        conversation = ConversationStore(store).create(creator_id, "workspace", workspace_id)
+        ConversationStore(store).begin_turn(
+            creator_id,
+            conversation["id"],
+            "workspace",
+            workspace_id,
+            [workspace_id],
+            "私有问题",
+        )
+        ConversationStore(store).append_assistant(creator_id, conversation["id"], "私有回答", [])
+        all_scope_with_workspace_source = ConversationStore(store).create(creator_id, "all")
+        ConversationStore(store).append_assistant(
+            creator_id,
+            all_scope_with_workspace_source["id"],
+            "引用授权工作区资料的回答",
+            [{"metadata": {"workspace_id": workspace_id}}],
+        )
+        all_scope_with_general_source = ConversationStore(store).create(creator_id, "all")
+        ConversationStore(store).append_assistant(
+            creator_id,
+            all_scope_with_general_source["id"],
+            "引用通用资料的回答",
+            [{"metadata": {"workspace_id": DEFAULT_WORKSPACE_ID}}],
+        )
+
+        original_cleanup = app.state.delete_workspace_data
+
+        def fail_cleanup(_workspace_id):
+            raise HTTPException(status_code=503, detail="模拟索引删除失败")
+
+        app.state.delete_workspace_data = fail_cleanup
+        failed = creator.request(
+            "DELETE",
+            f"/api/workspaces/{workspace_id}",
+            headers=_headers(creator_csrf),
+            json={"confirm": True, "workspace_name": workspace["name"]},
+        )
+        assert failed.status_code == 503
+        archived_workspace = next(
+            item for item in creator.get("/api/workspaces").json()["workspaces"]
+            if item["id"] == workspace_id
+        )
+        assert archived_workspace["status"] == "archived"
+        assert archived_workspace["deletion_in_progress"] is True
+        assert original.exists()
+        blocked_restore = reader.post(
+            f"/api/workspaces/{workspace_id}/restore",
+            headers=_headers(reader_csrf),
+            json={"confirm": True},
+        )
+        assert blocked_restore.status_code == 409
+
+        app.state.delete_workspace_data = original_cleanup
+        deleted = creator.request(
+            "DELETE",
+            f"/api/workspaces/{workspace_id}",
+            headers=_headers(creator_csrf),
+            json={"confirm": True, "workspace_name": workspace["name"]},
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted_conversation_count"] == 2
+        assert deleted.json()["removed_chunk_count"] > 0
+        assert not app.state.kb.workspace_chunk_ids(workspace_id), deleted.json()
+        assert creator.get(f"/api/workspaces/{workspace_id}").status_code == 404
+        assert all(item["id"] != workspace_id for item in creator.get("/api/workspaces").json()["workspaces"])
+        remaining_chunks = app.state.kb.chunks_snapshot()
+        assert [(chunk.source, chunk.metadata.get("workspace_id")) for chunk in remaining_chunks] == [
+            ("general.pdf", DEFAULT_WORKSPACE_ID)
+        ]
+        assert not original.parent.exists()
+        remaining_conversation_ids = {
+            item["id"] for item in creator.get("/api/conversations").json()["conversations"]
+        }
+        assert conversation["id"] not in remaining_conversation_ids
+        assert all_scope_with_workspace_source["id"] not in remaining_conversation_ids
+        assert all_scope_with_general_source["id"] in remaining_conversation_ids
+        with store.Session() as db:
+            assert db.scalar(select(AuditLog.id).where(AuditLog.action == "workspace_deleted", AuditLog.target_id == workspace_id))
+            assert db.scalar(select(ConversationMessage.id).where(ConversationMessage.conversation_id == conversation["id"])) is None
+            assert db.scalar(select(ConversationMessage.id).where(ConversationMessage.conversation_id == all_scope_with_workspace_source["id"])) is None
+            assert db.scalar(select(ConversationMessage.id).where(ConversationMessage.conversation_id == all_scope_with_general_source["id"])) is not None
+        assert reader.get("/api/workspaces").status_code == 200
+    finally:
+        store.engine.dispose()
+
+
+def test_general_workspace_cannot_be_permanently_deleted(monkeypatch):
+    (
+        _app,
+        store,
+        _creator,
+        _creator_id,
+        _creator_csrf,
+        _reader,
+        _reader_id,
+        _reader_csrf,
+        _other_id,
+        admin_client,
+        admin_csrf,
+    ) = _setup(monkeypatch)
+    try:
+        general = next(
+            item for item in admin_client.get("/api/workspaces").json()["workspaces"]
+            if item["workspace_type"] == "general"
+        )
+        response = admin_client.request(
+            "DELETE",
+            f"/api/workspaces/{general['id']}",
+            headers=_headers(admin_csrf),
+            json={"confirm": True, "workspace_name": general["name"]},
+        )
+        assert response.status_code == 403
+        assert admin_client.get(f"/api/workspaces/{general['id']}").status_code == 200
     finally:
         store.engine.dispose()
 

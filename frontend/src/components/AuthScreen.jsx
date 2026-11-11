@@ -1,7 +1,7 @@
 import { useState } from "react";
 import Button from "antd/es/button";
 import Input from "antd/es/input";
-import { ArrowRight, KeyRound, LockKeyhole, UserRound } from "lucide-react";
+import { ArrowRight, KeyRound, UserRound } from "lucide-react";
 import "./AuthScreen.css";
 
 export default function AuthScreen({
@@ -16,7 +16,6 @@ export default function AuthScreen({
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [passwordConfirm, setPasswordConfirm] = useState("");
-  const [inviteCode, setInviteCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState("");
   const registering = mode === "register";
@@ -38,10 +37,6 @@ export default function AuthScreen({
         setLocalError("两次输入的密码不一致。");
         return;
       }
-      if (!/^[A-Za-z0-9]{6}$/.test(inviteCode.trim())) {
-        setLocalError("请输入管理员提供的 6 位邀请码。");
-        return;
-      }
     }
     setSubmitting(true);
     try {
@@ -51,7 +46,6 @@ export default function AuthScreen({
       };
       if (registering) {
         payload.display_name = displayName.trim() || undefined;
-        payload.invite_code = inviteCode.trim().toUpperCase();
       }
       await onSubmit(mode, payload);
     } catch (submitError) {
@@ -68,9 +62,7 @@ export default function AuthScreen({
         <span>库解</span>
       </div>
       <div className="auth-intro">
-        <span className="auth-eyebrow"><LockKeyhole size={14} /> 多模态知识库</span>
         <h1 id="auth-heading">{registering ? "创建账号" : "欢迎回来"}</h1>
-        <p>{registering ? "使用管理员邀请码注册，注册后即可检索有权访问的工作区。" : "登录后继续检索校园知识库与已授权的工作区。"}</p>
       </div>
       <form className="auth-form" onSubmit={submit}>
         <label htmlFor="auth-username">账号</label>
@@ -114,31 +106,21 @@ export default function AuthScreen({
             placeholder="再次输入密码"
             required
           />
-          <label htmlFor="auth-invite">管理员邀请码</label>
-          <Input
-            id="auth-invite"
-            value={inviteCode}
-            onChange={(event) => setInviteCode(event.target.value.replace(/[^a-z0-9]/gi, "").slice(0, 6).toUpperCase())}
-            autoComplete="off"
-            maxLength={6}
-            placeholder="6 位字母或数字"
-            required
-          />
         </>}
         {(localError || error) && <div className="auth-error" role="alert">{localError || error}</div>}
         <Button className="auth-submit" type="primary" htmlType="submit" loading={submitting || loading}>
           {registering ? "注册并登录" : "登录"}<ArrowRight size={17} />
         </Button>
       </form>
-      <div className="auth-footer">
-        {registrationEnabled
-          ? <span>{registering ? "已有账号？" : "还没有账号？"}</span>
-          : <span>{error ? "账号服务暂时不可用。" : "当前未开放注册，请联系管理员获取邀请码。"}</span>}
-        {registrationEnabled && <button type="button" onClick={() => { setMode(registering ? "login" : "register"); setLocalError(""); }}>
-          {registering ? "返回登录" : "使用邀请码注册"}
-        </button>}
+      {(registrationEnabled || error) && <div className="auth-footer">
+        {registrationEnabled && <>
+          <span>{registering ? "已有账号？" : "还没有账号？"}</span>
+          <button type="button" onClick={() => { setMode(registering ? "login" : "register"); setLocalError(""); }}>
+            {registering ? "返回登录" : "创建账号"}
+          </button>
+        </>}
         {error && <button type="button" onClick={onRetry}>重试连接</button>}
-      </div>
+      </div>}
       {registering && <p className="auth-rules">账号 3～32 位；密码 8～16 个字符。显示名称可在注册时填写。</p>}
     </section>
     <div className="auth-page-caption">让每份资料，都能成为答案</div>

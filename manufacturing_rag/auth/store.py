@@ -35,7 +35,6 @@ from manufacturing_rag.auth.security import (
     DUMMY_PASSWORD_HASH,
     PASSWORD_HASHER,
     hash_password,
-    normalize_invite_code,
     normalize_login_username,
     normalize_password,
     normalize_username,
@@ -61,10 +60,6 @@ class AuthServiceUnavailable(RuntimeError):
 
 
 class InvalidCredentials(RuntimeError):
-    pass
-
-
-class InvalidInvitation(RuntimeError):
     pass
 
 
@@ -132,20 +127,23 @@ def _project_path(value: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def _invite_pepper(data_dir: Path, provided: bytes | None = None) -> bytes:
+def _auth_pepper(data_dir: Path, provided: bytes | None = None) -> bytes:
     if provided is not None:
         if len(provided) < 32:
-            raise ValueError("invite pepper must contain at least 32 bytes")
+            raise ValueError("auth pepper must contain at least 32 bytes")
         return provided
 
-    configured = os.getenv("AUTH_INVITE_PEPPER", "")
+    configured = os.getenv("AUTH_SECRET_PEPPER") or os.getenv("AUTH_INVITE_PEPPER", "")
     if configured:
         secret = configured.encode("utf-8")
         if len(secret) < 32:
-            raise ValueError("AUTH_INVITE_PEPPER must contain at least 32 bytes")
+            raise ValueError("AUTH_SECRET_PEPPER must contain at least 32 bytes")
         return secret
 
-    key_path = _project_path(os.getenv("AUTH_INVITE_PEPPER_FILE", str(data_dir / "invite.key")))
+    key_file = os.getenv("AUTH_SECRET_PEPPER_FILE") or os.getenv(
+        "AUTH_INVITE_PEPPER_FILE", str(data_dir / "invite.key")
+    )
+    key_path = _project_path(key_file)
     key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -158,7 +156,7 @@ def _invite_pepper(data_dir: Path, provided: bytes | None = None) -> bytes:
             handle.flush()
             os.fsync(handle.fileno())
     if len(secret) < 32:
-        raise ValueError("invite pepper file must contain at least 32 bytes")
+        raise ValueError("auth pepper file must contain at least 32 bytes")
     if os.name == "posix":
         os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
     return secret
@@ -191,10 +189,10 @@ def _database_url(data_dir: Path) -> tuple[str | URL, dict[str, Any], Any]:
 class AuthStore:
     """Persistent identity store. The database is never replaced with in-memory users."""
 
-    def __init__(self, database_url: str | URL | None = None, invite_pepper: bytes | None = None):
+    def __init__(self, database_url: str | URL | None = None, auth_pepper: bytes | None = None):
         data_dir = _project_path(os.getenv("AUTH_DATA_DIR", "data/auth"))
         data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.invite_pepper = _invite_pepper(data_dir, invite_pepper)
+        self.auth_pepper = _auth_pepper(data_dir, auth_pepper)
         if database_url is None:
             database_url, connect_args, pool_class = _database_url(data_dir)
         else:
@@ -273,11 +271,8 @@ class AuthStore:
             "permissions_version": user.permissions_version,
         }
 
-    def _invite_digest(self, code: str) -> str:
-        return hmac.new(self.invite_pepper, b"invite:" + code.encode("ascii"), hashlib.sha256).hexdigest()
-
     def _csrf_token(self, raw_session_token: str) -> str:
-        return csrf_token_for_session(self.invite_pepper, raw_session_token)
+        return csrf_token_for_session(self.auth_pepper, raw_session_token)
 
     @staticmethod
     def _token_digest(raw_token: str) -> str:
@@ -358,9 +353,6 @@ class AuthStore:
         try:
             with self.Session.begin() as db:
                 settings = db.get(RegistrationSettings, 1, with_for_update=True)
-                if not settings:
-                    db.add(RegistrationSettings(id=1, registration_enabled=False, version=0))
-                    db.flush()
                 active_admin = db.scalar(
                     select(User.id)
                     .where(User.platform_role == "platform_admin", User.status == "active")
@@ -371,6 +363,14 @@ class AuthStore:
                     raise RuntimeError("已有启用的平台管理员；不能再次执行首次初始化")
                 db.add(user)
                 db.flush()
+                if not settings:
+                    settings = RegistrationSettings(id=1, registration_enabled=True, version=1)
+                    db.add(settings)
+                else:
+                    settings.registration_enabled = True
+                    settings.version += 1
+                    settings.updated_at = utcnow()
+                settings.updated_by = user.id
                 self._audit(db, None, "platform_admin_bootstrapped", "user", user.id)
             return self.public_user(user)
         except IntegrityError as exc:
@@ -380,12 +380,12 @@ class AuthStore:
 
     def _attempt_buckets(self, username_key: str, ip_address: str) -> tuple[tuple[str, int, str, str | None, str | None], ...]:
         account_digest = hmac.new(
-            self.invite_pepper,
+            self.auth_pepper,
             f"rate-account:{username_key}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
         ip_digest = hmac.new(
-            self.invite_pepper,
+            self.auth_pepper,
             f"rate-ip:{ip_address}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -396,7 +396,7 @@ class AuthStore:
         )
         return tuple(
             (
-                hmac.new(self.invite_pepper, f"login:{scope}:{value}".encode("utf-8"), hashlib.sha256).hexdigest(),
+                hmac.new(self.auth_pepper, f"login:{scope}:{value}".encode("utf-8"), hashlib.sha256).hexdigest(),
                 limit,
                 scope,
                 account_digest if scope != "ip" else None,
@@ -479,16 +479,16 @@ class AuthStore:
             raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
 
     def check_registration_rate_limit(self, ip_address: str) -> None:
-        buckets = self._attempt_buckets("registration-invitation", str(ip_address or "unknown")[:128])
+        buckets = self._attempt_buckets("registration", str(ip_address or "unknown")[:128])
         self._check_rate_limit(buckets)
 
     def record_registration_failure(self, ip_address: str) -> None:
-        buckets = self._attempt_buckets("registration-invitation", str(ip_address or "unknown")[:128])
+        buckets = self._attempt_buckets("registration", str(ip_address or "unknown")[:128])
         self._record_failed_login(buckets)
 
     def _consume_registration_slot(self, ip_address: str) -> None:
         digest = hmac.new(
-            self.invite_pepper,
+            self.auth_pepper,
             f"registration-success:{str(ip_address or 'unknown')[:128]}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -508,7 +508,7 @@ class AuthStore:
                         bucket_digest=digest,
                         scope_type="registration_ip",
                         ip_digest=hmac.new(
-                            self.invite_pepper,
+                            self.auth_pepper,
                             f"rate-ip:{str(ip_address or 'unknown')[:128]}".encode("utf-8"),
                             hashlib.sha256,
                         ).hexdigest(),
@@ -601,7 +601,6 @@ class AuthStore:
         username: str,
         display_name: str | None,
         password: str,
-        invite_code: str,
         ip_address: str = "unknown",
     ) -> tuple[dict[str, Any], str, str]:
         normalized_username = normalize_username(username)
@@ -614,10 +613,6 @@ class AuthStore:
         if not normalized_display_name:
             normalized_display_name = normalized_username
 
-        normalized_code = normalize_invite_code(invite_code)
-        if normalized_code is None:
-            raise InvalidInvitation("邀请码无效或注册暂未开放")
-        invite_digest = self._invite_digest(normalized_code)
         password_hash = hash_password(normalized_password)
         self._consume_registration_slot(ip_address)
         user = User(
@@ -635,9 +630,7 @@ class AuthStore:
             with self.Session.begin() as db:
                 settings = db.get(RegistrationSettings, 1, with_for_update=True)
                 if not settings or not settings.registration_enabled:
-                    raise RegistrationClosed("邀请码无效或注册暂未开放")
-                if not settings.invite_digest or not hmac.compare_digest(settings.invite_digest, invite_digest):
-                    raise InvalidInvitation("邀请码无效或注册暂未开放")
+                    raise RegistrationClosed("当前暂未开放注册")
                 db.add(user)
                 db.flush()
                 auth_session.user_id = user.id
@@ -645,7 +638,7 @@ class AuthStore:
                 self._audit(db, user.id, "account_registered", "user", user.id)
                 public_user = self.public_user(user)
             return public_user, raw_token, csrf_token
-        except (InvalidInvitation, RegistrationClosed):
+        except RegistrationClosed:
             raise
         except IntegrityError as exc:
             raise AccountAlreadyExists("该账号已被使用") from exc
@@ -762,8 +755,13 @@ class AuthStore:
         try:
             with self.Session() as db:
                 settings = db.get(RegistrationSettings, 1)
+                active_admin = db.scalar(
+                    select(User.id)
+                    .where(User.platform_role == "platform_admin", User.status == "active")
+                    .limit(1)
+                )
                 return {
-                    "configured": bool(settings and settings.invite_digest),
+                    "configured": bool(active_admin),
                     "registration_enabled": bool(settings and settings.registration_enabled),
                 }
         except SQLAlchemyError as exc:
@@ -931,66 +929,6 @@ class AuthStore:
         except SQLAlchemyError as exc:
             raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
 
-    def invitation_status(self, actor_user_id: str) -> dict[str, Any]:
-        self.ensure_schema()
-        try:
-            with self.Session() as db:
-                actor = db.get(User, actor_user_id)
-                if not actor or actor.status != "active" or actor.platform_role != "platform_admin":
-                    raise PlatformAdminRequired("需要平台管理员权限")
-                settings = db.get(RegistrationSettings, 1)
-                updated_by = db.get(User, settings.updated_by) if settings and settings.updated_by else None
-                return {
-                    "configured": bool(settings and settings.invite_digest),
-                    "registration_enabled": bool(settings and settings.registration_enabled),
-                    "version": settings.version if settings else 0,
-                    "updated_at": settings.updated_at.isoformat() if settings and settings.updated_at else None,
-                    "updated_by": updated_by.username if updated_by else None,
-                }
-        except PlatformAdminRequired:
-            raise
-        except SQLAlchemyError as exc:
-            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
-
-    def reset_invitation(self, actor_user_id: str) -> tuple[str, dict[str, Any]]:
-        self.ensure_schema()
-        try:
-            with self.Session.begin() as db:
-                actor = self._require_platform_admin(db, actor_user_id)
-                settings = db.get(RegistrationSettings, 1, with_for_update=True)
-                if not settings:
-                    settings = RegistrationSettings(id=1, registration_enabled=False, version=0)
-                    db.add(settings)
-                    db.flush()
-                old_digest = settings.invite_digest
-                code = ""
-                digest = ""
-                alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-                for _ in range(20):
-                    code = "".join(secrets.choice(alphabet) for _ in range(6))
-                    digest = self._invite_digest(code)
-                    if not old_digest or not hmac.compare_digest(old_digest, digest):
-                        break
-                else:
-                    raise RuntimeError("无法生成与旧邀请码不同的新邀请码")
-                settings.invite_digest = digest
-                settings.updated_by = actor.id
-                settings.updated_at = utcnow()
-                settings.version += 1
-                self._audit(db, actor.id, "registration_invitation_reset", "registration", "global", {"version": settings.version})
-                status = {
-                    "configured": True,
-                    "registration_enabled": bool(settings.registration_enabled),
-                    "version": settings.version,
-                    "updated_at": settings.updated_at.isoformat(),
-                    "updated_by": actor.username,
-                }
-            return code, status
-        except PlatformAdminRequired:
-            raise
-        except SQLAlchemyError as exc:
-            raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
-
     def set_registration_enabled(self, actor_user_id: str, enabled: bool) -> dict[str, Any]:
         self.ensure_schema()
         try:
@@ -1001,8 +939,6 @@ class AuthStore:
                     settings = RegistrationSettings(id=1, registration_enabled=False, version=0)
                     db.add(settings)
                     db.flush()
-                if enabled and not settings.invite_digest:
-                    raise RegistrationClosed("请先生成邀请码，再开放注册")
                 settings.registration_enabled = bool(enabled)
                 settings.updated_by = actor.id
                 settings.updated_at = utcnow()
@@ -1018,13 +954,13 @@ class AuthStore:
                 updated_at = settings.updated_at.isoformat()
                 version = settings.version
             return {
-                "configured": True if settings.invite_digest else False,
+                "configured": True,
                 "registration_enabled": bool(enabled),
                 "version": version,
                 "updated_at": updated_at,
                 "updated_by": actor.username,
             }
-        except (PlatformAdminRequired, RegistrationClosed):
+        except PlatformAdminRequired:
             raise
         except SQLAlchemyError as exc:
             raise AuthServiceUnavailable("账号数据服务暂不可用") from exc
@@ -1032,7 +968,7 @@ class AuthStore:
     def clear_login_limits(self, actor_user_id: str, username: str) -> int:
         normalized_username = normalize_username(username)
         account_digest = hmac.new(
-            self.invite_pepper,
+            self.auth_pepper,
             f"rate-account:{normalized_username}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
