@@ -20,6 +20,7 @@ const switcherTheme = {
 
 export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searchScope, busy, defaultWorkspaceId, onSelectWorkspace, onSelectScope, onCreateWorkspace }) {
   const workspace = workspaces.find((item) => item.id === activeWorkspaceId) || workspaces[0];
+  const selectableWorkspaces = workspaces.filter((item) => item.workspace_type !== "general");
   if (!workspace) return null;
   const selectedName = searchScope === "all" ? "全部可用资料" : searchScope === "common" ? "通用知识库" : workspace.name;
 
@@ -36,7 +37,7 @@ export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searc
             { key: "scope-all", label: "全部可用资料", icon: <LibraryBig size={16} /> },
             { key: "scope-common", label: "通用知识库", icon: <LibraryBig size={16} /> },
             { type: "divider" },
-            ...workspaces.map((item) => ({
+            ...selectableWorkspaces.map((item) => ({
               key: item.id,
               label: <div className={styles.menuItem}>
                 <span className={styles.menuName}>{item.name}</span>
@@ -65,3 +66,4 @@ export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searc
     </ConfigProvider>
   );
 }
+
