@@ -799,6 +799,14 @@ class KnowledgeBaseState:
                 render_dpi=render_dpi,
             )
         except Exception as exc:  # noqa: BLE001 - convert parser-specific failures to a stable API error.
+            write_debug_log(
+                self._config,
+                "multimodal_document_etl_failed",
+                filename=safe_document_filename(filename),
+                file_extension=Path(filename).suffix.lower(),
+                error_type=type(exc).__name__,
+                error=sanitize_error_detail(str(exc)),
+            )
             raise HTTPException(status_code=400, detail=f"多模态 ETL 失败：{exc}") from exc
         log_chunks_for_ingest(self._config, "multimodal_document_ingest", result.chunks, normalized_mode, filename=filename)
         response = self._apply_chunks_locked(

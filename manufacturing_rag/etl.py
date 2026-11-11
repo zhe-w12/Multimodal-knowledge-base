@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,6 +14,7 @@ from manufacturing_rag.adapters.ocr import PaddleOCRAdapter
 from manufacturing_rag.adapters.vision import QwenVLAdapter
 from manufacturing_rag.chunking import ETLValidationReport, prepare_chunks
 from manufacturing_rag.config import DEFAULT_CONFIG, RAGConfig
+from manufacturing_rag.debug_log import write_debug_log
 from manufacturing_rag.pdf_quality import chunks_have_unusable_pdf_text, suspicious_pdf_text
 from manufacturing_rag.schemas import DocumentChunk
 
@@ -209,14 +211,18 @@ class MultimodalETLPipeline:
         except ImportError as exc:
             raise RuntimeError("Unstructured is not installed; install the production requirements") from exc
         try:
-            elements = partition(
-                filename=str(path),
-                strategy="auto",
-                extract_image_block_types=["Image", "Table"],
-                extract_image_block_to_payload=True,
-            )
-        except TypeError:
-            elements = partition(filename=str(path), strategy="auto")
+            try:
+                elements = partition(
+                    filename=str(path),
+                    strategy="auto",
+                    extract_image_block_types=["Image", "Table"],
+                    extract_image_block_to_payload=True,
+                )
+            except TypeError:
+                elements = partition(filename=str(path), strategy="auto")
+        except Exception as exc:  # noqa: BLE001 - log the parser stage without document content.
+            self._log_etl_failure(path, "unstructured_partition", exc)
+            raise
         chunks: List[DocumentChunk] = []
         for index, element in enumerate(elements, start=1):
             text = str(element).strip()
@@ -234,11 +240,16 @@ class MultimodalETLPipeline:
                     mime_type = str(metadata.get("image_mime_type") or "image/png")
                     image_suffix = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/bmp": ".bmp", "image/tiff": ".tiff"}.get(mime_type, ".png")
                     image_path = str(persist_image_bytes(image_bytes, image_suffix, self.config))
+                except Exception as exc:  # noqa: BLE001 - image persistence failures must remain visible.
+                    self._log_etl_failure(path, "embedded_image_asset", exc)
+                    raise
+                try:
                     visual_text = self.vision.describe_bytes(
                         image_bytes,
                         mime_type=mime_type,
                     )
-                except (ValueError, RuntimeError):
+                except Exception as exc:  # noqa: BLE001 - image semantics are optional for text ingestion.
+                    self._log_etl_failure(path, "embedded_image_description", exc)
                     visual_text = ""
                 if visual_text:
                     text = f"{text}\n图像语义补全：{visual_text}".strip()
@@ -270,7 +281,11 @@ class MultimodalETLPipeline:
             if not image_path or image_path in seen or not Path(image_path).is_file():
                 continue
             seen.add(image_path)
-            description = self.vision.describe_file(image_path)
+            try:
+                description = self.vision.describe_file(image_path)
+            except Exception as exc:  # noqa: BLE001 - preserve extracted document text if vision is unavailable.
+                self._log_etl_failure(Path(chunk.source), "extracted_image_description", exc)
+                continue
             if not description:
                 continue
             enriched.append(
@@ -287,6 +302,20 @@ class MultimodalETLPipeline:
                 )
             )
         return enriched
+
+    def _log_etl_failure(self, path: Path, stage: str, error: Exception) -> None:
+        status = getattr(error, "code", None)
+        if status is None:
+            match = re.search(r"\bHTTP Error (\d{3})\b", str(error))
+            status = int(match.group(1)) if match else None
+        write_debug_log(
+            self.config,
+            "document_etl_stage_failed",
+            filename=path.name,
+            stage=stage,
+            error_type=type(error).__name__,
+            upstream_status=status,
+        )
 
     def _parse_pdf_fallback(self, path: Path, max_pages: Optional[int] = None) -> List[DocumentChunk]:
         try:
