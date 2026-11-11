@@ -39,7 +39,17 @@
 .admin-loading { display: grid; min-height: 150px; place-items: center; color: #888494; font-size: 13px; }
 .admin-refresh { margin-top: 10px; color: #777284; }
 .admin-upload-status, .admin-job-status { margin: 12px 0; padding: 10px 12px; border-radius: 9px; background: #f7f5fb; color: #655c7c; font-size: 12px; }
-.admin-upload-status.error { color: #a3433c; }
+.admin-upload-status { display: grid; gap: 8px; }
+.admin-upload-status-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #71737e; font-size: 12px; }
+.admin-upload-status-label > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-upload-status-label > span:last-child { flex: none; color: #8986c4; font-variant-numeric: tabular-nums; }
+.admin-upload-status .ant-progress-inner { background: #ececf2; }
+.admin-upload-status .ant-progress-bg { min-height: 6px; border-radius: 99px; background: var(--accent); }
+.admin-upload-status .ant-progress.library-progress-indeterminate .ant-progress-bg { position: relative; width: 34% !important; animation: progress-indeterminate 1.35s ease-in-out infinite; }
+.admin-upload-status.success .ant-progress-bg { background: #54a77b; }
+.admin-upload-status.warning .ant-progress-bg { background: #d2a65d; }
+.admin-upload-status.error { background: #fdf8f7; }
+.admin-upload-status.error .admin-upload-status-label > span:last-child { color: #a3433c; }
 .admin-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .admin-member-search { display: flex; align-items: center; gap: 8px; margin: 10px 0 13px; }
 .admin-member-search .ant-input, .admin-member-search .ant-input-affix-wrapper { min-width: 0; height: 40px; border-radius: 9px; }

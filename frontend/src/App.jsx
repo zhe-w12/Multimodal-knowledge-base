@@ -23,7 +23,6 @@ const API_DEFAULT = import.meta.env.VITE_API_BASE_URL || (
     ? "http://127.0.0.1:8000"
     : `${window.location.protocol}//${window.location.hostname}:3000`
 );
-const ACTIVE_WORKSPACE_KEY = "zhixu-rag-active-workspace-v1";
 const ACTIVE_CONVERSATIONS_KEY = "kujie-rag-active-conversations-v1";
 const SIDEBAR_COLLAPSED_KEY = "kujie-rag-sidebar-collapsed-v1";
 const DEFAULT_WORKSPACE_ID = "campus-default";
@@ -60,7 +59,7 @@ function mapConversation(conversation, messages = []) {
   };
 }
 
-function readActiveConversationId(userId, workspaceId = "scope:all", conversations = []) {
+function readActiveConversationId(userId, workspaceId = "scope:common", conversations = []) {
   const available = conversations.filter((item) => item.workspaceId === workspaceId && hasConversationContent(item));
   try {
     const selected = JSON.parse(localStorage.getItem(userStorageKey(ACTIVE_CONVERSATIONS_KEY, userId)) || "{}");
@@ -155,7 +154,7 @@ function App() {
   const [activeId, setActiveId] = useState(null);
   const [workspaces, setWorkspaces] = useState([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(DEFAULT_WORKSPACE_ID);
-  const [searchScope, setSearchScope] = useState("all");
+  const [searchScope, setSearchScope] = useState("common");
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
   const [question, setQuestion] = useState("");
@@ -199,10 +198,7 @@ function App() {
         const nextWorkspaces = Array.isArray(session.workspaces) ? session.workspaces : [];
         if (authUserIdRef.current !== user.id) {
           authUserIdRef.current = user.id;
-          const savedId = localStorage.getItem(userStorageKey(ACTIVE_WORKSPACE_KEY, user.id));
-          const nextWorkspaceId = nextWorkspaces.some((item) => item.id === savedId)
-            ? savedId
-            : nextWorkspaces.find((item) => item.workspace_type === "general")?.id || nextWorkspaces[0]?.id || DEFAULT_WORKSPACE_ID;
+          const nextWorkspaceId = nextWorkspaces.find((item) => item.workspace_type === "general")?.id || nextWorkspaces[0]?.id || DEFAULT_WORKSPACE_ID;
           let nextConversations = [];
           let historyLoadError = "";
           try {
@@ -213,9 +209,9 @@ function App() {
           }
           setConversations(nextConversations);
           setActiveWorkspaceId(nextWorkspaceId);
-          const selectedConversationId = readActiveConversationId(user.id, "scope:all", nextConversations);
+          const selectedConversationId = readActiveConversationId(user.id, "scope:common", nextConversations);
           setActiveId(selectedConversationId);
-          setSearchScope("all");
+          setSearchScope("common");
           setQuestion("");
           if (selectedConversationId) {
             try {
@@ -246,7 +242,7 @@ function App() {
       setActiveId(null);
       setWorkspaces([]);
       setActiveWorkspaceId(DEFAULT_WORKSPACE_ID);
-      setSearchScope("all");
+      setSearchScope("common");
       setAuthLoading(false);
       return session;
     } catch (error) {
@@ -285,7 +281,7 @@ function App() {
     setActiveId(null);
     setWorkspaces([]);
     setActiveWorkspaceId(DEFAULT_WORKSPACE_ID);
-    setSearchScope("all");
+    setSearchScope("common");
     setQuestion("");
     setStatus({ kind: "idle", text: "" });
     setActiveView("chat");
@@ -371,10 +367,6 @@ function App() {
   const showWelcome = activeView === "chat" && visibleMessages.length === 0;
 
   useEffect(() => {
-    if (authUser) localStorage.setItem(userStorageKey(ACTIVE_WORKSPACE_KEY, authUser.id), activeWorkspaceId);
-  }, [activeWorkspaceId, authUser]);
-
-  useEffect(() => {
     if (!authUser) return;
     try {
       const storageKey = userStorageKey(ACTIVE_CONVERSATIONS_KEY, authUser.id);
@@ -446,13 +438,16 @@ function App() {
 
   const createConversation = useCallback(() => {
     if (busy) return;
+    const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
     setActiveView("chat");
+    setActiveWorkspaceId(generalWorkspaceId);
+    setSearchScope("common");
     setActiveId(null);
     setQuestion("");
     setMobileNav(false);
     setStatus({ kind: "idle", text: "" });
     window.setTimeout(focusComposer, 0);
-  }, [busy, focusComposer]);
+  }, [busy, focusComposer, workspaces]);
 
   const selectConversation = useCallback(async (conversationId) => {
     if (!conversations.some((item) => item.id === conversationId && item.workspaceId === conversationScopeId)) return;
@@ -511,21 +506,6 @@ function App() {
     }
   }
 
-  function selectWorkspace(workspaceId) {
-    if (busy) return;
-    setActiveView("chat");
-    summaryRequestRef.current += 1;
-    setActiveWorkspaceId(workspaceId);
-    setSummary(null);
-    setSearchScope("workspace");
-    setActiveId(readActiveConversationId(authUser?.id, workspaceId, conversations));
-    setQuestion("");
-    setStatus({ kind: "idle", text: "" });
-    setWorkspaceCreateOpen(false);
-    setWorkspaceName("");
-    setMobileNav(false);
-  }
-
   function selectAdminWorkspace(workspaceId) {
     if (busy) return;
     setActiveWorkspaceId(workspaceId);
@@ -534,12 +514,30 @@ function App() {
   }
 
   function selectSearchScope(scope) {
-    if (busy || !["all", "common"].includes(scope)) return;
-    setSearchScope(scope);
+    if (busy || scope !== "common") return;
+    const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
+    setActiveWorkspaceId(generalWorkspaceId);
+    setSearchScope("common");
     setActiveView("chat");
-    setActiveId(readActiveConversationId(authUser?.id, `scope:${scope}`, conversations));
+    setActiveId(readActiveConversationId(authUser?.id, "scope:common", conversations));
     setQuestion("");
+    setSummary(null);
     setStatus({ kind: "idle", text: "" });
+    setWorkspaceCreateOpen(false);
+    setWorkspaceName("");
+    setMobileNav(false);
+  }
+
+  function returnToCommonChat() {
+    const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
+    summaryRequestRef.current += 1;
+    setActiveWorkspaceId(generalWorkspaceId);
+    setSearchScope("common");
+    setActiveId(readActiveConversationId(authUser?.id, "scope:common", conversations));
+    setQuestion("");
+    setSummary(null);
+    setStatus({ kind: "idle", text: "" });
+    setActiveView("chat");
   }
 
   async function createWorkspace(event) {
@@ -839,12 +837,7 @@ function App() {
         <header className="topbar">
           <Button className="mobile-menu" type="text" aria-label="打开侧栏" icon={<PanelLeft size={20} strokeWidth={1.75} />} onClick={() => setMobileNav(true)} />
           {activeView === "admin" ? <div className="topbar-context">工作区管理</div> : <WorkspaceSwitcher
-            workspaces={workspaces}
-            activeWorkspaceId={activeWorkspaceId}
-            searchScope={searchScope}
             busy={busy}
-            defaultWorkspaceId={DEFAULT_WORKSPACE_ID}
-            onSelectWorkspace={selectWorkspace}
             onSelectScope={selectSearchScope}
             onCreateWorkspace={() => { setWorkspaceName(""); setWorkspaceCreateOpen(true); setMobileNav(false); }}
           />}
@@ -863,7 +856,7 @@ function App() {
               activeWorkspaceId={activeWorkspaceId}
               onWorkspaceChange={selectAdminWorkspace}
               onRefreshSession={refreshAuthSession}
-              onReturnToChat={() => setActiveView("chat")}
+              onReturnToChat={returnToCommonChat}
               onUpload={() => fileInput.current?.click()}
               uploadProgress={uploadProgress}
               documentReloadToken={documentListVersion}

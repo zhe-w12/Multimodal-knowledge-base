@@ -18,11 +18,8 @@ const switcherTheme = {
   components: { Button: { defaultShadow: "none", controlHeight: 40 } },
 };
 
-export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searchScope, busy, defaultWorkspaceId, onSelectWorkspace, onSelectScope, onCreateWorkspace }) {
-  const workspace = workspaces.find((item) => item.id === activeWorkspaceId) || workspaces[0];
-  const selectableWorkspaces = workspaces.filter((item) => item.workspace_type !== "general");
-  if (!workspace) return null;
-  const selectedName = searchScope === "all" ? "全部可用资料" : searchScope === "common" ? "通用知识库" : workspace.name;
+export default function WorkspaceSwitcher({ busy, onSelectScope, onCreateWorkspace }) {
+  const selectedName = "通用知识库";
 
   return (
     <ConfigProvider theme={switcherTheme}>
@@ -32,26 +29,15 @@ export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searc
         disabled={busy}
         classNames={{ root: styles.dropdownRoot, menu: styles.dropdownMenu, item: styles.dropdownItem }}
         menu={{
-          selectedKeys: [searchScope === "all" ? "scope-all" : searchScope === "common" ? "scope-common" : activeWorkspaceId],
+          selectedKeys: ["scope-common"],
           items: [
-            { key: "scope-all", label: "全部可用资料", icon: <LibraryBig size={16} /> },
             { key: "scope-common", label: "通用知识库", icon: <LibraryBig size={16} /> },
-            { type: "divider" },
-            ...selectableWorkspaces.map((item) => ({
-              key: item.id,
-              label: <div className={styles.menuItem}>
-                <span className={styles.menuName}>{item.name}</span>
-              </div>,
-              icon: <LibraryBig size={16} />,
-            })),
             { type: "divider" },
             { key: "create", label: "创建授权工作区", icon: <Plus size={16} /> },
           ],
           onClick: ({ key }) => {
             if (key === "create") onCreateWorkspace();
-            else if (key === "scope-all") onSelectScope("all");
             else if (key === "scope-common") onSelectScope("common");
-            else onSelectWorkspace(key);
           },
         }}
       >
@@ -66,4 +52,3 @@ export default function WorkspaceSwitcher({ workspaces, activeWorkspaceId, searc
     </ConfigProvider>
   );
 }
-

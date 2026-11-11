@@ -683,7 +683,18 @@ export default function AdminPortal({
         {workspaceLoading ? <div className="admin-loading">正在读取工作区…</div> : workspaceTab === "documents" ? <>
           <div className="admin-card admin-document-card">
             <div className="admin-card-heading"><div><h2>工作区资料</h2><p>{workspaceSummary?.chunk_count ?? 0} 个知识片段 · {documents.length} 份资料</p></div><Button type="primary" onClick={onUpload}>上传资料</Button></div>
-            {uploadProgress && <div className={`admin-upload-status ${uploadProgress.kind}`}>{uploadProgress.filename} · {uploadProgress.phase}{uploadProgress.detail ? `：${uploadProgress.detail}` : ""}</div>}
+            {uploadProgress && <div className={`admin-upload-status ${uploadProgress.kind || "working"}`} role="status" aria-live="polite">
+              <div className="admin-upload-status-label">
+                <span title={uploadProgress.filename}>{uploadProgress.filename} · {uploadProgress.phase}{uploadProgress.detail ? `：${uploadProgress.detail}` : ""}</span>
+                <span>{uploadProgress.indeterminate ? "处理中" : `${Math.max(0, Math.min(100, Number(uploadProgress.percent) || 0))}%`}</span>
+              </div>
+              <Progress
+                className={uploadProgress.indeterminate ? "library-progress-indeterminate" : ""}
+                percent={uploadProgress.indeterminate ? 34 : Math.max(0, Math.min(100, Number(uploadProgress.percent) || 0))}
+                showInfo={false}
+                status={uploadProgress.kind === "error" ? "exception" : uploadProgress.kind === "success" ? "success" : "active"}
+              />
+            </div>}
             {documents.length ? <div className="admin-document-list">
               {documents.map((item) => <div className="admin-document-row" key={item.source}>
                 <span><FileText size={17} /></span><strong title={item.filename}>{item.filename}</strong><small>{Number(item.size_bytes) ? `${(Number(item.size_bytes) / 1024).toFixed(1)} KB` : ""}</small>
