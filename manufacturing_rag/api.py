@@ -1857,28 +1857,29 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 job.update(updates)
 
     def run_document_delete_job(job_id: str, source: str, workspace_id: str, actor_user_id: str | None) -> None:
-        update_document_delete_job(status="running", progress=5, phase="正在检查资料索引")
         try:
+            update_document_delete_job(job_id, status="running", progress=5, phase="正在检查资料索引")
             chunk_ids = kb_state.document_chunk_ids(source, workspace_id)
             if not chunk_ids:
                 raise HTTPException(status_code=404, detail=f"知识库中不存在资料：{source}")
 
             if config.vector_store_provider == "memory":
-                update_document_delete_job(progress=78, phase="正在更新本地向量索引")
+                update_document_delete_job(job_id, progress=78, phase="正在更新本地向量索引")
             else:
-                update_document_delete_job(progress=12, phase="正在连接本地向量库")
+                update_document_delete_job(job_id, progress=12, phase="正在连接本地向量库")
                 vector_store = MilvusVectorStore(config=config, embedding=HashEmbeddingAdapter(config))
 
                 def report_vector_progress(done: int, total: int) -> None:
                     ratio = done / max(total, 1)
                     update_document_delete_job(
+                        job_id,
                         progress=20 + round(ratio * 62),
                         phase=f"正在删除向量索引（{done}/{total}）",
                     )
 
                 vector_store.delete_chunk_ids(chunk_ids, progress_callback=report_vector_progress)
 
-            update_document_delete_job(progress=88, phase="正在从知识库移除资料")
+            update_document_delete_job(job_id, progress=88, phase="正在从知识库移除资料")
             result = kb_state.delete_document(source, chunk_ids, workspace_id)
             record_audit_event(
                 actor_user_id,
@@ -1888,6 +1889,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 {"source": source, "removed_chunk_count": result["removed_chunk_count"]},
             )
             update_document_delete_job(
+                job_id,
                 status="completed",
                 progress=100,
                 phase="删除完成",
@@ -1899,7 +1901,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             detail = exc.detail if isinstance(exc, HTTPException) else exc
             status_code = exc.status_code if isinstance(exc, HTTPException) else 503
             error = explain_api_error(detail, status_code, type(exc).__name__)["reason"]
-            update_document_delete_job(status="failed", phase="删除失败", error=error)
+            update_document_delete_job(job_id, status="failed", phase="删除失败", error=error)
 
     @app.get("/")
     def root() -> Dict[str, Any]:

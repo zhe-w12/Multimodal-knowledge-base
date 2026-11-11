@@ -27,6 +27,38 @@ def build_client(config=DEFAULT_CONFIG):
     return TestClient(create_app(initial_chunks=chunks, config=config))
 
 
+def test_document_delete_background_job_reaches_completed_status(monkeypatch, tmp_path):
+    source = "delete-job-regression.pdf"
+    chunks = [
+        DocumentChunk(
+            id="delete-job-regression-1",
+            text="用于验证资料删除后台任务可以完成。",
+            source=source,
+            page=1,
+            block_id="delete-1",
+        )
+    ]
+    config = replace(
+        DEFAULT_CONFIG,
+        vector_store_provider="memory",
+        kb_runtime_path=str(tmp_path / "runtime-kb.jsonl"),
+    )
+    monkeypatch.setattr("manufacturing_rag.api.remove_stored_document", lambda *_args, **_kwargs: None)
+    client = TestClient(create_app(initial_chunks=chunks, config=config))
+
+    started = client.post("/kb/documents/delete", json={"source": source})
+    assert started.status_code == 200
+    job_id = started.json()["job_id"]
+
+    completed = client.get(f"/kb/documents/delete/{job_id}")
+
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["progress"] == 100
+    assert completed.json()["phase"] == "删除完成"
+    assert completed.json()["removed_chunk_count"] == 1
+
+
 def test_health_endpoint_reports_kb_count():
     client = build_client()
 

@@ -693,7 +693,7 @@ export default function AdminPortal({
             {documentJob && <div className={`document-delete-progress ${documentJob.status === "failed" ? "failed" : ""}`} role="status" aria-live="polite">
               <div className="document-delete-progress-label">
                 <span>{documentJob.source ? `“${documentJob.source}” · ` : ""}{documentJob.phase || documentJob.status}</span>
-                <span>{isDocumentDeleting && documentProgress === 0 ? "处理中" : `${documentProgress}%`}</span>
+                <span>{documentJob.status === "queued" ? "排队中" : isDocumentDeleting && documentProgress === 0 ? "准备中" : `${documentProgress}%`}</span>
               </div>
               <Progress
                 className={isDocumentDeleting && documentProgress === 0 ? "library-progress-indeterminate" : ""}

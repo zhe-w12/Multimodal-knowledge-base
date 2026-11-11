@@ -194,9 +194,11 @@ class MilvusVectorStore:
         for offset in range(0, total, safe_batch_size):
             batch = ids[offset : offset + safe_batch_size]
             self._delete_existing(collection, batch)
-            collection.flush()
             if progress_callback:
                 progress_callback(min(offset + len(batch), total), total)
+        # Flush once after all delete requests to avoid repeating a synchronous
+        # Milvus round trip for every batch.
+        collection.flush()
         return {"status": "ok", "deleted": total, "collection_name": self.collection_name}
 
     def search(

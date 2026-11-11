@@ -24,6 +24,33 @@ def test_hybrid_candidate_limit_overfetches_and_caps():
     assert hybrid_candidate_limit(30) == 100
 
 
+def test_delete_chunk_ids_flushes_once_after_all_batches(monkeypatch):
+    events = []
+    progress = []
+    collection = SimpleNamespace(
+        delete=lambda expression: events.append(("delete", expression)),
+        flush=lambda: events.append(("flush", None)),
+    )
+    utility = SimpleNamespace(has_collection=lambda *_args, **_kwargs: True)
+    config = RAGConfig(
+        vector_store_provider="milvus",
+        embedding_provider="hash",
+        embedding_dimensions=64,
+    )
+    store = MilvusVectorStore(config=config, embedding=HashEmbeddingAdapter(config))
+    monkeypatch.setattr(store, "_connect_and_import", lambda: (utility, lambda *_args, **_kwargs: collection))
+
+    result = store.delete_chunk_ids(
+        [f"chunk-{index}" for index in range(123)],
+        progress_callback=lambda done, total: progress.append((done, total)),
+        batch_size=50,
+    )
+
+    assert result["deleted"] == 123
+    assert [kind for kind, _ in events] == ["delete", "delete", "delete", "flush"]
+    assert progress == [(50, 123), (100, 123), (123, 123)]
+
+
 def test_authenticated_vector_search_filters_before_dense_and_sparse_recall(monkeypatch):
     config = RAGConfig(
         vector_store_provider="milvus",
