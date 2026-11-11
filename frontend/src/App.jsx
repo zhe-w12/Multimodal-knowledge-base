@@ -438,16 +438,13 @@ function App() {
 
   const createConversation = useCallback(() => {
     if (busy) return;
-    const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
     setActiveView("chat");
-    setActiveWorkspaceId(generalWorkspaceId);
-    setSearchScope("common");
     setActiveId(null);
     setQuestion("");
     setMobileNav(false);
     setStatus({ kind: "idle", text: "" });
     window.setTimeout(focusComposer, 0);
-  }, [busy, focusComposer, workspaces]);
+  }, [busy, focusComposer]);
 
   const selectConversation = useCallback(async (conversationId) => {
     if (!conversations.some((item) => item.id === conversationId && item.workspaceId === conversationScopeId)) return;
