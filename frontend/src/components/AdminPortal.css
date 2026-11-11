@@ -75,19 +75,26 @@
 .admin-registration-row > div { display: grid; gap: 5px; }
 .admin-registration-row strong { color: #4d485e; font-size: 13px; }
 .admin-registration-row span { color: #8b8795; font-size: 12px; }
+.admin-user-card { container-type: inline-size; }
 .admin-user-card > .ant-input-affix-wrapper { height: 40px; border-radius: 9px; }
 .admin-user-list { margin-top: 10px; }
 .admin-user-row { display: grid; grid-template-columns: minmax(120px, 1fr) 145px 150px 95px auto; align-items: center; gap: 8px; min-height: 59px; border-bottom: 1px solid #f0edf3; }
-.admin-user-row .ant-select { width: 100%; }
+.admin-user-row .ant-select { width: 100%; min-width: 0; }
 .admin-user-row > .ant-btn { padding-inline: 6px; color: #777284; font-size: 12px; }
 .admin-user-actions .ant-btn { padding-inline: 6px; color: #777284; font-size: 12px; }
+
+@container (max-width: 760px) {
+  .admin-user-row { grid-template-columns: minmax(0, 1fr) minmax(112px, 132px) minmax(120px, 145px) minmax(78px, 90px); row-gap: 4px; padding: 8px 0; }
+  .admin-user-identity { grid-column: 1; }
+  .admin-user-department { grid-column: 2; }
+  .admin-user-role { grid-column: 3; }
+  .admin-user-status { grid-column: 4; }
+  .admin-user-actions { grid-column: 2 / -1; grid-row: 2; justify-self: end; }
+}
 
 @media (max-width: 860px) {
   .admin-portal { width: min(calc(100% - 36px), 1120px); }
   .admin-grid { grid-template-columns: minmax(0, 1fr); }
-  .admin-user-row { grid-template-columns: minmax(120px, 1fr) 130px 140px; padding: 7px 0; }
-  .admin-user-row .ant-btn { justify-self: start; }
-  .admin-user-actions { grid-column: 2; flex-wrap: wrap; }
 }
 @media (max-width: 560px) {
   .admin-audit-entry-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
@@ -103,6 +110,9 @@
   .admin-member-state { grid-column: 1 / -1; grid-row: 2; white-space: normal; }
   .admin-member-row .ant-select { grid-column: 2; grid-row: 1; width: 105px; }
   .admin-user-row { grid-template-columns: minmax(0, 1fr) 125px; gap: 8px; padding: 10px 0; }
-  .admin-user-row .ant-select:nth-of-type(2), .admin-user-row .ant-select:nth-of-type(3), .admin-user-actions { grid-column: 2; }
+  .admin-user-identity { grid-column: 1; grid-row: 1; }
+  .admin-user-department { grid-column: 2; grid-row: 1; }
+  .admin-user-role, .admin-user-status, .admin-user-actions { grid-column: 2; }
+  .admin-user-actions { grid-row: auto; justify-self: start; flex-wrap: wrap; }
   .admin-registration-row { align-items: flex-start; }
 }

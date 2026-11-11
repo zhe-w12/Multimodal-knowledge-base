@@ -904,14 +904,15 @@ function PlatformPanel({
           {users.map((person) => <div className="admin-user-row" key={person.id}>
             <div className="admin-user-identity"><strong>{person.display_name || person.username}</strong><span>{person.username} · {person.status === "active" ? "启用" : "已停用"}</span></div>
             <Select
+              className="admin-user-department"
               size="small"
               value={person.department_id || "none"}
               disabled={saving || person.status !== "active"}
               onChange={(departmentId) => void onAssignDepartment(person.id, departmentId === "none" ? null : departmentId)}
               options={[{ value: "none", label: "未分配部门" }, ...departments.filter((item) => item.is_active).map((item) => ({ value: item.id, label: item.name }))]}
             />
-            <Select size="small" value={person.platform_role} onChange={(role) => void onChangeRole(person, role)} options={[{ value: "user", label: "普通用户" }, { value: "platform_admin", label: "平台管理员" }]} />
-            <Select size="small" value={person.status} onChange={(status) => void onChangeStatus(person, status)} options={[{ value: "active", label: "启用" }, { value: "suspended", label: "停用" }]} />
+            <Select className="admin-user-role" size="small" value={person.platform_role} onChange={(role) => void onChangeRole(person, role)} options={[{ value: "user", label: "普通用户" }, { value: "platform_admin", label: "平台管理员" }]} />
+            <Select className="admin-user-status" size="small" value={person.status} onChange={(status) => void onChangeStatus(person, status)} options={[{ value: "active", label: "启用" }, { value: "suspended", label: "停用" }]} />
             <div className="admin-user-actions">
               <Button type="text" onClick={() => void onClearLoginLimits(person)}>解除限流</Button>
               <Button type="text" onClick={() => void onRevokeSessions(person)}>退出设备</Button>
