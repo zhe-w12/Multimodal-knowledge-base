@@ -230,10 +230,11 @@ class ManufacturingRAGPipeline:
             if on_status:
                 on_status("正在请 AI 确认缺少的信息…")
             clarification_generator = getattr(self.llm_router, "generate_clarifying_question", None)
-            if callable(clarification_generator):
-                clarification = clarification_generator(question, contexts, sufficiency_reason)
-            else:
-                clarification = build_insufficient_follow_up(question, contexts, sufficiency_reason)
+            if not callable(clarification_generator):
+                raise RuntimeError("当前 AI 模型无法生成澄清问题，请检查模型配置后重试。")
+            clarification = clarification_generator(question, contexts, sufficiency_reason)
+            if not str(clarification or "").strip():
+                raise RuntimeError("AI 未能生成澄清问题，请稍后重试。")
             if on_token:
                 for start in range(0, len(clarification), 24):
                     on_token(clarification[start : start + 24])
@@ -586,32 +587,6 @@ def retrieve_with_query_variants(
 
 
 EducationRAGPipeline = ManufacturingRAGPipeline
-
-
-def build_insufficient_follow_up(question: str, contexts, reason: str) -> str:
-    """Turn an insufficient-evidence result into one useful follow-up question."""
-
-    normalized = " ".join(str(question or "").split()).strip().rstrip("？?。.!！")
-    focus = normalized if len(normalized) <= 40 else normalized[:39].rstrip() + "…"
-    reason_text = str(reason or "")
-
-    if "关键对象" in reason_text:
-        subject = reason_text.split(":", 1)[-1].split("：", 1)[-1].strip().rstrip("。")[:24]
-        if subject:
-            return f"你提到的“{subject}”，具体指哪个课程、章节或题目？"
-    if "具体数据" in reason_text:
-        return "你要核实的是哪项数据？能补充一下年份或适用范围吗？"
-    if any(term in normalized for term in ("学校", "校内", "本校")) and any(term in normalized for term in ("名单", "哪些", "谁")):
-        return "你想查的是哪所学校、哪一年度或哪个项目的名单？"
-    if any(term in normalized for term in ("学校", "校内", "本校", "奖学金", "助学金", "政策")):
-        return "你指的是哪所学校、哪一年度或哪一项政策？"
-    if any(term in normalized for term in ("题", "例题", "作业", "练习")):
-        return f"关于“{focus}”，你能补充课程、章节或具体题目吗？"
-    if contexts:
-        return f"你最想确认“{focus}”中的哪项条件或适用范围？"
-    if focus:
-        return f"关于“{focus}”，你能补充相关课程、章节或具体范围吗？"
-    return "你想查询哪门课程、哪个章节或哪份资料？"
 
 
 def contextualize_question(question: str, conversation_context: str) -> str:
