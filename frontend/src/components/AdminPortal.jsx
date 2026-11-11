@@ -6,7 +6,7 @@ import Modal from "antd/es/modal";
 import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
-import { Archive, ArrowLeft, Building2, ClipboardList, FileText, RefreshCw, Search, Shield, Trash2, Users } from "lucide-react";
+import { Archive, ArrowLeft, Building2, ClipboardList, FileText, RefreshCw, Search, Trash2, Users } from "lucide-react";
 import { apiFetch, apiResponse } from "../api.js";
 import "./AdminPortal.css";
 
@@ -104,11 +104,9 @@ function auditDetails(details) {
 function AuditPanel({ title, entries, total, page, onPageChange, onRefresh, loading, error }) {
   const pageSize = 50;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const start = total ? page * pageSize + 1 : 0;
-  const end = Math.min((page + 1) * pageSize, total);
   return <section className="admin-card admin-audit">
     <div className="admin-card-heading">
-      <div><h2>{title}</h2><p>记录账号、授权与工作区管理操作。</p></div>
+      <div><h2>{title}</h2></div>
       <Button type="text" icon={<RefreshCw size={15} />} onClick={onRefresh}>刷新</Button>
     </div>
     {error && <div className="admin-error" role="alert">{error}</div>}
@@ -122,13 +120,12 @@ function AuditPanel({ title, entries, total, page, onPageChange, onRefresh, load
         {auditDetails(entry.details) && <p>{auditDetails(entry.details)}</p>}
       </article>)}
     </div> : <div className="admin-inline-empty">暂无操作记录。</div>}
-    <div className="admin-audit-pagination">
-      <span>{total ? `显示 ${start}–${end} 条，共 ${total} 条` : "共 0 条"}</span>
+    {pageCount > 1 && <div className="admin-audit-pagination">
       <div>
         <Button size="small" disabled={loading || page <= 0} onClick={() => onPageChange(page - 1)}>上一页</Button>
         <Button size="small" disabled={loading || page + 1 >= pageCount} onClick={() => onPageChange(page + 1)}>下一页</Button>
       </div>
-    </div>
+    </div>}
   </section>;
 }
 
@@ -640,9 +637,7 @@ export default function AdminPortal({
   return <section className="admin-portal" aria-labelledby="admin-heading">
     <header className="admin-header">
       <div>
-        <div className="admin-eyebrow"><Shield size={15} /> 管理端</div>
         <h1 id="admin-heading">{section === "platform" ? "平台管理" : "管理工作区"}</h1>
-        <p>使用当前登录账号管理你有权限的资料和成员。</p>
       </div>
       <Button icon={<ArrowLeft size={16} />} onClick={onReturnToChat}>返回问答</Button>
     </header>
@@ -874,13 +869,13 @@ function PlatformPanel({
     {error && <div className="admin-error" role="alert">{error}</div>}
     {notice && <div className="admin-success" role="status">{notice}</div>}
     <section className="admin-card">
-      <div className="admin-card-heading"><div><h2>用户注册</h2><p>用户可以自行创建账号；关闭注册后，现有账号仍可正常登录。</p></div></div>
-      <div className="admin-registration-row"><div><strong>开放用户注册</strong><span>注册账号默认没有部门或授权工作区权限。</span></div><Switch checked={registrationEnabled} disabled={saving} onChange={onToggleRegistration} /></div>
+      <div className="admin-card-heading"><div><h2>用户注册</h2></div></div>
+      <div className="admin-registration-row"><div><strong>开放用户注册</strong></div><Switch checked={registrationEnabled} disabled={saving} onChange={onToggleRegistration} /></div>
     </section>
 
     <div className="admin-grid">
       <section className="admin-card">
-        <div className="admin-card-heading"><div><h2>部门</h2><p>部门归属由平台管理员统一维护。</p></div></div>
+        <div className="admin-card-heading"><div><h2>部门</h2></div></div>
         <form className="admin-member-search" onSubmit={onCreateDepartment}><Input value={newDepartment} onChange={(event) => setNewDepartment(event.target.value)} maxLength={60} placeholder="新部门名称" /><Button type="primary" htmlType="submit" loading={saving}>添加</Button></form>
         <div className="admin-department-list">
           {departments.map((department) => <div className="admin-department-row" key={department.id}>
@@ -898,7 +893,7 @@ function PlatformPanel({
         </div>
       </section>
       <section className="admin-card admin-user-card">
-        <div className="admin-card-heading"><div><h2>用户管理</h2><p>按账号或显示名称查找；停用会立即撤销所有会话。</p></div></div>
+        <div className="admin-card-heading"><div><h2>用户管理</h2></div></div>
         <Input value={userQuery} onChange={(event) => setUserQuery(event.target.value)} prefix={<Search size={16} />} placeholder="搜索账号或显示名称" aria-label="搜索用户" />
         {loading ? <div className="admin-loading">正在读取用户…</div> : <div className="admin-user-list">
           {users.map((person) => <div className="admin-user-row" key={person.id}>
