@@ -27,3 +27,4 @@ frontend/dist/
 # User-uploaded source materials are kept local
 素材/
 /tmp/document_files/
+/data/auth/

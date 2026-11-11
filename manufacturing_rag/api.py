@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+from manufacturing_rag.auth.routes import router as auth_router
 from manufacturing_rag.adapters.ocr import BaiduOCRAdapter
 from manufacturing_rag.adapters.llm import build_llm_router
 from manufacturing_rag.adapters.embedding import HashEmbeddingAdapter, build_embedding_adapter
@@ -1405,14 +1406,16 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     )
     app.state.kb = kb_state
     app.state.document_delete_jobs = document_delete_jobs
+    app.state.auth_store = None
     cors_origins = parse_cors_origins()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_credentials=False,
+        allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.include_router(auth_router, prefix="/api/auth")
 
     @app.middleware("http")
     async def preserve_error_reason_for_browser(request: Request, call_next):
