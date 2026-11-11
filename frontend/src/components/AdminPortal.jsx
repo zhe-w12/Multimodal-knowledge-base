@@ -3,6 +3,7 @@ import Button from "antd/es/button";
 import Empty from "antd/es/empty";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
+import Progress from "antd/es/progress";
 import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
@@ -162,6 +163,7 @@ export default function AdminPortal({
   const [deleteWorkspaceName, setDeleteWorkspaceName] = useState("");
   const [workspaceDeleting, setWorkspaceDeleting] = useState(false);
   const [documentJob, setDocumentJob] = useState(null);
+  const [deleteDocumentConfirmation, setDeleteDocumentConfirmation] = useState(null);
   const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [departments, setDepartments] = useState([]);
   const [newDepartment, setNewDepartment] = useState("");
@@ -187,6 +189,8 @@ export default function AdminPortal({
   );
   const workspace = manageableWorkspaces.find((item) => item.id === activeWorkspaceId) || manageableWorkspaces[0] || null;
   const canManageAdminRole = Boolean(platformAdmin || workspace?.is_owner);
+  const isDocumentDeleting = Boolean(documentJob && ["queued", "running"].includes(documentJob.status));
+  const documentProgress = Math.max(0, Math.min(100, Number(documentJob?.progress) || 0));
 
   useEffect(() => setOwnerTargetUserId(""), [workspace?.id]);
 
@@ -477,26 +481,36 @@ export default function AdminPortal({
     }
   }
 
-  async function deleteDocument(source) {
-    if (!workspace || documentJob && ["queued", "running"].includes(documentJob.status)) return;
-    if (!window.confirm(`确认从“${workspace.name}”删除“${source}”？`)) return;
+  async function deleteDocument() {
+    const source = deleteDocumentConfirmation;
+    if (!workspace || !source || isDocumentDeleting) return;
+    setDeleteDocumentConfirmation(null);
+    setWorkspaceError("");
+    setDocumentJob({ source, status: "queued", progress: 0, phase: "正在启动删除任务", error: "" });
     try {
       let job = await apiFetch(url(apiBase, "/kb/documents/delete"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source, workspace_id: workspace.id }),
       }, csrfToken).then(apiResponse);
-      setDocumentJob(job);
+      setDocumentJob({ ...job, source });
       while (["queued", "running"].includes(job.status)) {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
         job = await apiFetch(url(apiBase, `/kb/documents/delete/${encodeURIComponent(job.job_id)}`)).then(apiResponse);
-        setDocumentJob(job);
+        setDocumentJob({ ...job, source });
       }
       if (job.status === "failed") throw new Error(job.error || "资料删除失败。");
       await refreshWorkspace();
       setDocumentJob(null);
     } catch (error) {
-      setWorkspaceError(apiError(error, "删除资料失败。"));
+      const detail = apiError(error, "删除资料失败。");
+      setDocumentJob((current) => ({
+        ...current,
+        source,
+        status: "failed",
+        phase: "删除失败",
+        error: detail,
+      }));
     }
   }
 
@@ -673,10 +687,22 @@ export default function AdminPortal({
             {documents.length ? <div className="admin-document-list">
               {documents.map((item) => <div className="admin-document-row" key={item.source}>
                 <span><FileText size={17} /></span><strong title={item.filename}>{item.filename}</strong><small>{Number(item.size_bytes) ? `${(Number(item.size_bytes) / 1024).toFixed(1)} KB` : ""}</small>
-                <Button type="text" danger onClick={() => void deleteDocument(item.source)} disabled={Boolean(documentJob && ["queued", "running"].includes(documentJob.status))}>删除</Button>
+                <Button type="text" danger onClick={() => setDeleteDocumentConfirmation(item.source)} disabled={isDocumentDeleting}>删除</Button>
               </div>)}
             </div> : <div className="admin-inline-empty">这个工作区还没有资料。上传的文档会归属于当前工作区。</div>}
-            {documentJob && <div className="admin-job-status" role="status">{documentJob.phase || documentJob.status} {documentJob.progress ? `· ${documentJob.progress}%` : ""}{documentJob.error ? ` · ${documentJob.error}` : ""}</div>}
+            {documentJob && <div className={`document-delete-progress ${documentJob.status === "failed" ? "failed" : ""}`} role="status" aria-live="polite">
+              <div className="document-delete-progress-label">
+                <span>{documentJob.source ? `“${documentJob.source}” · ` : ""}{documentJob.phase || documentJob.status}</span>
+                <span>{isDocumentDeleting && documentProgress === 0 ? "处理中" : `${documentProgress}%`}</span>
+              </div>
+              <Progress
+                className={isDocumentDeleting && documentProgress === 0 ? "library-progress-indeterminate" : ""}
+                percent={isDocumentDeleting && documentProgress === 0 ? 34 : documentProgress}
+                showInfo={false}
+                status={documentJob.status === "failed" ? "exception" : documentJob.status === "completed" ? "success" : "active"}
+              />
+              {documentJob.error && <small>{documentJob.error}</small>}
+            </div>}
             <Button className="admin-refresh" type="text" icon={<RefreshCw size={15} />} onClick={() => void refreshWorkspace()}>刷新资料</Button>
           </div>
         </> : workspaceTab === "audit" ? <AuditPanel
@@ -834,6 +860,22 @@ export default function AdminPortal({
       <p>请输入工作区名称 <strong>{workspace?.name}</strong> 以确认：</p>
       <Input value={deleteWorkspaceName} onChange={(event) => setDeleteWorkspaceName(event.target.value)} autoComplete="off" />
     </Modal>
+    {deleteDocumentConfirmation && <Modal
+      className="library-confirm-modal"
+      open
+      centered
+      width={460}
+      title="删除这份资料？"
+      onCancel={() => setDeleteDocumentConfirmation(null)}
+      footer={[
+        <Button key="cancel" onClick={() => setDeleteDocumentConfirmation(null)}>取消</Button>,
+        <Button key="delete" danger type="primary" onClick={() => void deleteDocument()}>确认删除</Button>,
+      ]}
+    >
+      <p className="confirm-dialog-description">
+        将从“{workspace?.name}”删除“{deleteDocumentConfirmation}”及对应的知识片段和向量索引。此操作无法撤销。
+      </p>
+    </Modal>}
   </section>;
 }
 

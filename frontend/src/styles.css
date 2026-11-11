@@ -161,7 +161,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .upload-progress.success .ant-progress-bg { background: #54a77b; }
 .upload-progress.warning .ant-progress-bg { background: #d2a65d; }
 .upload-progress.error .ant-progress-bg { background: #c66f66; }
-.upload-progress .ant-progress.library-progress-indeterminate .ant-progress-bg { position: relative; width: 34% !important; animation: progress-indeterminate 1.35s ease-in-out infinite; }
+.upload-progress .ant-progress.library-progress-indeterminate .ant-progress-bg,
+.document-delete-progress .ant-progress.library-progress-indeterminate .ant-progress-bg { position: relative; width: 34% !important; animation: progress-indeterminate 1.35s ease-in-out infinite; }
 .inline-status { position: absolute; bottom: calc(100% + 3px); left: 50%; display: flex; align-items: center; max-width: 90%; gap: 7px; padding: 8px 13px; transform: translateX(-50%); border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 3px 12px #2525380d; color: #71737e; font-size: 12px; white-space: nowrap; animation: fade-in .2s ease both; }
 .inline-status.working > span { color: var(--accent); animation: spin 1.4s linear infinite; }
 .inline-status.error { border-color: #f3dedb; color: #a64e47; }
