@@ -1,25 +1,31 @@
-.document-library-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  font-weight: 650;
-}
-.document-library-title small {
-  color: #858a95;
-  font-size: 13px;
-  font-weight: 450;
+.document-library-page {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+  width: min(calc(100% - 64px), 1000px);
+  min-height: 100%;
+  gap: 18px;
+  margin: 0 auto;
+  padding: 30px 0;
 }
 .document-library-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 12px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #eceef2;
 }
-.document-library-toolbar p {
+.document-library-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.document-library-heading h1 {
   margin: 0;
-  color: #737986;
-  font-size: 13px;
+  color: #343841;
+  font-size: 22px;
+  font-weight: 680;
 }
 .document-library-controls {
   display: flex;
@@ -27,7 +33,8 @@
   gap: 8px;
 }
 .document-library-search {
-  width: min(280px, 30vw);
+  width: min(280px, 26vw);
+  min-width: 0;
 }
 .document-library-size {
   flex-shrink: 0;
@@ -36,13 +43,19 @@
 }
 .document-library-loading {
   display: grid;
-  min-height: 150px;
+  flex: 1;
+  min-height: 180px;
   place-items: center;
 }
 .document-library-list {
-  max-height: min(56vh, 520px);
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 220px;
   overflow: auto;
-  border-top: 1px solid #eceef2;
+}
+.document-library-list > .ant-empty {
+  margin: auto;
 }
 .document-library-row {
   display: flex;
@@ -77,12 +90,20 @@
   font-size: 13px;
 }
 @media (max-width: 560px) {
+  .document-library-page {
+    width: calc(100% - 32px);
+    gap: 14px;
+    padding-block: 20px;
+  }
   .document-library-toolbar {
     align-items: stretch;
     flex-direction: column;
   }
+  .document-library-heading h1 {
+    font-size: 20px;
+  }
   .document-library-controls {
-    align-items: stretch;
+    min-width: 0;
   }
   .document-library-search {
     width: auto;
@@ -91,6 +112,9 @@
   }
   .document-library-row {
     gap: 8px;
+  }
+  .document-library-size {
+    display: none;
   }
   .document-library-actions .ant-btn {
     padding-inline: 6px;

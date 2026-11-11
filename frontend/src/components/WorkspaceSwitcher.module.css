@@ -1,0 +1,124 @@
+.switcher:global(.ant-btn) {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  height: 46px;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 14px 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--ink);
+  text-align: left;
+  box-shadow: none;
+}
+
+.switcher:global(.ant-btn):hover:not(:disabled),
+.switcher:global(.ant-btn):focus-visible:not(:disabled) {
+  border-color: #e9e2f6;
+  background: #faf7ff;
+  color: var(--ink);
+}
+
+.icon {
+  display: grid;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.copy {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.name {
+  max-width: 220px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chevron {
+  flex: none;
+  margin-left: 2px;
+  color: var(--muted);
+}
+
+.menuItem {
+  display: flex;
+  min-width: 150px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.menuName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menuDelete:global(.ant-btn) {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  place-items: center;
+  padding: 0;
+  color: #858a95;
+}
+
+.menuDelete:global(.ant-btn):hover {
+  color: #c43f48 !important;
+  background: #fff1f0 !important;
+}
+
+@media (max-width: 700px) {
+  .switcher:global(.ant-btn) {
+    max-width: calc(100vw - 96px);
+    height: 44px;
+    gap: 7px;
+    padding: 4px 12px 4px 6px;
+    border-radius: 999px;
+  }
+  .icon {
+    flex-basis: 28px;
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+  }
+  .name {
+    max-width: 150px;
+  }
+}
+
+@media (max-width: 430px) {
+  .name {
+    max-width: 112px;
+  }
+}
+
+
+/* Rounded dropdown for the workspace switcher; keeps the pill radius language */
+.dropdownRoot :global(.ant-dropdown-menu),
+.dropdownMenu:global(.ant-dropdown-menu) {
+  padding: 6px;
+  border-radius: 18px;
+}
+.dropdownRoot :global(.ant-dropdown-menu) :global(.ant-dropdown-menu-item),
+.dropdownRoot :global(.ant-dropdown-menu-item),
+.dropdownItem:global(.ant-dropdown-menu-item) {
+  border-radius: 12px;
+}
