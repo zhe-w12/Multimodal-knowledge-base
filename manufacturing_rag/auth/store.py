@@ -653,8 +653,11 @@ class AuthStore:
                     auth_session.revoked_at = now
                     return None
                 auth_session.last_seen_at = now
+                public_user = self.public_user(user)
+                department = db.get(Department, user.department_id) if user.department_id else None
+                public_user["department_name"] = department.name if department else None
                 return Principal(
-                    user=self.public_user(user),
+                    user=public_user,
                     session_id=auth_session.id,
                     token_digest=digest,
                     csrf_token=csrf_token,

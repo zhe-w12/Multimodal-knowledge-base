@@ -992,6 +992,7 @@ function App() {
         <div className="account-summary">
           <strong>{authUser.display_name || authUser.username}</strong>
           <span>@{authUser.username}</span>
+          <span>{authUser.department_name || "未分配部门"}</span>
           {authUser.platform_role === "platform_admin" && <span className="account-admin-badge">平台管理员</span>}
         </div>
         <form className="account-password-form" onSubmit={changePassword}>

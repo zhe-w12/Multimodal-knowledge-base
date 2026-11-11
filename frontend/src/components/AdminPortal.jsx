@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import Button from "antd/es/button";
 import Empty from "antd/es/empty";
 import Input from "antd/es/input";
+import Modal from "antd/es/modal";
 import Select from "antd/es/select";
 import Switch from "antd/es/switch";
 import Tag from "antd/es/tag";
@@ -15,6 +16,12 @@ function url(apiBase, path) {
 
 function apiError(error, fallback) {
   return error?.message || fallback;
+}
+
+function permissionLabel(access) {
+  if (access?.can_manage) return "可管理、可检索";
+  if (access?.can_read) return "可检索";
+  return "无权限";
 }
 
 export default function AdminPortal({
@@ -53,8 +60,11 @@ export default function AdminPortal({
   const [userQuery, setUserQuery] = useState("");
   const [platformUsers, setPlatformUsers] = useState([]);
   const [platformError, setPlatformError] = useState("");
+  const [platformNotice, setPlatformNotice] = useState("");
   const [platformLoading, setPlatformLoading] = useState(false);
   const [platformSaving, setPlatformSaving] = useState(false);
+  const [departmentPreview, setDepartmentPreview] = useState(null);
+  const [ownerTargetUserId, setOwnerTargetUserId] = useState("");
 
   const platformAdmin = user?.platform_role === "platform_admin";
   const manageableWorkspaces = useMemo(
@@ -63,6 +73,8 @@ export default function AdminPortal({
   );
   const workspace = manageableWorkspaces.find((item) => item.id === activeWorkspaceId) || manageableWorkspaces[0] || null;
   const canManageAdminRole = Boolean(platformAdmin || workspace?.is_owner);
+
+  useEffect(() => setOwnerTargetUserId(""), [workspace?.id]);
 
   async function refreshWorkspace() {
     if (!workspace) return;
@@ -139,6 +151,7 @@ export default function AdminPortal({
   }, [apiBase, platformAdmin, section, userQuery]);
 
   async function runWrite(path, method, body, fallback) {
+    setPlatformError("");
     setPlatformSaving(true);
     try {
       const result = await apiFetch(url(apiBase, path), {
@@ -302,13 +315,82 @@ export default function AdminPortal({
     } catch { /* The error is shown in the platform panel. */ }
   }
 
-  async function assignDepartment(userId, departmentId) {
+  async function previewDepartmentChange(userId, departmentId) {
+    setPlatformError("");
+    setPlatformNotice("");
     try {
-      await runWrite(`/api/admin/users/${encodeURIComponent(userId)}/department`, "PATCH", { department_id: departmentId || null }, "分配部门失败。");
+      const preview = await runWrite(
+        `/api/admin/users/${encodeURIComponent(userId)}/department/preview`,
+        "POST",
+        { department_id: departmentId || null },
+        "读取部门变更权限预览失败。",
+      );
+      setDepartmentPreview(preview);
+    } catch { /* The error is shown in the platform panel. */ }
+  }
+
+  async function confirmDepartmentChange() {
+    if (!departmentPreview) return;
+    const { user_id: userId, new_department_id: departmentId } = departmentPreview;
+    try {
+      await runWrite(
+        `/api/admin/users/${encodeURIComponent(userId)}/department`,
+        "PATCH",
+        { department_id: departmentId },
+        "分配部门失败。",
+      );
       const result = await apiFetch(url(apiBase, `/api/auth/admin/users?q=${encodeURIComponent(userQuery.trim())}`)).then(apiResponse);
       setPlatformUsers(Array.isArray(result.users) ? result.users : []);
       await onRefreshSession();
+      setDepartmentPreview(null);
+      setPlatformNotice(`已调整 ${departmentPreview.username} 的部门；个人授权和负责人身份保持不变。`);
     } catch { /* The error is shown in the platform panel. */ }
+  }
+
+  async function updateDepartment(department, updates) {
+    if (updates.is_active === false && !window.confirm(`确认停用部门“${department.name}”？`)) return;
+    try {
+      await runWrite(`/api/admin/departments/${encodeURIComponent(department.id)}`, "PATCH", updates, "更新部门失败。");
+      const result = await apiFetch(url(apiBase, "/api/admin/departments")).then(apiResponse);
+      setDepartments(Array.isArray(result.departments) ? result.departments : []);
+    } catch { /* The error is shown in the platform panel. */ }
+  }
+
+  async function clearLoginLimits(target) {
+    if (!window.confirm(`确认解除账号 ${target.username} 的临时登录限制？`)) return;
+    setPlatformNotice("");
+    try {
+      const result = await runWrite(
+        "/api/auth/admin/login-limits/clear",
+        "POST",
+        { username: target.username, confirm: true },
+        "解除登录限制失败。",
+      );
+      setPlatformNotice(result.removed_bucket_count
+        ? `已清除 ${target.username} 的 ${result.removed_bucket_count} 条临时限流记录。`
+        : `${target.username} 当前没有临时登录限制。`);
+    } catch { /* The error is shown in the platform panel. */ }
+  }
+
+  async function transferOwner(userId) {
+    if (!workspace || !userId || workspace.workspace_type !== "authorized") return;
+    const target = members.find((member) => member.user_id === userId) || memberCandidate;
+    const label = target?.display_name || target?.username || "所选用户";
+    if (!window.confirm(`确认将“${workspace.name}”转交给 ${label}？你会保留本区管理员身份。`)) return;
+    try {
+      await apiFetch(url(apiBase, `/api/workspaces/${encodeURIComponent(workspace.id)}/transfer`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_owner_user_id: userId }),
+      }, csrfToken).then(apiResponse);
+      setOwnerTargetUserId("");
+      setMemberCandidate(null);
+      setMemberMessage("");
+      await onRefreshSession();
+      await refreshWorkspace();
+    } catch (error) {
+      setWorkspaceError(apiError(error, "转交工作区负责人失败。"));
+    }
   }
 
   async function changePlatformRole(target, role) {
@@ -399,7 +481,7 @@ export default function AdminPortal({
           <section className="admin-card">
             <div className="admin-card-heading"><div><h2>个人授权</h2><p>按准确账号添加启用用户。</p></div></div>
             <div className="admin-member-search"><Input value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} onPressEnter={() => void findMember()} placeholder="输入完整账号" aria-label="查找用户账号" /><Button icon={<Search size={16} />} onClick={() => void findMember()}>查找</Button></div>
-            {memberCandidate && <div className="admin-candidate"><div><strong>{memberCandidate.display_name}</strong><span>{memberCandidate.username}</span></div><Button type="primary" onClick={() => void setMemberRole(memberCandidate.user_id, "reader")}>设为阅读者</Button></div>}
+            {memberCandidate && <div className="admin-candidate"><div><strong>{memberCandidate.display_name}</strong><span>{memberCandidate.username}</span></div><div className="admin-candidate-actions"><Button type="primary" onClick={() => void setMemberRole(memberCandidate.user_id, "reader")}>设为阅读者</Button>{canManageAdminRole && <Button onClick={() => void transferOwner(memberCandidate.user_id)}>转交负责人</Button>}</div></div>}
             {memberMessage && <div className="admin-error" role="alert">{memberMessage}</div>}
             <div className="admin-member-list">
               {members.map((member) => <div className="admin-member-row" key={member.user_id}>
@@ -431,7 +513,8 @@ export default function AdminPortal({
               {!departmentOptions.length && <div className="admin-inline-empty">平台管理员尚未建立可授权部门。</div>}
             </div>
           </section>
-        </div> : <form className="admin-card admin-workspace-settings" onSubmit={saveWorkspace}>
+        </div> : <div className="admin-workspace-settings">
+          <form className="admin-card" onSubmit={saveWorkspace}>
           <div className="admin-card-heading"><div><h2>工作区设置</h2><p>{workspace?.workspace_type === "general" ? "通用区由平台管理员维护。" : "工作区创建者自动成为负责人。"}</p></div></div>
           <label>名称</label><Input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} maxLength={50} disabled={workspace?.workspace_type === "general"} />
           <label>说明</label><Input.TextArea value={workspaceDescription} onChange={(event) => setWorkspaceDescription(event.target.value)} maxLength={500} rows={4} disabled={workspace?.workspace_type === "general"} />
@@ -441,7 +524,23 @@ export default function AdminPortal({
               ? <Button type="primary" onClick={() => void restoreWorkspace()}>恢复工作区</Button>
               : workspace.is_owner && <Button danger icon={<Archive size={15} />} onClick={() => void archiveWorkspace()}>归档工作区</Button>}
           </div>}
-        </form>}
+          </form>
+          {workspace?.workspace_type === "authorized" && workspace.status === "active" && (workspace.is_owner || platformAdmin) && <section className="admin-card admin-owner-transfer">
+            <div className="admin-card-heading"><div><h2>转交负责人</h2><p>新负责人须为启用账号；转交后你仍保留本区管理员身份。</p></div></div>
+            <div className="admin-owner-transfer-controls">
+              <Select
+                value={ownerTargetUserId || undefined}
+                onChange={setOwnerTargetUserId}
+                placeholder="选择本区成员"
+                options={members.filter((member) => member.status === "active" && !member.is_owner).map((member) => ({
+                  value: member.user_id,
+                  label: `${member.display_name || member.username}（${member.username}）`,
+                }))}
+              />
+              <Button type="primary" disabled={!ownerTargetUserId} onClick={() => void transferOwner(ownerTargetUserId)}>转交负责人</Button>
+            </div>
+          </section>}
+        </div>}
       </>}
     </> : <PlatformPanel
       invitation={invitation}
@@ -456,14 +555,36 @@ export default function AdminPortal({
       onToggleRegistration={toggleRegistration}
       onResetInvitation={resetInvitation}
       onCreateDepartment={createDepartment}
-      onAssignDepartment={assignDepartment}
+      onUpdateDepartment={updateDepartment}
+      onAssignDepartment={previewDepartmentChange}
       onChangeRole={changePlatformRole}
       onChangeStatus={changeUserStatus}
       onRevokeSessions={revokeSessions}
+      onClearLoginLimits={clearLoginLimits}
       loading={platformLoading}
       saving={platformSaving}
       error={platformError}
+      notice={platformNotice}
     />}
+    <Modal
+      title="部门变更权限预览"
+      open={Boolean(departmentPreview)}
+      confirmLoading={platformSaving}
+      okText="确认调整部门"
+      cancelText="取消"
+      onCancel={() => setDepartmentPreview(null)}
+      onOk={() => void confirmDepartmentChange()}
+    >
+      {departmentPreview && <div className="admin-permission-preview">
+        <p><strong>{departmentPreview.display_name || departmentPreview.username}</strong>：{departmentPreview.current_department_name || "未分配部门"} → {departmentPreview.new_department_name || "未分配部门"}</p>
+        <p>个人授权、禁止规则、管理员和负责人身份保持不变；以下仅列出因部门继承而变化的工作区权限。</p>
+        {departmentPreview.changes?.length ? <ul>
+          {departmentPreview.changes.map((change) => <li key={change.workspace_id}>
+            <strong>{change.workspace_name}</strong>：{permissionLabel(change.before)} → {permissionLabel(change.after)}
+          </li>)}
+        </ul> : <div className="admin-inline-empty">此部门变更不会改变该账号当前的工作区权限。</div>}
+      </div>}
+    </Modal>
   </section>;
 }
 
@@ -480,16 +601,20 @@ function PlatformPanel({
   onToggleRegistration,
   onResetInvitation,
   onCreateDepartment,
+  onUpdateDepartment,
   onAssignDepartment,
   onChangeRole,
   onChangeStatus,
   onRevokeSessions,
+  onClearLoginLimits,
   loading,
   saving,
   error,
+  notice,
 }) {
   return <div className="admin-platform">
     {error && <div className="admin-error" role="alert">{error}</div>}
+    {notice && <div className="admin-success" role="status">{notice}</div>}
     <section className="admin-card">
       <div className="admin-card-heading"><div><h2>注册与邀请码</h2><p>邀请码为 6 位字母或数字，重置后旧码立即失效。</p></div></div>
       <div className="admin-registration-row"><div><strong>开放新用户注册</strong><span>关闭后，现有账号仍可正常登录。</span></div><Switch checked={registrationEnabled} disabled={saving || !invitation?.configured} onChange={onToggleRegistration} /></div>
@@ -502,7 +627,17 @@ function PlatformPanel({
         <div className="admin-card-heading"><div><h2>部门</h2><p>部门归属由平台管理员统一维护。</p></div></div>
         <form className="admin-member-search" onSubmit={onCreateDepartment}><Input value={newDepartment} onChange={(event) => setNewDepartment(event.target.value)} maxLength={60} placeholder="新部门名称" /><Button type="primary" htmlType="submit" loading={saving}>添加</Button></form>
         <div className="admin-department-list">
-          {departments.map((department) => <div className="admin-department-row" key={department.id}><div><strong>{department.name}</strong>{!department.is_active && <Tag>已停用</Tag>}</div><span>{department.active_user_count ?? ""}</span></div>)}
+          {departments.map((department) => <div className="admin-department-row" key={department.id}>
+            <div><strong>{department.name}</strong>{!department.is_active && <Tag>已停用</Tag>}</div>
+            <span>{department.active_user_count ?? 0} 人</span>
+            <div className="admin-department-actions">
+              <Button type="text" size="small" disabled={saving} onClick={() => {
+                const name = window.prompt("修改部门名称", department.name);
+                if (name?.trim() && name.trim() !== department.name) void onUpdateDepartment(department, { name: name.trim() });
+              }}>改名</Button>
+              <Button type="text" size="small" disabled={saving || (department.is_active && department.active_user_count > 0)} danger={department.is_active} onClick={() => void onUpdateDepartment(department, { is_active: !department.is_active })}>{department.is_active ? "停用" : "启用"}</Button>
+            </div>
+          </div>)}
           {!departments.length && <div className="admin-inline-empty">还没有部门。</div>}
         </div>
       </section>
@@ -515,12 +650,16 @@ function PlatformPanel({
             <Select
               size="small"
               value={person.department_id || "none"}
+              disabled={saving || person.status !== "active"}
               onChange={(departmentId) => void onAssignDepartment(person.id, departmentId === "none" ? null : departmentId)}
               options={[{ value: "none", label: "未分配部门" }, ...departments.filter((item) => item.is_active).map((item) => ({ value: item.id, label: item.name }))]}
             />
             <Select size="small" value={person.platform_role} onChange={(role) => void onChangeRole(person, role)} options={[{ value: "user", label: "普通用户" }, { value: "platform_admin", label: "平台管理员" }]} />
             <Select size="small" value={person.status} onChange={(status) => void onChangeStatus(person, status)} options={[{ value: "active", label: "启用" }, { value: "suspended", label: "停用" }]} />
-            <Button type="text" onClick={() => void onRevokeSessions(person)}>退出设备</Button>
+            <div className="admin-user-actions">
+              <Button type="text" onClick={() => void onClearLoginLimits(person)}>解除限流</Button>
+              <Button type="text" onClick={() => void onRevokeSessions(person)}>退出设备</Button>
+            </div>
           </div>)}
           {!users.length && <div className="admin-inline-empty">没有匹配的用户。</div>}
         </div>}

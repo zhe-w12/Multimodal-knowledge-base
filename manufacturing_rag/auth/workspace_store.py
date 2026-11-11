@@ -4,7 +4,7 @@ from functools import wraps
 from typing import Any, Callable, TypeVar
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from manufacturing_rag.auth.models import (
@@ -670,6 +670,15 @@ class WorkspaceStore:
                     "name": department.name,
                     "is_active": department.is_active,
                     "version": department.version,
+                    "active_user_count": int(
+                        db.scalar(
+                            select(func.count(User.id)).where(
+                                User.department_id == department.id,
+                                User.status == "active",
+                            )
+                        )
+                        or 0
+                    ),
                 }
                 for department in departments
             ]
@@ -777,4 +786,81 @@ class WorkspaceStore:
                 "user_id": user.id,
                 "department_id": user.department_id,
                 "permissions_version": user.permissions_version,
+            }
+
+    @_database_operation
+    def preview_user_department(
+        self,
+        actor_user_id: str,
+        user_id: str,
+        department_id: str | None,
+    ) -> dict[str, Any]:
+        self.auth.ensure_schema()
+        with self.auth.Session() as db:
+            actor = self._load_user(db, actor_user_id)
+            if actor.platform_role != "platform_admin":
+                raise WorkspaceForbidden("需要平台管理员权限")
+            user = self._load_user(db, user_id)
+            next_department = None
+            if department_id is not None:
+                next_department = db.get(Department, department_id)
+                if next_department is None:
+                    raise WorkspaceNotFound("部门不存在")
+                if not next_department.is_active:
+                    raise WorkspaceConflict("不能将账号分配到已停用部门")
+            current_department = db.get(Department, user.department_id) if user.department_id else None
+
+            workspaces = db.scalars(select(Workspace).order_by(Workspace.name, Workspace.id)).all()
+            changes = []
+            for workspace in workspaces:
+                before = self._access_in_session(db, user, workspace)
+                direct_role = db.scalar(
+                    select(WorkspaceMembership.role).where(
+                        WorkspaceMembership.workspace_id == workspace.id,
+                        WorkspaceMembership.user_id == user.id,
+                    )
+                )
+                department_granted = False
+                if next_department is not None:
+                    department_granted = bool(
+                        db.scalar(
+                            select(DepartmentWorkspaceGrant.id).where(
+                                DepartmentWorkspaceGrant.department_id == next_department.id,
+                                DepartmentWorkspaceGrant.workspace_id == workspace.id,
+                            )
+                        )
+                    )
+                after = self._access_for(user, workspace, direct_role, department_granted)
+                if (
+                    before["can_read"] != after["can_read"]
+                    or before["can_manage"] != after["can_manage"]
+                    or before["role"] != after["role"]
+                ):
+                    changes.append(
+                        {
+                            "workspace_id": workspace.id,
+                            "workspace_name": workspace.name,
+                            "workspace_status": workspace.status,
+                            "before": {
+                                "role": before["role"],
+                                "can_read": before["can_read"],
+                                "can_manage": before["can_manage"],
+                            },
+                            "after": {
+                                "role": after["role"],
+                                "can_read": after["can_read"],
+                                "can_manage": after["can_manage"],
+                            },
+                        }
+                    )
+            return {
+                "user_id": user.id,
+                "username": user.username,
+                "display_name": user.display_name,
+                "current_department_id": user.department_id,
+                "current_department_name": current_department.name if current_department else None,
+                "new_department_id": next_department.id if next_department else None,
+                "new_department_name": next_department.name if next_department else None,
+                "changes": changes,
+                "direct_permissions_preserved": True,
             }

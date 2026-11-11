@@ -261,3 +261,13 @@ def set_user_department(user_id: str, payload: SetUserDepartmentPayload, request
             principal.user["id"], user_id, payload.department_id
         )
     )
+
+
+@admin_router.post("/users/{user_id}/department/preview")
+def preview_user_department(user_id: str, payload: SetUserDepartmentPayload, request: Request) -> dict[str, Any]:
+    principal = _write_principal(request)
+    return _run(
+        lambda: _workspace_store(request).preview_user_department(
+            principal.user["id"], user_id, payload.department_id
+        )
+    )
