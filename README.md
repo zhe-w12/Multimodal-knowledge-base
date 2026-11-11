@@ -56,6 +56,12 @@ Copy-Item .env.example .env
 
 安装 NLTK 的 `punkt_tab` 和英文词性标注数据，供 Unstructured 解析 Word、PowerPoint 等 Office 文档使用，避免首次解析时尝试从受限的运行时地址下载。
 
+生产环境必须将数据安装到 API 进程的 NLTK 搜索目录。当前面板进程使用 `/home/www/nltk_data`；若通过 root 执行安装，需显式指定：
+
+```bash
+NLTK_DATA=/home/www/nltk_data /www/server/pyporject_evn/versions/3.11.18/bin/python3.11 scripts/install_nltk_data.py
+```
+
 在 `.env` 中分别设置新的 `DEEPSEEK_API_KEY`、`BAILIAN_API_KEY` 和 `BAILIAN_WORKSPACE_ID`。若已有旧 `.env`，将 `.env.example` 中模型配置段合并到本地文件；不要把密钥写入或提交到代码仓库。离线开发可临时使用：
 
 向量库使用本机 Docker Milvus。仅启动向量数据库及其 etcd、MinIO 依赖（无需读取 `.env`）：
