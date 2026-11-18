@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Iterable, List, Optional
 
 from manufacturing_rag.adapters.llm import RuleBasedLLMRouter, build_llm_router
@@ -160,6 +161,14 @@ class ManufacturingRAGPipeline:
             )
 
         retrieval_question = contextualize_question(question, conversation_context)
+        follow_up_resolver = getattr(self.llm_router, "resolve_follow_up_question", None)
+        if retrieval_question != question and callable(follow_up_resolver):
+            try:
+                resolved_question = follow_up_resolver(question, conversation_context)
+            except Exception:  # noqa: BLE001 - local context remains available if the resolver fails.
+                resolved_question = ""
+            if isinstance(resolved_question, str) and resolved_question.strip():
+                retrieval_question = resolved_question.strip()
         entities = self.query_optimizer.extract_entities(retrieval_question)
         query_variants = self.query_optimizer.expand_queries(retrieval_question, intent, entities)
         if not query_variants:
@@ -234,9 +243,9 @@ class ManufacturingRAGPipeline:
                 raise RuntimeError("当前 AI 模型无法生成澄清问题，请检查模型配置后重试。")
             clarification_streamer = getattr(self.llm_router, "generate_clarifying_question_stream", None)
             if on_token and callable(clarification_streamer):
-                clarification = clarification_streamer(question, contexts, sufficiency_reason, on_token)
+                clarification = clarification_streamer(retrieval_question, contexts, sufficiency_reason, on_token)
             else:
-                clarification = clarification_generator(question, contexts, sufficiency_reason)
+                clarification = clarification_generator(retrieval_question, contexts, sufficiency_reason)
                 if on_token:
                     for start in range(0, len(clarification), 24):
                         on_token(clarification[start : start + 24])
@@ -594,16 +603,60 @@ EducationRAGPipeline = ManufacturingRAGPipeline
 
 
 def contextualize_question(question: str, conversation_context: str) -> str:
-    """Resolve short or referential follow-ups with recent session context."""
+    """Keep user goals and supplements without treating assistant questions as constraints."""
 
     if not conversation_context:
         return question
     compact = question.strip()
-    follow_up_markers = (
-        "这个", "这项", "这条", "它", "上述", "前面", "刚才", "那么", "那", "该项", "其中",
-        "还有", "另外", "继续", "展开", "具体说说", "为什么", "怎么改", "如何呢", "第二个", "第一项",
+    reference_pattern = (
+        r"这个|这项|这条|这些|这种|它|上述|前面|刚才|该项|其中|"
+        r"第[一二三四五六七八九十\d]+(?:个|项|条|种)|^(?:那么|那|还有|继续|展开|具体说说)"
     )
-    needs_context = len(compact) <= 14 or any(term in compact for term in follow_up_markers)
-    if not needs_context:
+    follow_up_request_pattern = (
+        r"(?:能否|能不能|能|可以|请|再|帮我|给我|详细|具体|进一步|继续|解释|说明|展开|介绍|总结|说说|"
+        r"一下|一点|吗|呢|为什么|怎么|改|会这样|这样|[？?。！!\s])+"
+    )
+    has_reference = bool(re.search(reference_pattern, compact) or re.fullmatch(follow_up_request_pattern, compact))
+
+    def independent_query(text: str) -> bool:
+        text = text.strip()
+        if re.search(reference_pattern, text) or re.fullmatch(follow_up_request_pattern, text):
+            return False
+        # A named topic with its requested property is already a complete goal,
+        # even when it is phrased as a noun phrase rather than a question.
+        if re.search(r".+的(?:奖金|金额|标准|要求|条件|时间|流程|材料|定义|用途)$", text.rstrip("？?。")):
+            return True
+        question_words = r"是什么|有哪些|是多少|多少钱|什么时候|怎么样|怎么办|多少|多久|何时|几(?:点|天|年|月|次|个)|如何|怎么|为什么|是否|能否|有没有|哪里|哪个|什么|吗|请问|查询|介绍|解释|总结|列出|说明"
+        if not re.search(question_words, text):
+            return False
+        subject = re.sub(question_words + r"|[？?。！!，,\s]|的|呢", "", text)
+        return bool(subject) and subject not in {
+            "奖金", "金额", "标准", "条件", "要求", "时间", "流程", "材料", "区别", "申请", "办理",
+        }
+
+    if independent_query(compact):
         return question
-    return f"会话上下文：{conversation_context}\n当前问题：{question}"
+
+    role_matches = list(re.finditer(r"(?im)^\s*(用户|助手|user|assistant)\s*[:：]\s*", conversation_context))
+    if not role_matches:
+        return f"此前问题：{conversation_context}\n当前补充：{question}"
+    turns = [
+        (
+            match.group(1).lower(),
+            conversation_context[match.end() : role_matches[index + 1].start() if index + 1 < len(role_matches) else len(conversation_context)].strip(),
+        )
+        for index, match in enumerate(role_matches)
+    ]
+    user_turns = [content for role, content in turns if role in {"用户", "user"} and content][-4:]
+    for index in range(len(user_turns) - 1, -1, -1):
+        if independent_query(user_turns[index]):
+            user_turns = user_turns[index:]
+            break
+    if not user_turns:
+        return question
+    result = "此前用户问题：" + "\n用户补充：".join(user_turns) + f"\n当前补充（以此为准）：{question}"
+    if has_reference:
+        previous_answer = next((content for role, content in reversed(turns) if role in {"助手", "assistant"}), "")
+        if previous_answer and not re.search(r"[？?]", previous_answer):
+            result += f"\n指代参考（助手此前回答，仅用于识别指代，不作为用户条件）：{previous_answer}"
+    return result
