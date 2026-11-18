@@ -95,22 +95,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .message-text.assistant-markdown { white-space: normal; }
 .assistant-markdown > :first-child { margin-top: 0; }
 .assistant-markdown > :last-child { margin-bottom: 0; }
-.assistant-markdown p { margin: 0 0 13px; }
-.assistant-markdown h1, .assistant-markdown h2, .assistant-markdown h3, .assistant-markdown h4 { margin: 20px 0 9px; color: #242630; font-weight: 650; line-height: 1.4; }
-.assistant-markdown h1 { font-size: 26px; }
-.assistant-markdown h2 { font-size: 22px; }
-.assistant-markdown h3, .assistant-markdown h4 { font-size: 18px; }
-.assistant-markdown ul, .assistant-markdown ol { margin: 9px 0 15px; padding-left: 1.55em; }
+.assistant-markdown p { margin: 0 0 16px; }
+.assistant-markdown h1, .assistant-markdown h2, .assistant-markdown h3, .assistant-markdown h4 { margin: 26px 0 12px; color: #242630; font-weight: 650; line-height: 1.5; letter-spacing: -.015em; }
+.assistant-markdown h1 { font-size: 22px; }
+.assistant-markdown h2 { padding-bottom: 9px; border-bottom: 1px solid var(--line); font-size: 19px; }
+.assistant-markdown h3, .assistant-markdown h4 { font-size: 17px; }
+.assistant-markdown ul, .assistant-markdown ol { margin: 12px 0 18px; padding-left: 1.55em; }
 .assistant-markdown li { padding-left: 2px; }
-.assistant-markdown li + li { margin-top: 6px; }
-.assistant-markdown blockquote { margin: 12px 0; padding: 3px 0 3px 14px; border-left: 3px solid #d8d6f4; color: #686a75; }
+.assistant-markdown li + li { margin-top: 8px; }
+.assistant-markdown li > p { margin-bottom: 0; }
+.assistant-markdown li::marker { color: #8b7ba8; }
+.assistant-markdown strong { color: var(--ink); font-weight: 650; }
+.assistant-markdown blockquote { margin: 18px 0; padding: 10px 14px; border-left: 3px solid #cbbde9; border-radius: 0 8px 8px 0; background: #f8f6fc; color: #686a75; }
+.assistant-markdown blockquote > :last-child { margin-bottom: 0; }
 .assistant-markdown pre { max-width: 100%; margin: 12px 0 15px; padding: 14px 16px; overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: #f5f2f9; line-height: 1.65; }
 .assistant-markdown code { padding: 2px 5px; border-radius: 5px; background: #f0f0f4; font-family: "Cascadia Code", Consolas, monospace; font-size: .92em; }
 .assistant-markdown pre code { padding: 0; background: transparent; font-size: 14px; }
-.assistant-markdown table { display: block; width: max-content; min-width: min(100%, 520px); max-width: 100%; margin: 14px 0 18px; overflow-x: auto; border: 0; border-collapse: separate; border-spacing: 0; border-radius: 12px; background: #fcfcfe; }
-.assistant-markdown th, .assistant-markdown td { min-width: 90px; padding: 10px 14px; border: 0; border-bottom: 1px solid #eceef3; text-align: left; vertical-align: top; }
-.assistant-markdown th { background: #f5f2f9; color: #635e73; font-size: .94em; font-weight: 600; }
-.assistant-markdown tbody tr:nth-child(even) { background: #fdfbff; }
+.markdown-table-wrap { width: 100%; max-width: 100%; margin: 18px 0 22px; overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+.assistant-markdown table { width: 100%; min-width: 480px; margin: 0; border: 0; border-collapse: separate; border-spacing: 0; background: #fff; font-size: 14px; line-height: 1.75; }
+.assistant-markdown th, .assistant-markdown td { min-width: 110px; padding: 12px 16px; border: 0; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.assistant-markdown th:first-child, .assistant-markdown td:first-child { width: 22%; min-width: 140px; }
+.assistant-markdown th { background: #f5f2f9; color: #635e73; font-size: 13px; font-weight: 650; }
+.assistant-markdown tbody tr:nth-child(even) { background: #faf9fd; }
 .assistant-markdown tbody tr:last-child td { border-bottom: 0; }
 .assistant-markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .assistant-markdown hr { margin: 17px 0; border: 0; border-top: 1px solid var(--line); }
@@ -283,7 +289,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 }
 
 .conversation-stage { background: var(--canvas); overscroll-behavior: contain; }
-.message-list.ant-bubble-list { width: min(calc(100% - 2 * var(--gutter)), calc(942px - 2 * var(--gutter))); }
+.message-list.ant-bubble-list { width: min(calc(100% - 32px), calc(1038px - 2 * var(--gutter))); }
+.message-list .assistant-bubble .ant-bubble-body { flex: 1; min-width: 0; }
 .message-list .ant-bubble-list-scroll-box { padding-top: 36px; }
 .message-list .ant-bubble-list-scroll-content { gap: 32px; }
 .message-text { color: var(--ink); font-size: 15px; line-height: 1.8; }
