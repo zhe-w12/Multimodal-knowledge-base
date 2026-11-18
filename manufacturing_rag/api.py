@@ -237,6 +237,13 @@ def explain_api_error(detail: Any, status_code: int, error_type: str = "") -> Di
         code = "INVALID_REQUEST"
         reason = f"请求参数不符合接口要求：{technical_detail}"
         suggestion = "请检查必填字段、字段类型以及输入内容是否为空。"
+    elif status_code == 404 and technical_detail == "对话不存在":
+        code = "CONVERSATION_NOT_FOUND"
+        reason = "该对话已删除或不可访问。"
+        suggestion = "请刷新对话列表或新建对话。"
+    elif status_code == 404 and technical_detail not in {"", "Not Found"}:
+        code = "RESOURCE_NOT_FOUND"
+        suggestion = "请刷新列表后重试，确认该资源仍然存在且有权访问。"
     elif status_code == 404:
         code = "API_NOT_FOUND"
         reason = "请求的后端接口不存在，通常是 API 地址填写错误或前后端版本不一致。"

@@ -11,7 +11,7 @@ import AuthScreen from "./components/AuthScreen.jsx";
 import AdminPortal from "./components/AdminPortal.jsx";
 import WorkspaceSwitcher from "./components/WorkspaceSwitcher.jsx";
 import DocumentLibrary from "./components/DocumentLibrary.jsx";
-import { apiFetch, apiResponse } from "./api.js";
+import { apiFetch, apiResponse, deleteConversationRequest } from "./api.js";
 
 const MarkdownRenderer = lazy(() => import("./MarkdownRenderer.jsx"));
 const ConfidenceSlider = lazy(() => import("antd/es/slider"));
@@ -183,6 +183,7 @@ function App() {
   const scrollIdleTimerRef = useRef(null);
   const authUserIdRef = useRef(null);
   const activeAnswerControllerRef = useRef(null);
+  const deletingConversationRef = useRef(false);
   const closeMobileNav = useCallback(() => setMobileNav(false), []);
 
   const refreshAuthSession = useCallback(async () => {
@@ -603,18 +604,18 @@ function App() {
   }
 
   async function confirmDeletion() {
-    if (!deleteConfirmation) return;
+    if (!deleteConfirmation || busy || deletingConversationRef.current) return;
+    deletingConversationRef.current = true;
     const conversationId = deleteConfirmation.conversationId;
     setBusy(true);
     try {
-      await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`), {
-        method: "DELETE",
-      }, csrfToken).then(parseResponse);
+      await deleteConversationRequest(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`), csrfToken);
       setDeleteConfirmation(null);
       removeConversation(conversationId);
     } catch (error) {
       setStatus({ kind: "error", text: error.message || "删除对话失败" });
     } finally {
+      deletingConversationRef.current = false;
       setBusy(false);
     }
   }
@@ -1058,10 +1059,12 @@ function App() {
         centered
         width={460}
         title="删除这段对话？"
-        onCancel={() => setDeleteConfirmation(null)}
+        onCancel={() => { if (!busy) setDeleteConfirmation(null); }}
+        closable={!busy}
+        maskClosable={!busy}
         footer={[
-          <Button key="cancel" onClick={() => setDeleteConfirmation(null)}>取消</Button>,
-          <Button key="delete" danger type="primary" onClick={confirmDeletion}>确认删除</Button>,
+          <Button key="cancel" disabled={busy} onClick={() => setDeleteConfirmation(null)}>取消</Button>,
+          <Button key="delete" danger type="primary" loading={busy} disabled={busy} onClick={confirmDeletion}>确认删除</Button>,
         ]}
       >
         {deleteConfirmation && <p className="confirm-dialog-description">
