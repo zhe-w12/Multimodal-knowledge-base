@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Callable, Iterable, List, Optional
 
 from manufacturing_rag.adapters.llm import RuleBasedLLMRouter, build_llm_router
@@ -20,7 +21,7 @@ from manufacturing_rag.adapters.retriever import (
 from manufacturing_rag.adapters.vector_store import MilvusVectorStore
 from manufacturing_rag.config import DEFAULT_CONFIG, RAGConfig
 from manufacturing_rag.debug_log import retrieval_results_for_debug, write_debug_log
-from manufacturing_rag.query import split_terms
+from manufacturing_rag.query import RuleBasedQueryProcessor, split_terms
 from manufacturing_rag.schemas import (
     DocumentChunk,
     EntityExtractionResult,
@@ -360,7 +361,16 @@ class ManufacturingRAGPipeline:
     def classify_intent(self, question: str, conversation_context: str = "") -> IntentResult:
         """Classify the user's message before choosing chat or RAG processing."""
 
-        return self.query_optimizer.classify_intent(question, conversation_context)
+        intent = self.query_optimizer.classify_intent(question, conversation_context)
+        if intent.allowed and intent.category == "chit_chat":
+            local = RuleBasedQueryProcessor().classify_intent(question)
+            asks_for_information = re.search(
+                r"什么|是啥|为何|为什么|怎么|如何|哪些|哪类|解释|介绍|定义|含义|区别|条件|标准|流程|多少|能否|是否",
+                question,
+            )
+            if local.allowed and local.category != "chit_chat" and asks_for_information:
+                intent = replace(intent, category=local.category, reason="知识查询优先检索，避免将术语或概念问题误分为闲聊")
+        return intent
 
 
 def filter_low_quality_contexts(question: str, contexts):

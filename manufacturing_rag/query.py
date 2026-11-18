@@ -155,7 +155,7 @@ def split_terms(text: str) -> List[str]:
     normalized = normalize_text(text)
     lower = normalized.lower()
     terms: List[str] = []
-    terms.extend(re.findall(r"[a-zA-Z]+[-_]?[a-zA-Z0-9]*|\d+(?:\.\d+)?(?:分|页|课时|学分|%)?", lower))
+    terms.extend(re.findall(r"\d+[a-zA-Z][a-zA-Z0-9_-]*|[a-zA-Z]+[-_]?[a-zA-Z0-9]*|\d+(?:\.\d+)?(?:分|页|课时|学分|%)?", lower))
     for term in LEARNING_TERMS + ASSIGNMENT_TERMS + EXAM_TERMS + POLICY_TERMS + LEARNING_NODES:
         if term.lower() in lower:
             terms.append(term.lower())
