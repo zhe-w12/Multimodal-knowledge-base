@@ -162,6 +162,7 @@ function App() {
   const [status, setStatus] = useState({ kind: "idle", text: "" });
   const [uploadProgress, setUploadProgress] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [answering, setAnswering] = useState(false);
   const [documentListVersion, setDocumentListVersion] = useState(0);
   const [isConversationScrolling, setIsConversationScrolling] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -632,6 +633,7 @@ function App() {
     const answerId = makeId();
     setQuestion("");
     setBusy(true);
+    setAnswering(true);
     setStatus({ kind: "working", text: "正在识别问题类型…" });
     const answerController = new AbortController();
     activeAnswerControllerRef.current = answerController;
@@ -754,6 +756,7 @@ function App() {
       }
     } finally {
       if (activeAnswerControllerRef.current === answerController) activeAnswerControllerRef.current = null;
+      setAnswering(false);
       setBusy(false);
     }
   }
@@ -900,7 +903,7 @@ function App() {
                 items={visibleMessages.map(makeBubbleItem)}
                 autoScroll={false}
               />
-              {busy && !visibleMessages.some((message) => message.pending) && !uploadProgress && <div className="thinking"><span /><span /><span />正在思考</div>}
+              {answering && !visibleMessages.some((message) => message.pending) && <div className="thinking"><span /><span /><span />正在思考</div>}
             </>
           )}
         </section>
@@ -934,7 +937,7 @@ function App() {
             submitType="enter"
             autoSize={{ minRows: 1, maxRows: 6 }}
             disabled={busy}
-            suffix={<Button className="send-button" type="primary" shape="circle" aria-label="发送问题" disabled={!question.trim() || busy} icon={busy ? <Suspense fallback={<SendOutlined />}><DeferredSpin size="small" /></Suspense> : <SendOutlined />} onClick={() => void submitQuestion(null, question)} />}
+            suffix={<Button className="send-button" type="primary" shape="circle" aria-label={answering ? "正在生成回答" : "发送问题"} disabled={!question.trim() || busy} icon={answering ? <Suspense fallback={<SendOutlined />}><DeferredSpin size="small" /></Suspense> : <SendOutlined />} onClick={() => void submitQuestion(null, question)} />}
           />
         </div>}
       </main>
