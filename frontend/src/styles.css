@@ -124,20 +124,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .message-error .message-text { color: #a94c48; }
 .answer-review-note { margin: 12px 0; padding: 9px 12px; border: 1px solid #efe4c8; border-radius: 10px; background: #fffbf3; color: #806b45; font-size: 13px; line-height: 1.6; }
 .cursor-blink { display: inline-block; width: 6px; height: 14px; margin-left: 2px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(2, start) infinite; }
-.sources-block { margin-top: 18px; }
-.sources-heading { display: flex; align-items: center; width: max-content; gap: 7px; color: #676975; font-size: 12px; font-weight: 600; cursor: pointer; list-style: none; user-select: none; }
+.sources-block { margin-top: 18px; padding-top: 14px; border-top: 1px solid #f0edf5; }
+.sources-heading { display: inline-flex; align-items: center; width: max-content; max-width: 100%; min-height: 32px; gap: 7px; padding: 5px 10px; border: 1px solid #e9e2f3; border-radius: 9px; background: #f7f4fc; color: #78688f; font-size: 12px; font-weight: 500; line-height: 1.5; cursor: pointer; list-style: none; user-select: none; transition: background .16s, border-color .16s, color .16s; }
+.sources-heading:hover { border-color: #d9cdec; background: #f0eafa; color: var(--accent); }
 .sources-heading::-webkit-details-marker { display: none; }
-.sources-heading:focus-visible { outline: 2px solid #5338c566; outline-offset: 3px; border-radius: 4px; }
-.sources-heading > span { color: #8582c6; font-size: 14px; }
-.sources-heading small { display: grid; width: 17px; height: 17px; place-items: center; border-radius: 50%; background: #f0eff8; color: #77738c; font-size: 10px; }
-.sources-chevron { margin-left: 2px; color: #999ba4; font-size: 11px; transition: transform .16s; }
+.sources-heading:focus-visible { outline: 2px solid #5338c566; outline-offset: 3px; }
+.sources-heading .sources-label { color: inherit; font-size: inherit; }
+.sources-heading > svg { flex: none; }
+.sources-heading small { display: grid; min-width: 18px; height: 18px; padding: 0 4px; place-items: center; border-radius: 6px; background: #eae3f5; color: #77618f; font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.sources-chevron { margin-left: 1px; color: #9a8aa9; transition: transform .16s; }
+.sources-block[open] .sources-heading { border-color: #dbcfed; background: #f0eafa; color: var(--accent); }
 .sources-block[open] .sources-chevron { transform: rotate(180deg); }
-.source-list { display: flex; flex-wrap: wrap; gap: 7px; }
-.sources-block[open] .source-list { margin-top: 9px; }
-.source-card { display: flex; align-items: center; max-width: 100%; min-height: 30px; gap: 8px; padding: 4px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
-.source-number { display: grid; width: 17px; height: 17px; place-items: center; border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: 10px; }
-.source-name { max-width: 280px; overflow: hidden; color: #666874; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.source-page { color: #999ba4; font-size: 11px; white-space: nowrap; }
+.source-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 8px; }
+.sources-block[open] .source-list { margin-top: 10px; }
+.source-card { display: flex; align-items: center; min-width: 0; max-width: 100%; min-height: 36px; gap: 8px; padding: 8px 10px; border: 1px solid #eeeaf4; border-radius: 8px; background: #faf9fd; }
+.source-number { display: grid; flex: none; width: 19px; height: 19px; place-items: center; border-radius: 6px; background: #eee8f8; color: #77618f; font-size: 10px; }
+.source-name { flex: 1; min-width: 0; overflow: hidden; color: #71677e; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.source-page { flex: none; padding: 2px 6px; border-radius: 5px; background: #f0ecf6; color: #756386; font-size: 10px; white-space: nowrap; }
 .thinking { display: flex; align-items: center; gap: 5px; width: min(calc(100% - 2 * var(--gutter)), calc(942px - 2 * var(--gutter))); margin: 0 auto 12px; padding-left: 40px; color: #999ba4; font-size: 12px; }
 .thinking span { width: 5px; height: 5px; border-radius: 50%; background: #8986c4; animation: pulse 1s ease-in-out infinite; }
 .thinking span:nth-child(2) { animation-delay: .15s; }

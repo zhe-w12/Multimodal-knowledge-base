@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import Bubble from "@ant-design/x/es/bubble/index.js";
 import Sender from "@ant-design/x/es/sender/index.js";
 import { SettingOutlined, UploadOutlined, SendOutlined } from "@ant-design/icons";
-import { PanelLeft } from "lucide-react";
+import { BookOpen, ChevronDown, PanelLeft } from "lucide-react";
 import Button from "antd/es/button";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
@@ -1092,8 +1092,8 @@ function MessageContent({ message }) {
       )}
       {sources.length > 0 && (
         <details className="sources-block">
-          <summary className="sources-heading"><span>▤</span> 参考资料 <small>{sources.length}</small><span className="sources-chevron">⌄</span></summary>
-          <div className="source-list">{sources.map((source, index) => <div className="source-card" key={`${source.document_id || sourceTitle(source)}-${index}`}><span className="source-number">{index + 1}</span><span className="source-name">{sourceTitle(source)}</span>{source.page && <span className="source-page">第 {source.page} 页</span>}</div>)}</div>
+          <summary className="sources-heading" aria-label={`参考资料，共 ${sources.length} 条`}><BookOpen size={14} strokeWidth={1.7} aria-hidden="true" /><span className="sources-label">参考资料</span><small>{sources.length}</small><ChevronDown size={13} strokeWidth={1.7} className="sources-chevron" aria-hidden="true" /></summary>
+          <div className="source-list">{sources.map((source, index) => <div className="source-card" key={`${source.document_id || sourceTitle(source)}-${index}`}><span className="source-number">{index + 1}</span><span className="source-name" title={sourceTitle(source)}>{sourceTitle(source)}</span>{source.page && <span className="source-page">第 {source.page} 页</span>}</div>)}</div>
         </details>
       )}
     </div>
