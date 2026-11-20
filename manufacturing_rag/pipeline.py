@@ -6,6 +6,13 @@ import re
 from dataclasses import replace
 from typing import Callable, Iterable, List, Optional
 
+from manufacturing_rag.agent_runtime import (
+    AgentExecutionInterrupted,
+    AgentRuntime,
+    FinalValidation,
+    ToolRegistry,
+)
+from manufacturing_rag.agent_tools import build_knowledge_tools
 from manufacturing_rag.adapters.llm import RuleBasedLLMRouter, build_llm_router
 from manufacturing_rag.adapters.embedding import HashEmbeddingAdapter, build_embedding_adapter
 from manufacturing_rag.adapters.ocr import OCRStructuredLoader
@@ -111,7 +118,18 @@ class ManufacturingRAGPipeline:
         hallucination_threshold: float = 0.75,
         on_status: Optional[Callable[[str], None]] = None,
         classified_intent: Optional[IntentResult] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> RAGResponse:
+        if self.config.agent_loop_enabled and callable(getattr(self.llm_router, "decide_agent_action", None)):
+            return self._answer_with_agent(
+                question,
+                conversation_context=conversation_context,
+                rerank_rules=rerank_rules,
+                on_token=on_token,
+                hallucination_threshold=hallucination_threshold,
+                on_status=on_status,
+                cancel_check=cancel_check,
+            )
         if on_status and classified_intent is None:
             on_status("正在识别问题类型…")
         intent = classified_intent or self.classify_intent(question, conversation_context)
@@ -358,6 +376,201 @@ class ManufacturingRAGPipeline:
             notices=notices,
         )
 
+    def search_knowledge(self, query: str, rerank_rules: Optional[dict] = None):
+        """Run one explicit query using this pipeline's already scoped retriever."""
+
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return []
+        entities = RuleBasedQueryProcessor().extract_entities(clean_query)
+        candidates = retrieve_with_query_variants(
+            self.retriever,
+            [clean_query],
+            entities,
+            limit=self.config.candidate_k,
+            rrf_k=self.config.rrf_k,
+        )
+        if isinstance(self.retriever, MilvusHybridRetriever):
+            candidates = filter_unanchored_candidates(
+                clean_query,
+                entities,
+                candidates,
+                active_chunks=self.chunks,
+            )
+        reranked = self.reranker.rerank(
+            clean_query,
+            candidates,
+            top_k=max(self.config.top_k, len(candidates)),
+            threshold=0.0,
+        )
+        contexts = apply_configurable_rerank_rules(reranked, rerank_rules)
+        contexts = [result for result in contexts if result.score >= self.config.rerank_threshold]
+        contexts = contexts[: self.config.top_k]
+        for rank, result in enumerate(contexts, start=1):
+            result.rank = rank
+        contexts = filter_low_quality_contexts(clean_query, contexts)
+        self.cache_retrieved_contexts(contexts)
+        return expand_parent_contexts(contexts)
+
+    def _answer_with_agent(
+        self,
+        question: str,
+        *,
+        conversation_context: str,
+        rerank_rules: Optional[dict],
+        on_token: Optional[Callable[[str], None]],
+        hallucination_threshold: float,
+        on_status: Optional[Callable[[str], None]],
+        cancel_check: Optional[Callable[[], bool]],
+    ) -> RAGResponse:
+        intent = RuleBasedQueryProcessor().classify_intent(question)
+        safety = self.safety_guard.assess_question(question)
+        entities = RuleBasedQueryProcessor().extract_entities(question)
+        if not safety.allowed:
+            return RAGResponse(
+                question=question,
+                answer="该请求未通过学科文档问答安全审核，无法继续处理。",
+                intent=intent,
+                safety=safety,
+                entities=entities,
+                hallucination_check=HallucinationCheck(True, [], 1.0),
+                notices=[safety.reason],
+            )
+
+        tool_definitions, tool_state = build_knowledge_tools(self, rerank_rules=rerank_rules)
+        registry = ToolRegistry(tool_definitions)
+        model = self.llm_router
+        runtime = AgentRuntime(
+            model=model,
+            tools=registry,
+            system_prompt=str(getattr(model, "agent_system_prompt", "")),
+            request_timeout_seconds=self.config.agent_request_timeout_seconds,
+        )
+        safe_threshold = min(0.95, max(0.0, float(hallucination_threshold)))
+        accepted_check = HallucinationCheck(True, [], 1.0)
+        accepted_safety = safety
+
+        def validate_final(answer: str, run_state) -> FinalValidation:
+            nonlocal accepted_check, accepted_safety
+            redacted_answer = self.safety_guard.redact(answer)
+            post_safety = self.safety_guard.post_audit(redacted_answer)
+            if not post_safety.allowed:
+                return FinalValidation(False, feedback="最终回复触发安全发布校验，请删除敏感或受限内容后重新处理。")
+
+            source_texts = source_texts_for_validation(tool_state.evidence.values())
+            if not source_texts:
+                if (
+                    not tool_state.search_queries
+                    and run_state.final_response_type == "conversation"
+                    and not RuleBasedLLMRouter.technical_number_pattern.search(redacted_answer)
+                ):
+                    accepted_safety = post_safety
+                    accepted_check = HallucinationCheck(True, [], 1.0)
+                    return FinalValidation(True, answer=redacted_answer)
+                if (
+                    not tool_state.search_queries
+                    and intent.category == "chit_chat"
+                    and run_state.final_response_type == "unspecified"
+                ):
+                    accepted_safety = post_safety
+                    accepted_check = HallucinationCheck(True, [], 1.0)
+                    return FinalValidation(True, answer=redacted_answer)
+                if (
+                    tool_state.search_queries
+                    and all(status == "empty" for status in tool_state.search_statuses)
+                    and run_state.final_response_type in {"limitation", "unspecified"}
+                ):
+                    if is_knowledge_gap_response(redacted_answer):
+                        accepted_safety = post_safety
+                        accepted_check = HallucinationCheck(True, [], 0.9)
+                        return FinalValidation(True, answer=redacted_answer)
+                feedback = (
+                    "当前回复没有资料证据。知识库事实必须先调用 search_knowledge；"
+                    "若检索无结果，只能简要说明资料未找到并停止提供实体结论。"
+                )
+                return FinalValidation(False, feedback=feedback)
+
+            # Numeric evidence is a hard gate. A relaxed display threshold cannot
+            # turn a failed local quantity check into an accepted publication.
+            local_check = RuleBasedLLMRouter.hallucination_check(self.llm_router, redacted_answer, source_texts)
+            if not local_check.passed:
+                return FinalValidation(False, feedback="；".join(local_check.issues) or "答案包含未被资料支持的信息。")
+            if on_status:
+                on_status("正在核对主 Agent 回复与资料…")
+            remote_check = self.llm_router.hallucination_check(redacted_answer, source_texts)
+            if not remote_check.passed or remote_check.confidence < safe_threshold:
+                issues = "；".join(remote_check.issues) or "来源核验未通过或置信度不足。"
+                return FinalValidation(False, feedback=issues)
+
+            accepted_safety = post_safety
+            accepted_check = remote_check
+            return FinalValidation(True, answer=redacted_answer)
+
+        try:
+            if on_status:
+                on_status("主 Agent 正在接收问题…")
+            result = runtime.run(
+                question,
+                conversation_context,
+                validate_final=validate_final,
+                on_status=on_status,
+                cancel_check=cancel_check,
+            )
+        except AgentExecutionInterrupted as exc:
+            if exc.code == "cancelled":
+                raise
+            return RAGResponse(
+                question=question,
+                answer="本次处理超过服务运行时限，已停止继续调用。你可以缩小问题范围后重试。",
+                intent=intent,
+                safety=safety,
+                entities=entities,
+                hallucination_check=HallucinationCheck(False, [exc.code], 0.0),
+                notices=["Agent 请求因服务运行时限中断"],
+            )
+
+        sources = [result.to_source_ref() for result in tool_state.evidence.values()]
+        optimized_query = tool_state.search_queries[-1] if tool_state.search_queries else ""
+        for observation in result.state.observations:
+            meta = observation.get("meta") if isinstance(observation.get("meta"), dict) else {}
+            error = observation.get("error") if isinstance(observation.get("error"), dict) else {}
+            write_debug_log(
+                self.config,
+                "agent_tool_result",
+                tool_name=str(observation.get("tool_name") or "unknown"),
+                status=str(observation.get("status") or "unknown"),
+                elapsed_ms=int(meta.get("elapsed_ms") or 0),
+                error_code=str(error.get("code") or ""),
+                repeat_count=int(meta.get("repeat_count") or 1),
+                new_evidence_count=int(meta.get("new_evidence_count") or 0),
+            )
+        notices = ["主 Agent 自主决定工具调用与回复"]
+        if result.awaiting_user:
+            notices.append("主 Agent 等待用户补充信息")
+        elif sources:
+            notices.append(f"答案已完成资料校验（置信度 {accepted_check.confidence:.0%}）")
+        elif result.state.final_response_type == "conversation" or intent.category == "chit_chat":
+            notices.append("普通交互由主 Agent 直接回复")
+        if accepted_safety.reason and accepted_safety.reason != safety.reason:
+            notices.append(accepted_safety.reason)
+        if on_token and result.answer:
+            # The Agent answer is released only after the publication gate accepts it.
+            for start in range(0, len(result.answer), 36):
+                on_token(result.answer[start : start + 36])
+        return RAGResponse(
+            question=question,
+            answer=result.answer,
+            intent=intent,
+            safety=accepted_safety,
+            optimized_query=optimized_query,
+            query_variants=list(dict.fromkeys(tool_state.search_queries)),
+            entities=entities,
+            sources=sources,
+            retrieval_confidence=max((source.score or 0.0 for source in sources), default=0.0),
+            hallucination_check=accepted_check,
+            notices=notices,
+        )
+
     def classify_intent(self, question: str, conversation_context: str = "") -> IntentResult:
         """Classify the user's message before choosing chat or RAG processing."""
 
@@ -442,6 +655,30 @@ def source_texts_for_validation(contexts: Iterable[object]) -> List[str]:
             labels.append(f"块：{chunk.block_id}")
         source_texts.append(" | ".join(labels) + "\n" + chunk.text)
     return source_texts
+
+
+def is_knowledge_gap_response(answer: str) -> bool:
+    """Accept a concise no-result statement without letting it carry factual claims."""
+
+    text = re.sub(r"[\s*_`#>\-]", "", str(answer or ""))
+    if len(text) > 260 or re.search(r"\d|[%￥$]", text):
+        return False
+    has_gap_statement = any(
+        marker in text
+        for marker in (
+            "知识库中未检索到",
+            "知识库里未检索到",
+            "资料中未检索到",
+            "当前资料未找到",
+            "现有资料未找到",
+            "未找到相关资料",
+            "没有找到相关资料",
+            "暂未找到相关资料",
+            "无法从资料中确认",
+        )
+    )
+    factual_claim = any(marker in text for marker in ("是指", "包括", "规定", "要求", "标准为", "金额为", "条件为"))
+    return has_gap_statement and not factual_claim
 
 
 def apply_hallucination_threshold(

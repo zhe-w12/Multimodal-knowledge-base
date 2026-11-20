@@ -660,7 +660,7 @@ function App() {
       updateMessages(conversationId, (items) => [
         ...items,
         { id: makeId(), role: "user", text },
-        { id: answerId, role: "assistant", text: "", sources: [], notices: [], pending: true, status: "正在识别问题类型…" },
+        { id: answerId, role: "assistant", text: "", sources: [], notices: [], pending: true, status: "主 Agent 正在思考…" },
       ]);
       const response = await apiFetch(joinApi(apiBase, "/answer/stream"), {
         method: "POST",

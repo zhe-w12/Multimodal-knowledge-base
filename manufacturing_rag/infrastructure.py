@@ -110,6 +110,13 @@ class RuntimeInfrastructure:
                 self._redis_error = str(exc)
         self.persist_conversation(response, session_id=session_id)
 
+    def remember_response(self, response: RAGResponse, session_id: Optional[str] = None) -> None:
+        """Persist conversation context without using the legacy answer cache."""
+
+        if session_id:
+            self._remember_session_turn(session_id, response.question, response.answer)
+        self.persist_conversation(response, session_id=session_id)
+
     def _remember_session_turn(self, session_id: str, question: str, answer: str) -> None:
         self._remember_session_history(
             session_id,

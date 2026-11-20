@@ -1,4 +1,7 @@
+import json
+
 from manufacturing_rag.adapters.llm import (
+    DeepSeekClient,
     DeepSeekLLMRouter,
     RuleBasedLLMRouter,
     answer_is_grounded_by_sources,
@@ -61,3 +64,48 @@ def test_deepseek_router_sends_simple_answer_to_configured_llm(monkeypatch):
 
     assert calls["count"] == 1
     assert result.startswith("奖学金制度用于鼓励学生发展")
+
+
+def test_deepseek_client_preserves_native_tool_call_and_provider_reasoning(monkeypatch):
+    response_message = {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "provider state",
+        "tool_calls": [{
+            "id": "call-search",
+            "type": "function",
+            "function": {"name": "search_knowledge", "arguments": "{\"query\":\"5A\"}"},
+        }],
+    }
+    observed = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": response_message}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        observed["payload"] = json.loads(request.data.decode("utf-8"))
+        observed["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    client = DeepSeekClient("unused-test-key", "deepseek-v4-flash", "https://example.test/chat/completions", 45)
+    message = client.complete_with_tools(
+        messages=[{"role": "user", "content": "问题"}],
+        tools=[{"type": "function", "function": {"name": "search_knowledge"}}],
+        temperature=0,
+        max_tokens=100,
+        enable_thinking=True,
+        timeout_seconds=7,
+    )
+
+    assert message == response_message
+    assert observed["payload"]["tool_choice"] == "auto"
+    assert observed["payload"]["thinking"] == {"type": "enabled"}
+    assert observed["timeout"] == 7

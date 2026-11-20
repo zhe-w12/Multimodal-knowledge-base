@@ -65,6 +65,17 @@ FRONTEND_DIST_DIR = FRONTEND_SOURCE_DIR / "dist"
 FRONTEND_DIR = FRONTEND_DIST_DIR
 MAX_PDF_UPLOAD_BYTES = 10 * 1024 * 1024
 DOCUMENT_FILES_DIR = PROJECT_ROOT / "tmp" / "document_files"
+AGENT_TOOL_PROVIDERS = {
+    "deepseek", "bailian", "dashscope", "aliyun", "openai-compatible", "openai_compatible", "auto",
+}
+
+
+def agent_loop_active(config: RAGConfig) -> bool:
+    if not config.agent_loop_enabled or config.llm_provider not in AGENT_TOOL_PROVIDERS:
+        return False
+    if config.llm_provider == "auto":
+        return bool(os.getenv(config.llm_api_key_env, "").strip())
+    return True
 
 
 def safe_document_filename(source: str) -> str:
@@ -442,6 +453,7 @@ class KnowledgeBaseState:
         principal_user_id: Optional[str] = None,
         permission_cache_scope: Optional[str] = None,
         strict_workspace_metadata: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> RAGResponse:
         with self._lock:
             if workspace_ids is None:
@@ -458,6 +470,21 @@ class KnowledgeBaseState:
         scoped_session_id = workspace_session_id(scope_key, session_id)
         stored_context = self.infrastructure.get_session_context(scoped_session_id)
         session_context = str(conversation_context or "").strip()[-4000:] or stored_context
+        agent_enabled = self._config.agent_loop_enabled and callable(
+            getattr(pipeline.llm_router, "decide_agent_action", None)
+        )
+        if agent_enabled:
+            response = pipeline.answer(
+                question,
+                conversation_context=session_context,
+                rerank_rules=rerank_rules or {"boost_terms": [], "exclude_terms": []},
+                on_token=on_token,
+                hallucination_threshold=hallucination_threshold,
+                on_status=on_status,
+                cancel_check=cancel_check,
+            )
+            self.infrastructure.remember_response(response, session_id=scoped_session_id)
+            return response
         if on_status:
             on_status("正在识别问题类型…")
         intent = pipeline.classify_intent(question, session_context)
@@ -489,6 +516,7 @@ class KnowledgeBaseState:
             hallucination_threshold=safe_threshold,
             on_status=on_status,
             classified_intent=intent,
+            cancel_check=cancel_check,
         )
         self.infrastructure.cache_answer(response, knowledge_version, session_id=scoped_session_id, cache_basis=cache_basis)
         return response
@@ -1928,6 +1956,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         infrastructure_status = kb_state.infrastructure.status()
+        agent_mode = agent_loop_active(config)
         return HealthResponse(
             status="ok",
             service="education-rag-api",
@@ -1942,8 +1971,8 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             vector_collection_name=config.zilliz_collection_name,
             strict_source_required=config.strict_source_required,
             default_kb_path=str(DEFAULT_KB_PATH),
-            query_classifier=f"{config.query_classifier_provider}:{config.query_classifier_model}",
-            query_agent=config.query_agent_provider,
+            query_classifier="主 Agent 自主决策" if agent_mode else f"{config.query_classifier_provider}:{config.query_classifier_model}",
+            query_agent="主 Agent 原生工具循环" if agent_mode else config.query_agent_provider,
             redis_status=str(infrastructure_status["redis"]),
             mysql_status=str(infrastructure_status["mysql"]),
         )
@@ -1987,16 +2016,22 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             if conversation_context is None:
                 raise HTTPException(status_code=403, detail="资料权限已变更，请新建对话")
             session_id = authenticated_session_id(scope["user_id"], conversation_id)
-        response = await run_in_threadpool(
-            kb_state.answer,
-            payload.question.strip(),
-            session_id,
-            payload.rerank_rules.dict(),
-            conversation_context=conversation_context,
-            hallucination_threshold=payload.hallucination_threshold,
-            workspace_id=payload.workspace_id,
-            **answer_options,
-        )
+        cancel_event = Event()
+        try:
+            response = await run_in_threadpool(
+                kb_state.answer,
+                payload.question.strip(),
+                session_id,
+                payload.rerank_rules.dict(),
+                conversation_context=conversation_context,
+                hallucination_threshold=payload.hallucination_threshold,
+                workspace_id=payload.workspace_id,
+                cancel_check=cancel_event.is_set,
+                **answer_options,
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
         change = await answer_scope_change(http_request)
         if change == "session_revoked":
             raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
@@ -2064,10 +2099,13 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             session_id = authenticated_session_id(scope["user_id"], conversation_id)
 
         async def events() -> AsyncIterator[str]:
-            yield sse_event("status", {"stage": "intent", "message": "正在识别问题类型…"})
+            use_agent_loop = agent_loop_active(config)
+            initial_status = "主 Agent 正在思考…" if use_agent_loop else "正在识别问题类型…"
+            yield sse_event("status", {"stage": "agent" if use_agent_loop else "intent", "message": initial_status})
             event_queue: Queue[tuple[str, Dict[str, Any]]] = Queue()
             streamed = False
             stop_stream = Event()
+            cancel_event = Event()
 
             def enqueue_token(token: str) -> None:
                 if token and not stop_stream.is_set():
@@ -2088,6 +2126,7 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     hallucination_threshold=payload.hallucination_threshold,
                     on_status=enqueue_status,
                     workspace_id=payload.workspace_id,
+                    cancel_check=cancel_event.is_set,
                     **answer_options,
                 )
             )
@@ -2095,10 +2134,17 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
             last_permission_check = loop.time()
             try:
                 while not worker.done() or not event_queue.empty():
+                    if await http_request.is_disconnected():
+                        cancel_event.set()
+                        stop_stream.set()
+                        worker.cancel()
+                        await asyncio.gather(worker, return_exceptions=True)
+                        return
                     if scope is not None and loop.time() - last_permission_check >= 2.0:
                         last_permission_check = loop.time()
                         change = await answer_scope_change(http_request)
                         if change:
+                            cancel_event.set()
                             stop_stream.set()
                             while not event_queue.empty():
                                 try:
@@ -2122,6 +2168,11 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                 if change:
                     yield sse_event(change, {"message": "登录状态或资料权限已变更"})
                     return
+            except asyncio.CancelledError:
+                cancel_event.set()
+                stop_stream.set()
+                worker.cancel()
+                raise
             except Exception as exc:  # noqa: BLE001 - keep failures visible in an SSE stream.
                 error = explain_api_error(exc, 500, type(exc).__name__)
                 write_debug_log(

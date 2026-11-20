@@ -12,12 +12,13 @@ PDF / Word / PPT / Image
   → BM25 + Qwen3-VL 多模态稠密向量
   → RRF 统一融合 + MMR 去重
   → Qwen3-VL Rerank 精排
-  → BERT 意图/难度分类 + LangChain Agent 查询改写、多 Query 扩展与拆解
-  → 来源约束生成与幻觉检查
+  → 主 Agent 自主选择检索、原文阅读、用户补充或直接回复
+  → 工具结果与异常回到主 Agent，由模型决定下一步
+  → 来源、安全和数值发布校验
   → FastAPI / SSE → React
 ```
 
-DeepSeek 主模型通过 `https://api.deepseek.com/chat/completions` 调用，密钥单独放在 `DEEPSEEK_API_KEY`；Qwen3-VL Embedding、Rerank 和图片描述通过百炼北京业务空间调用，使用 `BAILIAN_API_KEY` 与 `BAILIAN_WORKSPACE_ID`。所有密钥只从本地 `.env` 读取。运行前请先轮换在聊天中粘贴过的 API Key，再填入新密钥；仓库不包含真实密钥。图片素材保存在 `tmp/assets`，知识片段保存在 `RAG_KB_RUNTIME_PATH`。新模型使用独立的 Milvus 集合 `education_multimodal_qwen3_vl`，避免和旧向量空间混用。
+DeepSeek 主模型通过 `https://api.deepseek.com/chat/completions` 的原生工具调用驱动主 Agent。主 Agent 可按需调用当前授权知识库的检索、原文读取和用户补充工具；没有固定业务调用轮数，服务以 `RAG_AGENT_REQUEST_TIMEOUT_SECONDS`（默认 180 秒）控制单次请求时限。`RAG_AGENT_LOOP_ENABLED=false` 可回退到旧问答链路。密钥单独放在 `DEEPSEEK_API_KEY`；Qwen3-VL Embedding、Rerank 和图片描述通过百炼北京业务空间调用，使用 `BAILIAN_API_KEY` 与 `BAILIAN_WORKSPACE_ID`。所有密钥只从本地 `.env` 读取；仓库不包含真实密钥。图片素材保存在 `tmp/assets`，知识片段保存在 `RAG_KB_RUNTIME_PATH`。新模型使用独立的 Milvus 集合 `education_multimodal_qwen3_vl`，避免和旧向量空间混用。
 
 ## 目录结构
 
@@ -27,7 +28,9 @@ manufacturing_rag/
     embedding.py         # 百炼 Qwen3-VL 多模态向量
     retriever.py         # BM25、多路融合、MMR、Milvus 候选融合
     rerank.py            # 百炼 Qwen3-VL 精排
-    query_optimizer.py   # BERT + LangChain Agent 自适应查询
+    query_optimizer.py   # 旧链路的 BERT/LangChain 查询优化
+  agent_runtime.py      # 主 Agent 工具循环、观察结果与发布校验
+  agent_tools.py        # 授权知识检索、原文读取和用户补充工具
     ocr.py               # PaddleOCR 与百度 OCR 兼容适配
     vision.py            # Qwen3-VL Plus 图表/图片语义补全
     vector_store.py      # 本地 Docker Milvus 向量存储
@@ -86,6 +89,7 @@ $env:RAG_RERANK_PROVIDER='rule'
 $env:RAG_LLM_PROVIDER='rule'
 $env:RAG_QUERY_CLASSIFIER_PROVIDER='rule'
 $env:RAG_QUERY_AGENT_PROVIDER='rule'
+$env:RAG_AGENT_LOOP_ENABLED='false'
 $env:RAG_VECTOR_STORE_PROVIDER='memory'
 $env:RAG_REDIS_ENABLED='false'
 $env:RAG_MYSQL_ENABLED='false'

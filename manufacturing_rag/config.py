@@ -64,6 +64,8 @@ class RAGConfig:
     llm_max_tokens: int = 1200
     llm_enable_thinking: bool = False
     llm_fallback_enabled: bool = True
+    agent_loop_enabled: bool = True
+    agent_request_timeout_seconds: float = 180.0
     embedding_provider: str = "bailian"
     embedding_model: str = "qwen3-vl-embedding"
     embedding_device: str = "cpu"
@@ -242,6 +244,8 @@ def config_from_env() -> RAGConfig:
         llm_max_tokens=_env_int("RAG_LLM_MAX_TOKENS", 1200),
         llm_enable_thinking=_env_bool("RAG_LLM_ENABLE_THINKING", False),
         llm_fallback_enabled=_env_bool("RAG_LLM_FALLBACK_ENABLED", True),
+        agent_loop_enabled=_env_bool("RAG_AGENT_LOOP_ENABLED", True),
+        agent_request_timeout_seconds=_env_float("RAG_AGENT_REQUEST_TIMEOUT_SECONDS", 180.0),
         embedding_provider=_env_str("RAG_EMBEDDING_PROVIDER", "bailian").lower(),
         embedding_model=_env_str("RAG_EMBEDDING_MODEL", _env_str("BAILIAN_EMBEDDING_MODEL", "qwen3-vl-embedding")),
         embedding_device=_env_str("RAG_EMBEDDING_DEVICE", "cpu"),
