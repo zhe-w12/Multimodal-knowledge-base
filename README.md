@@ -18,6 +18,14 @@ PDF / Word / PPT / Image
   → FastAPI / SSE → React
 ```
 
+## 文档图文预处理
+
+- PDF 保留正文和表格文本；检测到扫描图片、图表或矢量图形的页面时，会额外渲染页面，并把页面正文、PaddleOCR 识别出的图中文字及 Qwen3-VL 对图形关系的描述合并到同一个可检索片段。Unstructured 提取出的独立图片块也会单独保留，避免空文本图片块被过滤。
+- DOCX 提取正文中的内嵌图片，并关联图片所在段落、相邻段落和替代文字；PPTX 提取图片、图表系列数据及幻灯片文字，将文字和版面位置一起提供给视觉分析。只有文字和连接线构成的流程图、图表，也会生成带位置关系的检索文本。
+- PNG、JPEG 等独立图片会把 OCR 文字、视觉描述和原图引用放进同一个片段，供文本检索和多模态向量共同使用。图片素材保存在知识库运行目录旁的 `assets/` 中。
+- 表格 HTML 会保留行列分隔，便于检索时区分单元格。视觉模型无法确认的内容会标记为待复核；图中文字过小、遮挡或图片质量较差时，仍应对照原图核实。
+- 当前额外的内嵌图片预处理针对 DOCX/PPTX；旧版 DOC/PPT 继续使用 Unstructured 的常规解析。若 Unstructured 无法启动，DOCX/PPTX 会退回本地解析器提取基础文字并标记待复核，图片仍继续走 OCR 和视觉分析。PDF 整页视觉分析会按页面逐页处理，导入大型 PDF 时可通过上传参数 `max_pages` 限制页数。
+
 DeepSeek 主模型通过 `https://api.deepseek.com/chat/completions` 的原生工具调用驱动主 Agent。主 Agent 可按需调用当前授权知识库的检索、原文读取和用户补充工具；没有固定业务调用轮数，服务以 `RAG_AGENT_REQUEST_TIMEOUT_SECONDS`（默认 180 秒）控制单次请求时限。`RAG_AGENT_LOOP_ENABLED=false` 可回退到旧问答链路。密钥单独放在 `DEEPSEEK_API_KEY`；Qwen3-VL Embedding、Rerank 和图片描述通过百炼北京业务空间调用，使用 `BAILIAN_API_KEY` 与 `BAILIAN_WORKSPACE_ID`。所有密钥只从本地 `.env` 读取；仓库不包含真实密钥。图片素材保存在 `tmp/assets`，知识片段保存在 `RAG_KB_RUNTIME_PATH`。新模型使用独立的 Milvus 集合 `education_multimodal_qwen3_vl`，避免和旧向量空间混用。
 
 ## 主 Agent 工具
