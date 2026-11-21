@@ -45,9 +45,11 @@
 .conversations :global(.ant-conversations-item):hover { background: #eee9f5; }
 .conversations :global(.ant-conversations-item-active), .conversations :global(.ant-conversations-item-active):hover { background: #eae2fa; color: var(--accent); }
 .conversations :global(.ant-conversations-label) { min-width: 0; }
-.conversationTitle:global(.ant-btn) { display: block; width: 100%; min-height: 42px; padding: 4px 7px; overflow: hidden; border-radius: 8px; background: transparent; color: inherit; font-size: 13px; font-weight: 400; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.conversationTitle:global(.ant-btn) { position: relative; display: block; width: 100%; min-height: 42px; padding: 4px 23px 4px 7px; overflow: hidden; border-radius: 8px; background: transparent; color: inherit; font-size: 13px; font-weight: 400; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .conversationTitle:global(.ant-btn):hover:not(:disabled) { background: transparent; color: var(--ink); }
 .conversationLock { margin-left: 6px; vertical-align: -2px; color: #c94e58; }
+.answeringIndicator { position: absolute; top: 50%; right: 9px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px #6a49d91c; transform: translateY(-50%); animation: answer-pulse 1.5s ease-in-out infinite; }
+@keyframes answer-pulse { 50% { box-shadow: 0 0 0 5px #6a49d900; opacity: .55; } }
 .conversations :global(.ant-conversations-item-active) .conversationTitle { color: var(--accent); font-weight: 600; }
 .menuTrigger:global(.ant-btn) { display: grid; width: 30px; height: 34px; min-width: 30px; flex: none; place-items: center; padding: 0; color: var(--muted); opacity: 0; pointer-events: none; }
 .conversations :global(.ant-conversations-item):is(:hover, :focus-within) .menuTrigger { opacity: 1; pointer-events: auto; }

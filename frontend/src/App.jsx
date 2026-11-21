@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import Bubble from "@ant-design/x/es/bubble/index.js";
 import Sender from "@ant-design/x/es/sender/index.js";
 import { SettingOutlined, UploadOutlined, SendOutlined } from "@ant-design/icons";
-import { BookOpen, ChevronDown, PanelLeft } from "lucide-react";
+import { BookOpen, ChevronDown, PanelLeft, Square } from "lucide-react";
 import Button from "antd/es/button";
 import Input from "antd/es/input";
 import Modal from "antd/es/modal";
@@ -16,7 +16,6 @@ import { apiFetch, apiResponse, deleteConversationRequest } from "./api.js";
 const MarkdownRenderer = lazy(() => import("./MarkdownRenderer.jsx"));
 const ConfidenceSlider = lazy(() => import("antd/es/slider"));
 const DeferredProgress = lazy(() => import("antd/es/progress"));
-const DeferredSpin = lazy(() => import("antd/es/spin"));
 
 const API_DEFAULT = import.meta.env.VITE_API_BASE_URL || (
   ["localhost", "127.0.0.1"].includes(window.location.hostname)
@@ -162,7 +161,6 @@ function App() {
   const [status, setStatus] = useState({ kind: "idle", text: "" });
   const [uploadProgress, setUploadProgress] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [answering, setAnswering] = useState(false);
   const [documentListVersion, setDocumentListVersion] = useState(0);
   const [isConversationScrolling, setIsConversationScrolling] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -183,9 +181,18 @@ function App() {
   const summaryRequestRef = useRef(0);
   const scrollIdleTimerRef = useRef(null);
   const authUserIdRef = useRef(null);
-  const activeAnswerControllerRef = useRef(null);
+  const activeAnswerJobsRef = useRef(new Map());
+  const answerQueuesRef = useRef(new Map());
+  const conversationCreationRef = useRef(false);
+  const navigationRevisionRef = useRef(0);
   const deletingConversationRef = useRef(false);
   const closeMobileNav = useCallback(() => setMobileNav(false), []);
+
+  function abortAllAnswers() {
+    activeAnswerJobsRef.current.forEach((job) => job.controller.abort());
+    activeAnswerJobsRef.current.clear();
+    answerQueuesRef.current.clear();
+  }
 
   const refreshAuthSession = useCallback(async () => {
     setAuthError("");
@@ -199,6 +206,7 @@ function App() {
         const user = session.user;
         const nextWorkspaces = Array.isArray(session.workspaces) ? session.workspaces : [];
         if (authUserIdRef.current !== user.id) {
+          if (authUserIdRef.current) abortAllAnswers();
           authUserIdRef.current = user.id;
           const nextWorkspaceId = nextWorkspaces.find((item) => item.workspace_type === "general")?.id || nextWorkspaces[0]?.id || DEFAULT_WORKSPACE_ID;
           let nextConversations = [];
@@ -236,7 +244,7 @@ function App() {
         setAuthLoading(false);
         return session;
       }
-      if (authUserIdRef.current) activeAnswerControllerRef.current?.abort();
+      if (authUserIdRef.current) abortAllAnswers();
       authUserIdRef.current = null;
       setAuthUser(null);
       setCsrfToken("");
@@ -276,6 +284,7 @@ function App() {
   }
 
   function clearLocalSession() {
+    abortAllAnswers();
     authUserIdRef.current = null;
     setAuthUser(null);
     setCsrfToken("");
@@ -295,7 +304,7 @@ function App() {
   }
 
   async function logout() {
-    activeAnswerControllerRef.current?.abort();
+    abortAllAnswers();
     try {
       if (authUser) {
         await apiFetch(joinApi(apiBase, "/api/auth/logout"), { method: "POST" }, csrfToken).then(parseResponse);
@@ -310,7 +319,7 @@ function App() {
     setAccountError("");
     try {
       await apiFetch(joinApi(apiBase, "/api/auth/logout-all"), { method: "POST" }, csrfToken).then(parseResponse);
-      activeAnswerControllerRef.current?.abort();
+      abortAllAnswers();
       clearLocalSession();
     } catch (error) {
       setAccountError(error.message || "退出其他设备失败。");
@@ -338,7 +347,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
       }, csrfToken).then(parseResponse);
-      activeAnswerControllerRef.current?.abort();
+      abortAllAnswers();
       clearLocalSession();
     } catch (error) {
       setAccountError(error.message || "修改密码失败。");
@@ -366,6 +375,7 @@ function App() {
   const activeWorkspace = workspaces.find((item) => item.id === activeWorkspaceId) || null;
   const messages = activeConversation?.messages || [];
   const visibleMessages = messages.filter((message) => !message.fileProgress);
+  const activeConversationAnswering = visibleMessages.some((message) => message.role === "assistant" && message.pending);
   const showWelcome = activeView === "chat" && visibleMessages.length === 0;
 
   useEffect(() => {
@@ -440,6 +450,7 @@ function App() {
 
   const createConversation = useCallback(() => {
     if (busy) return;
+    navigationRevisionRef.current += 1;
     setActiveView("chat");
     setActiveId(null);
     setQuestion("");
@@ -449,21 +460,34 @@ function App() {
   }, [busy, focusComposer]);
 
   const selectConversation = useCallback(async (conversationId) => {
-    if (!conversations.some((item) => item.id === conversationId && item.workspaceId === conversationScopeId)) return;
+    const existing = conversations.find((item) => item.id === conversationId && item.workspaceId === conversationScopeId);
+    if (!existing) return;
+    const navigationRevision = ++navigationRevisionRef.current;
     setActiveView("chat");
     setQuestion("");
     setMobileNav(false);
+    setActiveId(conversationId);
+    if (existing.messages?.some((message) => message.pending)) {
+      setStatus({ kind: "idle", text: "" });
+      return;
+    }
     setStatus({ kind: "working", text: "正在读取对话…" });
     try {
       const result = await apiFetch(joinApi(apiBase, `/api/conversations/${encodeURIComponent(conversationId)}`)).then(parseResponse);
       const conversation = mapConversation(result.conversation, result.conversation?.messages || []);
-      setConversations((items) => items.map((item) => item.id === conversationId ? conversation : item));
-      setActiveId(conversationId);
-      setStatus(conversation.status === "locked"
-        ? { kind: "error", text: "这段对话引用的资料权限已变更，请新建对话继续提问。" }
-        : { kind: "idle", text: "" });
+      setConversations((items) => items.map((item) => item.id === conversationId
+        ? item.messages?.some((message) => message.pending) ? item : conversation
+        : item,
+      ));
+      if (navigationRevisionRef.current === navigationRevision) {
+        setStatus(conversation.status === "locked"
+          ? { kind: "error", text: "这段对话引用的资料权限已变更，请新建对话继续提问。" }
+          : { kind: "idle", text: "" });
+      }
     } catch (error) {
-      setStatus({ kind: "error", text: error.message || "暂时无法读取这段对话" });
+      if (navigationRevisionRef.current === navigationRevision) {
+        setStatus({ kind: "error", text: error.message || "暂时无法读取这段对话" });
+      }
     }
   }, [apiBase, conversations, conversationScopeId]);
 
@@ -507,6 +531,7 @@ function App() {
 
   function selectAdminWorkspace(workspaceId) {
     if (busy) return;
+    navigationRevisionRef.current += 1;
     setActiveWorkspaceId(workspaceId);
     setSearchScope("workspace");
     setSummary(null);
@@ -514,6 +539,7 @@ function App() {
 
   function selectSearchScope(scope) {
     if (busy || scope !== "common") return;
+    navigationRevisionRef.current += 1;
     const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
     setActiveWorkspaceId(generalWorkspaceId);
     setSearchScope("common");
@@ -531,6 +557,7 @@ function App() {
     if (busy) return;
     const workspace = workspaces.find((item) => item.id === workspaceId && item.can_read);
     if (!workspace) return;
+    navigationRevisionRef.current += 1;
     setActiveWorkspaceId(workspace.id);
     setSearchScope("workspace");
     setActiveView("chat");
@@ -544,6 +571,7 @@ function App() {
   }
 
   function returnToCommonChat() {
+    navigationRevisionRef.current += 1;
     const generalWorkspaceId = workspaces.find((item) => item.workspace_type === "general")?.id || DEFAULT_WORKSPACE_ID;
     summaryRequestRef.current += 1;
     setActiveWorkspaceId(generalWorkspaceId);
@@ -583,6 +611,7 @@ function App() {
   }
 
   function openDocuments() {
+    navigationRevisionRef.current += 1;
     setActiveView("documents");
     setMobileNav(false);
     refreshStatus();
@@ -592,6 +621,7 @@ function App() {
     if (busy) return;
     const manageable = workspaces.find((item) => item.can_manage);
     if (!manageable) return;
+    navigationRevisionRef.current += 1;
     setActiveWorkspaceId(manageable.id);
     setSearchScope("workspace");
     setActiveView("admin");
@@ -599,6 +629,7 @@ function App() {
   }
 
   function openSettings() {
+    navigationRevisionRef.current += 1;
     setShowSettings(true);
     setMobileNav(false);
     refreshStatus();
@@ -629,67 +660,127 @@ function App() {
       setStatus({ kind: "error", text: "这段对话的资料权限已变更，请新建对话后继续提问。" });
       return;
     }
+
+    const scopeType = searchScope;
+    const workspaceId = activeWorkspaceId;
+    const navigationRevision = navigationRevisionRef.current;
     let conversationId = activeId;
-    const answerId = makeId();
+    const creatingConversation = !conversationId;
+    if (creatingConversation && conversationCreationRef.current) return;
+    if (creatingConversation) {
+      conversationCreationRef.current = true;
+      setBusy(true);
+    }
     setQuestion("");
-    setBusy(true);
-    setAnswering(true);
-    setStatus({ kind: "working", text: "正在识别问题类型…" });
-    const answerController = new AbortController();
-    activeAnswerControllerRef.current = answerController;
-    let cancelQueuedAnswerUpdate = () => {};
     try {
       if (!conversationId) {
         const created = await apiFetch(joinApi(apiBase, "/api/conversations"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            scope_type: searchScope,
-            workspace_id: searchScope === "workspace" ? activeWorkspaceId : null,
+            scope_type: scopeType,
+            workspace_id: scopeType === "workspace" ? workspaceId : null,
           }),
         }, csrfToken).then(parseResponse);
         const conversation = mapConversation(created.conversation);
         conversationId = conversation.id;
-        setActiveId(conversationId);
         setConversations((items) => [conversation, ...items.filter((item) => item.id !== conversationId)]);
-      } else {
-        window.requestAnimationFrame(() => {
-          scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
-        });
+        if (navigationRevisionRef.current === navigationRevision) setActiveId(conversationId);
       }
+
+      const answerId = makeId();
+      const queuedJobs = answerQueuesRef.current.get(conversationId) || [];
+      const queued = activeAnswerJobsRef.current.has(conversationId) || queuedJobs.length > 0;
+      const job = {
+        answerId,
+        conversationId,
+        question: text,
+        scopeType,
+        workspaceId,
+        csrfToken,
+        rerankRules: {
+          boost_terms: parseRerankTerms(rerankRules.boostTerms),
+          exclude_terms: parseRerankTerms(rerankRules.excludeTerms),
+        },
+        hallucinationThreshold: hallucinationThreshold / 100,
+      };
       updateMessages(conversationId, (items) => [
         ...items,
         { id: makeId(), role: "user", text },
-        { id: answerId, role: "assistant", text: "", sources: [], notices: [], pending: true, status: "主 Agent 正在思考…" },
+        {
+          id: answerId,
+          role: "assistant",
+          text: "",
+          sources: [],
+          notices: [],
+          pending: true,
+          queued,
+          status: queued ? "已加入队列，当前回答结束后继续…" : "主 Agent 正在思考…",
+        },
       ]);
+      queuedJobs.push(job);
+      answerQueuesRef.current.set(conversationId, queuedJobs);
+      if (!activeAnswerJobsRef.current.has(conversationId)) void processAnswerQueue(conversationId);
+      if (navigationRevisionRef.current === navigationRevision) setStatus({ kind: "idle", text: "" });
+      window.requestAnimationFrame(() => {
+        if (activeId === conversationId || !activeId) scrollArea.current?.scrollTo({ top: "bottom", behavior: "smooth" });
+      });
+    } catch (error) {
+      if (navigationRevisionRef.current === navigationRevision) {
+        setQuestion(text);
+        setStatus({ kind: "error", text: error.message || "无法创建对话" });
+      }
+    } finally {
+      if (creatingConversation) {
+        conversationCreationRef.current = false;
+        setBusy(false);
+      }
+    }
+  }
+
+  async function processAnswerQueue(conversationId) {
+    if (activeAnswerJobsRef.current.has(conversationId)) return;
+    const queue = answerQueuesRef.current.get(conversationId) || [];
+    const job = queue.shift();
+    if (!job) {
+      answerQueuesRef.current.delete(conversationId);
+      return;
+    }
+    if (queue.length) answerQueuesRef.current.set(conversationId, queue);
+    else answerQueuesRef.current.delete(conversationId);
+
+    const answerController = new AbortController();
+    const activeJob = { ...job, controller: answerController };
+    activeAnswerJobsRef.current.set(conversationId, activeJob);
+    const apply = (patch) => updateMessages(conversationId, (items) => items.map((message) =>
+      message.id === job.answerId ? { ...message, ...patch } : message,
+    ));
+    apply({ queued: false, status: "主 Agent 正在思考…" });
+
+    let answer = "";
+    let metadata = {};
+    let cancelQueuedAnswerUpdate = () => {};
+    try {
       const response = await apiFetch(joinApi(apiBase, "/answer/stream"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
         signal: answerController.signal,
         body: JSON.stringify({
-          question: text,
+          question: job.question,
           session_id: conversationId,
           conversation_id: conversationId,
-          workspace_id: activeWorkspaceId,
-          scope: searchScope,
-          rerank_rules: {
-            boost_terms: parseRerankTerms(rerankRules.boostTerms),
-            exclude_terms: parseRerankTerms(rerankRules.excludeTerms),
-          },
-          hallucination_threshold: hallucinationThreshold / 100,
+          workspace_id: job.workspaceId,
+          scope: job.scopeType,
+          rerank_rules: job.rerankRules,
+          hallucination_threshold: job.hallucinationThreshold,
         }),
-      }, csrfToken);
+      }, job.csrfToken);
       if (!response.ok || !response.body) await parseResponse(response);
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let answer = "";
-      let metadata = {};
       let failure = "";
       let answerRenderTimer = null;
-      const apply = (patch) => updateMessages(conversationId, (items) => items.map((message) =>
-        message.id === answerId ? { ...message, ...patch } : message,
-      ));
       const flushAnswer = () => {
         answerRenderTimer = null;
         apply({ text: answer, ...metadata, pending: true });
@@ -701,6 +792,7 @@ function App() {
         if (answerRenderTimer !== null) window.clearTimeout(answerRenderTimer);
         answerRenderTimer = null;
       };
+
       while (true) {
         const { value, done } = await reader.read();
         buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
@@ -712,11 +804,7 @@ function App() {
           if (!event || dataLine === undefined) continue;
           const payload = JSON.parse(dataLine || "{}");
           if (event === "metadata") metadata = payload;
-          if (event === "status") {
-            const message = payload.message || "正在处理，请稍候…";
-            apply({ status: message });
-            setStatus({ kind: "working", text: message });
-          }
+          if (event === "status") apply({ status: payload.message || "正在处理，请稍候…" });
           if (event === "token") {
             answer += payload.text || "";
             scheduleAnswerRender();
@@ -738,27 +826,51 @@ function App() {
       if (failure) throw new Error(failure);
       cancelQueuedAnswerUpdate();
       if (!answer.trim()) throw new Error("回答连接中断，请重新发送。");
-      apply({ text: answer, ...metadata, pending: false, status: "" });
-      setStatus({ kind: "idle", text: "" });
+      apply({ text: answer, ...metadata, pending: false, queued: false, status: "" });
     } catch (error) {
       cancelQueuedAnswerUpdate();
-      if (error?.name !== "AbortError" && conversationId) {
+      if (error?.name === "AbortError") {
+        apply({ text: answer, pending: false, queued: false, stopped: true, status: "" });
+      } else {
         const errorText = error.message === "回答连接中断，请重新发送。"
           ? error.message
           : `暂时无法完成回答：${error.message}`;
-        updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
-          ? { ...message, text: errorText, error: true, pending: false }
-          : message,
-        ));
-        setStatus({ kind: "idle", text: "" });
-      } else if (error?.name !== "AbortError") {
-        setStatus({ kind: "error", text: error.message || "无法创建对话" });
+        apply({ text: errorText, error: true, pending: false, queued: false, status: "" });
       }
     } finally {
-      if (activeAnswerControllerRef.current === answerController) activeAnswerControllerRef.current = null;
-      setAnswering(false);
-      setBusy(false);
+      if (activeAnswerJobsRef.current.get(conversationId) === activeJob) {
+        activeAnswerJobsRef.current.delete(conversationId);
+      }
+      if (answerQueuesRef.current.get(conversationId)?.length) void processAnswerQueue(conversationId);
+      else answerQueuesRef.current.delete(conversationId);
     }
+  }
+
+  function stopAnswer(answerId) {
+    for (const job of activeAnswerJobsRef.current.values()) {
+      if (job.answerId === answerId) {
+        job.controller.abort();
+        return;
+      }
+    }
+    for (const [conversationId, queue] of answerQueuesRef.current) {
+      const index = queue.findIndex((job) => job.answerId === answerId);
+      if (index < 0) continue;
+      queue.splice(index, 1);
+      if (queue.length) answerQueuesRef.current.set(conversationId, queue);
+      else answerQueuesRef.current.delete(conversationId);
+      updateMessages(conversationId, (items) => items.map((message) => message.id === answerId
+        ? { ...message, text: "已从队列移除。", pending: false, queued: false, status: "" }
+        : message,
+      ));
+      return;
+    }
+  }
+
+  function stopCurrentAnswer() {
+    if (!activeId) return;
+    const activeJob = activeAnswerJobsRef.current.get(activeId);
+    if (activeJob) stopAnswer(activeJob.answerId);
   }
 
   async function uploadFiles(fileList) {
@@ -850,7 +962,7 @@ function App() {
         onOpenSettings={openSettings}
         onOpenDocuments={openDocuments}
         onOpenAdmin={openAdmin}
-        onOpenAccount={() => { setAccountError(""); setShowAccount(true); setMobileNav(false); }}
+        onOpenAccount={() => { navigationRevisionRef.current += 1; setAccountError(""); setShowAccount(true); setMobileNav(false); }}
         canManageWorkspace={canManageWorkspace}
       />
 
@@ -900,10 +1012,9 @@ function App() {
               <Bubble.List
                 ref={scrollArea}
                 className="message-list"
-                items={visibleMessages.map(makeBubbleItem)}
+                items={visibleMessages.map((message) => makeBubbleItem(message, stopAnswer))}
                 autoScroll={false}
               />
-              {answering && !visibleMessages.some((message) => message.pending) && <div className="thinking"><span /><span /><span />正在思考</div>}
             </>
           )}
         </section>
@@ -916,6 +1027,7 @@ function App() {
               <UploadProgress progress={uploadProgress} />
             </div>
           )}
+          {activeConversationAnswering && <div className="answer-queue-hint" role="status">回答生成中；现在发送的问题会追加到当前对话。</div>}
           {status.text && status.kind !== "working" && !uploadProgress && <div className={`inline-status ${status.kind}`}><span>{status.kind === "error" ? "!" : "✓"}</span>{status.text}</div>}
           <Sender
             ref={textInput}
@@ -933,11 +1045,14 @@ function App() {
               void submitQuestion(null, event.currentTarget.value);
               return false;
             }}
-            placeholder="向你的知识库提问…"
+            placeholder={activeConversationAnswering ? "追加问题；当前回答结束后继续…" : "向你的知识库提问…"}
             submitType="enter"
             autoSize={{ minRows: 1, maxRows: 6 }}
             disabled={busy}
-            suffix={<Button className="send-button" type="primary" shape="circle" aria-label={answering ? "正在生成回答" : "发送问题"} disabled={!question.trim() || busy} icon={answering ? <Suspense fallback={<SendOutlined />}><DeferredSpin size="small" /></Suspense> : <SendOutlined />} onClick={() => void submitQuestion(null, question)} />}
+            suffix={<div className="sender-action-group">
+              {activeConversationAnswering && <Button className="stop-answer-button" type="text" aria-label="停止当前回答" title="停止当前回答" icon={<Square size={14} strokeWidth={2} aria-hidden="true" />} onClick={stopCurrentAnswer}>停止</Button>}
+              <Button className="send-button" type="primary" shape="circle" aria-label={activeConversationAnswering ? "追加问题" : "发送问题"} title={activeConversationAnswering ? "追加到当前对话" : "发送问题"} disabled={!question.trim() || busy} icon={<SendOutlined />} onClick={() => void submitQuestion(null, question)} />
+            </div>}
           />
         </div>}
       </main>
@@ -1086,6 +1201,7 @@ function MessageContent({ message }) {
       {!isUser && message.text
         ? <Suspense fallback={<span className="markdown-loading">正在渲染回答…</span>}><MarkdownRenderer>{message.text}</MarkdownRenderer></Suspense>
         : isUser ? message.text : null}
+      {!isUser && message.stopped && <div className="answer-stopped-note">已停止生成</div>}
       {message.pending && message.text && <span className="cursor-blink" />}
       {!isUser && message.hallucination_check?.passed && (message.hallucination_check.issues || []).some((issue) => issue.startsWith("当前阈值已放宽来源校验")) && (
         <div className="answer-review-note" role="note">当前校验设置较宽松，建议核对参考资料。</div>
@@ -1100,7 +1216,7 @@ function MessageContent({ message }) {
   );
 }
 
-function makeBubbleItem(message) {
+function makeBubbleItem(message, onStop) {
   const isUser = message.role === "user";
   return {
     key: message.id,
@@ -1114,6 +1230,13 @@ function makeBubbleItem(message) {
     content: <>
       {message.pending && <div className="message-author"><span className="pending-label"><i />{message.status || "正在处理，请稍候…"}</span></div>}
       <MessageContent message={message} />
+      {message.pending && message.queued && <Button
+        className="answer-stop-button"
+        type="text"
+        size="small"
+        aria-label="从队列移除问题"
+        onClick={() => onStop?.(message.id)}
+      >移出队列</Button>}
     </>,
     loading: Boolean(message.pending && !message.text),
     streaming: Boolean(message.pending),

@@ -108,7 +108,7 @@ npm ci
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. For a backend on another host or port, set `VITE_API_BASE_URL` in the frontend environment and allow the frontend origin in the backend's `RAG_CORS_ORIGINS` setting.
+Open `http://127.0.0.1:5173`. For a backend on another host or port, set `VITE_API_BASE_URL` in the frontend environment and allow the frontend origin in the backend's `RAG_CORS_ORIGINS` setting. While an answer is generating, you can browse documents, switch conversations, or start a new chat without cancelling it. Follow-up questions in the same conversation are queued in order, and you can stop the current answer from the composer.
 
 ## Configuration and data
 

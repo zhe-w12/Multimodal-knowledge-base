@@ -83,17 +83,23 @@ export default function Sidebar({ conversations, activeId, busy, collapsed, onTo
     setRenaming(null);
   }, [activeWorkspaceId]);
 
-  const items = useMemo(() => matchedConversations.map((conversation) => ({
-    key: conversation.id,
-    title: conversation.status === "locked" ? `${conversation.title || "新对话"}（资料权限已变更）` : conversation.title || "新对话",
-    label: <Button
-      type="text"
-      className={styles.conversationTitle}
-      title={conversation.title || "新对话"}
-      aria-current={activeId === conversation.id ? "page" : undefined}
-      onClick={(event) => { event.stopPropagation(); onSelectConversation(conversation.id); }}
-    >{conversation.title || "新对话"}{conversation.status === "locked" && <LockKeyhole className={styles.conversationLock} size={14} aria-label="资料权限已变更" />}</Button>,
-  })), [matchedConversations, activeId, onSelectConversation]);
+  const items = useMemo(() => matchedConversations.map((conversation) => {
+    const isAnswerPending = conversation.messages?.some((message) => message.role === "assistant" && message.pending);
+    return {
+      key: conversation.id,
+      title: conversation.status === "locked"
+        ? `${conversation.title || "新对话"}（资料权限已变更）`
+        : `${conversation.title || "新对话"}${isAnswerPending ? "（正在回答）" : ""}`,
+      isAnswerPending,
+      label: <Button
+        type="text"
+        className={styles.conversationTitle}
+        title={conversation.title || "新对话"}
+        aria-current={activeId === conversation.id ? "page" : undefined}
+        onClick={(event) => { event.stopPropagation(); onSelectConversation(conversation.id); }}
+      >{conversation.title || "新对话"}{isAnswerPending && <span className={styles.answeringIndicator} title="正在后台回答" aria-label="正在后台回答" />}{conversation.status === "locked" && <LockKeyhole className={styles.conversationLock} size={14} aria-label="资料权限已变更" />}</Button>,
+    };
+  }), [matchedConversations, activeId, onSelectConversation]);
 
   function beginRename(id) {
     const conversation = conversations.find((item) => item.id === id);
@@ -158,9 +164,9 @@ export default function Sidebar({ conversations, activeId, busy, collapsed, onTo
           menu={(conversation) => ({
             trigger: <Button className={styles.menuTrigger} type="text" size="small" aria-label={`管理对话：${conversation.title}`} icon={<MoreHorizontal size={17} strokeWidth={1.8} aria-hidden />} />,
             items: [
-              { key: "rename", label: "重命名", icon: <Pencil size={15} />, disabled: busy, onClick: () => beginRename(conversation.key) },
+              { key: "rename", label: "重命名", icon: <Pencil size={15} />, disabled: busy || conversation.isAnswerPending, onClick: () => beginRename(conversation.key) },
               { type: "divider" },
-              { key: "delete", label: "删除对话", icon: <Trash2 size={15} />, danger: true, disabled: busy, onClick: () => onDeleteConversation(conversation.key) },
+              { key: "delete", label: "删除对话", icon: <Trash2 size={15} />, danger: true, disabled: busy || conversation.isAnswerPending, onClick: () => onDeleteConversation(conversation.key) },
             ],
           })}
         /> : <div className={`${styles.emptyHistory} ${query.trim() ? styles.emptyHistorySearch : ""}`}>
