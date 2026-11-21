@@ -20,6 +20,18 @@ PDF / Word / PPT / Image
 
 DeepSeek 主模型通过 `https://api.deepseek.com/chat/completions` 的原生工具调用驱动主 Agent。主 Agent 可按需调用当前授权知识库的检索、原文读取和用户补充工具；没有固定业务调用轮数，服务以 `RAG_AGENT_REQUEST_TIMEOUT_SECONDS`（默认 180 秒）控制单次请求时限。`RAG_AGENT_LOOP_ENABLED=false` 可回退到旧问答链路。密钥单独放在 `DEEPSEEK_API_KEY`；Qwen3-VL Embedding、Rerank 和图片描述通过百炼北京业务空间调用，使用 `BAILIAN_API_KEY` 与 `BAILIAN_WORKSPACE_ID`。所有密钥只从本地 `.env` 读取；仓库不包含真实密钥。图片素材保存在 `tmp/assets`，知识片段保存在 `RAG_KB_RUNTIME_PATH`。新模型使用独立的 Milvus 集合 `education_multimodal_qwen3_vl`，避免和旧向量空间混用。
 
+## 主 Agent 工具
+
+当前提供给模型自主选择的工具只有以下三项：
+
+| 工具 | 用途与限制 |
+| --- | --- |
+| `search_knowledge(query)` | 在当前已授权知识库中检索；每条命中返回资料 ID、来源、页码、块号、相关度和最多 2400 字符的片段。 |
+| `read_source(evidence_id)` | 读取本次请求检索结果中的资料原文或父段落，最多返回 8000 字符；不能传任意文件路径或读取未检索过的资料。 |
+| `collect_user_info(question)` | 只在缺少必须由用户提供的信息时提出一个问题；凭据和高度敏感信息会被拦截。该工具会结束当前请求并返回等待状态。 |
+
+用户补充信息会在后续请求中作为最近至多 8000 字符的对话上下文处理；目前不会持久化并恢复原 Agent 运行状态或本轮检索证据。分类、独立异常处理和证据评估都不是已注册工具。工具错误会以结构化结果交回主 Agent；答案安全、来源和数值检查由程序内部发布校验完成，也不是模型可调用的工具。
+
 ## 目录结构
 
 ```text
@@ -167,7 +179,7 @@ docker compose ps
 - `RAG_BM25_WEIGHT`、`RAG_SPARSE_WEIGHT`、`RAG_DENSE_WEIGHT` 作为 RRF 路由权重使用。
 - PDF 文本提取疑似乱码时优先转 OCR；OCR 不可用的异常页面会降置信度并标记 `needs_review`。
 - 低于 `RAG_MIN_ETL_CONFIDENCE` 的内容保留并标记 `needs_review`，不会静默混入高质量语料。
-- 回答以当前检索资料为依据；资料不足时由模型继续追问以补足问题信息，不使用固定的“没有足够依据”兜底答复，也不编造结论。对话正文按 SSE 增量流式显示。
+- 校园及知识库事实回答必须通过当前授权资料的来源与数值校验；主 Agent 自主决定是否检索、阅读原文或直接回复。只有确实缺少且无法从资料查明的必要用户信息时才追问，不因检索结果不完整而反复追问。事实正文通过校验后再按 SSE 分段发送；问候等普通交互可以直接回复。
 - 输出保留来源、页码、块号、模态、父块 ID 和相关性得分。
 - Token、API Key、Secret、密码及未授权数据请求会被拦截或脱敏。
 
