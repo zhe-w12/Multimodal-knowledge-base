@@ -243,6 +243,7 @@ def test_sse_answer_endpoint_streams_metadata_tokens_and_done():
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "event: metadata" in response.text
     assert "event: token" in response.text
+    assert response.text.count("event: token") >= 2
     assert "event: done" in response.text
 
 

@@ -64,6 +64,8 @@ FRONTEND_SOURCE_DIR = PROJECT_ROOT / "frontend"
 FRONTEND_DIST_DIR = FRONTEND_SOURCE_DIR / "dist"
 FRONTEND_DIR = FRONTEND_DIST_DIR
 MAX_PDF_UPLOAD_BYTES = 10 * 1024 * 1024
+SSE_TOKEN_BURST_DELAY_SECONDS = 0.025
+SSE_TOKEN_CHUNK_SIZE = 36
 DOCUMENT_FILES_DIR = PROJECT_ROOT / "tmp" / "document_files"
 AGENT_TOOL_PROVIDERS = {
     "deepseek", "bailian", "dashscope", "aliyun", "openai-compatible", "openai_compatible", "auto",
@@ -2163,6 +2165,12 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     if event_name == "token":
                         streamed = True
                     yield sse_event(event_name, event_payload)
+                    # The Agent currently releases its validated final answer in
+                    # queued text chunks. Pace bursts so ASGI/Nginx/browser don't
+                    # coalesce the whole queue into one visible update. Naturally
+                    # paced upstream model tokens are not delayed.
+                    if event_name == "token" and not event_queue.empty():
+                        await asyncio.sleep(SSE_TOKEN_BURST_DELAY_SECONDS)
                 response = await worker
                 change = await answer_scope_change(http_request)
                 if change:
@@ -2207,8 +2215,12 @@ def create_app(initial_chunks: Optional[Iterable[DocumentChunk]] = None, config:
                     return
             yield sse_event("metadata", metadata)
             if not streamed:
-                for token_chunk in text_stream_chunks(answer_text):
+                for index, token_chunk in enumerate(
+                    text_stream_chunks(answer_text, size=SSE_TOKEN_CHUNK_SIZE)
+                ):
                     yield sse_event("token", {"text": token_chunk})
+                    if (index + 1) * SSE_TOKEN_CHUNK_SIZE < len(answer_text):
+                        await asyncio.sleep(SSE_TOKEN_BURST_DELAY_SECONDS)
             yield sse_event("done", {"answer": answer_text, "cache_hit": response.cache_hit})
 
         return StreamingResponse(
