@@ -1,214 +1,146 @@
-# 多模态自适应 RAG
+# Multimodal Knowledge Base
 
-面向教材、讲义、课件、扫描 PDF 与图片资料的多模态知识库。聊天入口使用 DeepSeek V4 Flash；Qwen3-VL Embedding 负责文本和图片的统一向量检索，Qwen3-VL Rerank 对召回结果排序；FastAPI 提供入库和流式问答接口，React 提供对话式工作台。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 技术链路
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white) [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+> An education-focused multimodal knowledge base for course materials. It combines document and image ingestion, hybrid retrieval, and a tool-using RAG agent in a FastAPI service with a React interface.
+
+## Table of contents
+
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Configuration and data](#configuration-and-data)
+- [API overview](#api-overview)
+- [Development](#development)
+- [Security and privacy](#security-and-privacy)
+- [Limitations](#limitations)
+- [License](#license)
+
+## Features
+
+- Ingest PDF, Word, PowerPoint, text, Markdown, and image files.
+- Extract text with Unstructured and PaddleOCR; use Qwen3-VL for image and diagram descriptions.
+- Retrieve with BM25 and dense vectors, fuse and diversify candidates, then rerank them.
+- Generate source-grounded answers with a DeepSeek-powered agent that can search the active knowledge base, read retrieved evidence, or ask the user for required information.
+- Manage accounts, conversations, and workspaces through the web interface. Workspace access is checked by the backend.
+- Stream answers over Server-Sent Events (SSE) and show source references in the UI.
+
+## How it works
 
 ```text
-PDF / Word / PPT / Image
-  → Unstructured 结构化解析
-  → PaddleOCR 文本识别 + Qwen3-VL Plus 图表/图片描述
-  → 置信度校验 + 父子分层切片
-  → BM25 + Qwen3-VL 多模态稠密向量
-  → RRF 统一融合 + MMR 去重
-  → Qwen3-VL Rerank 精排
-  → 主 Agent 自主选择检索、原文阅读、用户补充或直接回复
-  → 工具结果与异常回到主 Agent，由模型决定下一步
-  → 来源、安全和数值发布校验
+Documents and images
+  → parsing, OCR, and visual analysis
+  → confidence checks and hierarchical chunking
+  → BM25 + multimodal dense retrieval
+  → reciprocal-rank fusion and MMR
+  → reranking
+  → agent-selected search, source reading, or clarification
+  → source and answer checks
   → FastAPI / SSE → React
 ```
 
-最终回答通过 SSE 分段发送；前端收到增量文本后会持续重新渲染 Markdown。回答在通过发布校验后开始输出。
+The agent currently has three tools:
 
-## 文档图文预处理
-
-- PDF 保留正文和表格文本；检测到扫描图片、图表或矢量图形的页面时，会额外渲染页面，并把页面正文、PaddleOCR 识别出的图中文字及 Qwen3-VL 对图形关系的描述合并到同一个可检索片段。Unstructured 提取出的独立图片块也会单独保留，避免空文本图片块被过滤。
-- DOCX 提取正文中的内嵌图片，并关联图片所在段落、相邻段落和替代文字；PPTX 提取图片、图表系列数据及幻灯片文字，将文字和版面位置一起提供给视觉分析。只有文字和连接线构成的流程图、图表，也会生成带位置关系的检索文本。
-- PNG、JPEG 等独立图片会把 OCR 文字、视觉描述和原图引用放进同一个片段，供文本检索和多模态向量共同使用。图片素材保存在知识库运行目录旁的 `assets/` 中。
-- 表格 HTML 会保留行列分隔，便于检索时区分单元格。视觉模型无法确认的内容会标记为待复核；图中文字过小、遮挡或图片质量较差时，仍应对照原图核实。
-- 当前额外的内嵌图片预处理针对 DOCX/PPTX；旧版 DOC/PPT 继续使用 Unstructured 的常规解析。若 Unstructured 无法启动，DOCX/PPTX 会退回本地解析器提取基础文字并标记待复核，图片仍继续走 OCR 和视觉分析。PDF 整页视觉分析会按页面逐页处理，导入大型 PDF 时可通过上传参数 `max_pages` 限制页数。
-
-DeepSeek 主模型通过 `https://api.deepseek.com/chat/completions` 的原生工具调用驱动主 Agent。主 Agent 可按需调用当前授权知识库的检索、原文读取和用户补充工具；没有固定业务调用轮数，服务以 `RAG_AGENT_REQUEST_TIMEOUT_SECONDS`（默认 180 秒）控制单次请求时限。`RAG_AGENT_LOOP_ENABLED=false` 可回退到旧问答链路。密钥单独放在 `DEEPSEEK_API_KEY`；Qwen3-VL Embedding、Rerank 和图片描述通过百炼北京业务空间调用，使用 `BAILIAN_API_KEY` 与 `BAILIAN_WORKSPACE_ID`。所有密钥只从本地 `.env` 读取；仓库不包含真实密钥。图片素材保存在 `tmp/assets`，知识片段保存在 `RAG_KB_RUNTIME_PATH`。新模型使用独立的 Milvus 集合 `education_multimodal_qwen3_vl`，避免和旧向量空间混用。
-
-## 主 Agent 工具
-
-当前提供给模型自主选择的工具只有以下三项：
-
-| 工具 | 用途与限制 |
+| Tool | Scope |
 | --- | --- |
-| `search_knowledge(query)` | 在当前已授权知识库中检索；每条命中返回资料 ID、来源、页码、块号、相关度和最多 2400 字符的片段。 |
-| `read_source(evidence_id)` | 读取本次请求检索结果中的资料原文或父段落，最多返回 8000 字符；不能传任意文件路径或读取未检索过的资料。 |
-| `collect_user_info(question)` | 只在缺少必须由用户提供的信息时提出一个问题；凭据和高度敏感信息会被拦截。该工具会结束当前请求并返回等待状态。 |
+| `search_knowledge(query)` | Searches the current authorized workspace and returns ranked evidence snippets. |
+| `read_source(evidence_id)` | Reads source text from evidence retrieved during the current request; it cannot open arbitrary file paths. |
+| `collect_user_info(question)` | Asks one question when the answer depends on information only the user can provide. |
 
-用户补充信息会在后续请求中作为最近至多 8000 字符的对话上下文处理；目前不会持久化并恢复原 Agent 运行状态或本轮检索证据。分类、独立异常处理和证据评估都不是已注册工具。工具错误会以结构化结果交回主 Agent；答案安全、来源和数值检查由程序内部发布校验完成，也不是模型可调用的工具。
+## Requirements
 
-## 目录结构
+- Python 3.11
+- Node.js and npm
+- A reachable Milvus instance for the default vector-store configuration ([deployment options](https://milvus.io/docs/install-overview.md))
+- API credentials for the configured language and multimodal model providers
 
-```text
-manufacturing_rag/
-  adapters/
-    embedding.py         # 百炼 Qwen3-VL 多模态向量
-    retriever.py         # BM25、多路融合、MMR、Milvus 候选融合
-    rerank.py            # 百炼 Qwen3-VL 精排
-    query_optimizer.py   # 旧链路的 BERT/LangChain 查询优化
-  agent_runtime.py      # 主 Agent 工具循环、观察结果与发布校验
-  agent_tools.py        # 授权知识检索、原文读取和用户补充工具
-    ocr.py               # PaddleOCR 与百度 OCR 兼容适配
-    vision.py            # Qwen3-VL Plus 图表/图片语义补全
-    vector_store.py      # 本地 Docker Milvus 向量存储
-  chunking.py            # 父子分层切片与低置信度校验
-  etl.py                 # Unstructured 多格式 ETL 编排
-  infrastructure.py      # Redis / MySQL
-  pipeline.py            # 端到端 RAG 链路
-  api.py                 # FastAPI、SSE 与入库接口
-frontend/                # React + Vite 工作台
-tests/                   # 单元与接口测试
-Dockerfile
-docker-compose.yml
-```
+The OCR and document-parsing dependencies are large and may take time to install. Model API usage may incur provider charges.
 
-## 本地开发
+## Quick start
 
-建议使用 Python 3.11。OCR 与文档解析依赖会占用较多安装空间。
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python scripts/install_nltk_data.py
-Copy-Item .env.example .env
-```
-
-安装 NLTK 的 `punkt_tab` 和英文词性标注数据，供 Unstructured 解析 Word、PowerPoint 等 Office 文档使用，避免首次解析时尝试从受限的运行时地址下载。
-
-生产环境必须将数据安装到 API 进程的 NLTK 搜索目录。当前面板进程使用 `/home/www/nltk_data`；若通过 root 执行安装，需显式指定：
+### 1. Configure the backend
 
 ```bash
-NLTK_DATA=/home/www/nltk_data /www/server/pyporject_evn/versions/3.11.18/bin/python3.11 scripts/install_nltk_data.py
+git clone https://github.com/zhe-w12/Multimodal-knowledge-base.git
+cd Multimodal-knowledge-base
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python scripts/install_nltk_data.py
+cp .env.example .env
 ```
 
-### Office 文档导入排查
+On Windows PowerShell, use `py -3.11 -m venv .venv`, activate with `.\.venv\Scripts\Activate.ps1`, and create the local configuration with `Copy-Item .env.example .env`. Then run the same `python -m pip install -r requirements.txt` and `python scripts/install_nltk_data.py` commands.
 
-- `POST /kb/document` 返回 HTTP 400 只表示接口拒绝或处理失败；需查看响应正文中的错误详情，并按请求 ID 检查 API 日志，单看状态码无法判断失败阶段。
-- 若错误详情含 `HTTP Error 403: Forbidden`，且堆栈位于 Unstructured/NLTK 分词初始化，原因可能是运行时缺少 `punkt_tab` 或英文词性标注数据，Unstructured 随后尝试从外部地址下载资源但被拒绝。这不是工作区权限 403。
-- 用 API 服务实际使用的 Python、运行账号和环境变量执行上面的安装命令。安装后可在同一运行环境确认 `nltk.data.path` 包含目标目录，并能找到 `tokenizers/punkt_tab` 与 `taggers/averaged_perceptron_tagger_eng`。仅安装到 root 的家目录不一定对以其他用户运行的 API 生效。
-- 上传进度达到 100% 仅代表文件已传完，不代表解析、切片和向量入库完成；应以任务状态和资料列表为准。若仍返回 400，保存响应正文及对应 API 堆栈继续定位，不能据此断定 NLTK 问题仍未解决。
+Edit `.env` and set `DEEPSEEK_API_KEY`, `BAILIAN_API_KEY`, and `BAILIAN_WORKSPACE_ID`. Start Milvus and set `MILVUS_ENDPOINT` (and `MILVUS_TOKEN` if required by your deployment). The backend loads `.env` from the repository root. Redis and MySQL integrations are optional and disabled by default; account data uses a local SQLite database unless `AUTH_DATABASE_URL` is configured.
 
-在 `.env` 中分别设置新的 `DEEPSEEK_API_KEY`、`BAILIAN_API_KEY` 和 `BAILIAN_WORKSPACE_ID`。若已有旧 `.env`，将 `.env.example` 中模型配置段合并到本地文件；不要把密钥写入或提交到代码仓库。离线开发可临时使用：
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | Yes | Primary chat model. |
+| `BAILIAN_API_KEY` | Yes for default model providers | Embedding, reranking, and vision services. |
+| `BAILIAN_WORKSPACE_ID` | Unless `BAILIAN_API_HOST` is set | Builds the default Bailian service endpoints. |
+| `MILVUS_ENDPOINT` | Yes for default vector storage | Address of the Milvus service. |
+| `MILVUS_TOKEN` | Deployment-dependent | Authentication token for Milvus, if enabled. |
+| `RAG_CORS_ORIGINS` | Recommended | Comma-separated frontend origins allowed to call the API. |
+| `RAG_KB_RUNTIME_PATH` | No | Local path for persisted knowledge-base data. |
+| `AUTH_DATABASE_URL` | No | Account database URL; defaults to local SQLite. |
 
-向量库使用本机 Docker Milvus。仅启动向量数据库及其 etcd、MinIO 依赖（无需读取 `.env`）：
+Never commit `.env`, API keys, passwords, uploaded materials, or local databases. Keep provider credentials on the backend; do not put them in frontend `VITE_*` variables.
 
-```powershell
-docker compose -f docker-compose.vector.yml up -d
-docker compose -f docker-compose.vector.yml ps
+### 2. Start the API
+
+```bash
+python -m uvicorn manufacturing_rag.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Milvus 地址为 `127.0.0.1:19530`，健康端点为 `http://127.0.0.1:9091/healthz`。宿主机运行 API 时使用 `MILVUS_ENDPOINT=http://127.0.0.1:19530`；主 `docker-compose.yml` 内使用 `http://milvus:19530`。OCR 在后端运行：Docker 部署由 API 容器中的 PaddleOCR 处理，宿主机开发则由本地 Python 后端处理。模型切换后如需重建当前知识库的索引，可在侧栏点击“重建资料索引”；该操作会重写新模型集合中的向量。
+The API is available at `http://127.0.0.1:8000`. FastAPI's interactive API reference is at `http://127.0.0.1:8000/docs`, and the health endpoint is `http://127.0.0.1:8000/health`.
 
-```powershell
-$env:RAG_EMBEDDING_PROVIDER='hash'
-$env:RAG_RERANK_PROVIDER='rule'
-$env:RAG_LLM_PROVIDER='rule'
-$env:RAG_QUERY_CLASSIFIER_PROVIDER='rule'
-$env:RAG_QUERY_AGENT_PROVIDER='rule'
-$env:RAG_AGENT_LOOP_ENABLED='false'
-$env:RAG_VECTOR_STORE_PROVIDER='memory'
-$env:RAG_REDIS_ENABLED='false'
-$env:RAG_MYSQL_ENABLED='false'
-py -m uvicorn manufacturing_rag.api:app --host 127.0.0.1 --port 8000 --reload
-```
+### 3. Start the frontend
 
-前端开发：
+In a second terminal:
 
-```powershell
-Set-Location frontend
-npm install
+```bash
+cd frontend
+npm ci
 npm run dev
 ```
 
-访问 `http://127.0.0.1:5173/`。前端通过 `POST /answer/stream` 消费 SSE 增量输出。
+Open `http://127.0.0.1:5173`. For a backend on another host or port, set `VITE_API_BASE_URL` in the frontend environment and allow the frontend origin in the backend's `RAG_CORS_ORIGINS` setting.
 
-BERT 意图分类模型可用自建数据微调后写入默认目录：
+## Configuration and data
 
-```powershell
-python scripts/train_intent_bert.py --dataset examples/intent_training.jsonl --output models/query-intent-bert
-```
+`.env.example` lists the main connection settings. Model names, retrieval parameters, and optional services can be adjusted with environment variables; see [`manufacturing_rag/config.py`](manufacturing_rag/config.py) for the supported settings and defaults.
 
-## Docker Compose 部署
+By default, uploaded knowledge-base data is stored under `tmp/`, and account data and the generated authentication secret are stored under `data/auth/`. These are local runtime data, are excluded from Git, and should be backed up and protected separately. Documents sent for embedding, reranking, visual analysis, or answer generation may be processed by the configured external providers; review their terms and data policies before uploading sensitive material.
 
-复制环境配置后启动 API、React 静态资源、本地 Docker Milvus、Redis、MySQL、etcd 与 MinIO：
+## API overview
 
-```powershell
-Copy-Item .env.example .env
-docker compose up -d --build
-docker compose ps
-```
+The main routes include `GET /health`, `POST /answer`, `POST /answer/stream`, and `POST /kb/document`. The complete, current schema is available from the running service at `/docs`.
 
-服务地址为 `http://127.0.0.1:8000/frontend/`，健康检查为 `http://127.0.0.1:8000/health`。首次启动会下载本地模型；生产环境建议预先把微调后的 BERT 分类模型放在 `models/query-intent-bert`。
+## Development
 
-## 主要接口
+Run the backend test suite and build the frontend with:
 
-| 接口 | 用途 |
-| --- | --- |
-| `GET /health` | 服务、模型、Redis、MySQL 和知识库状态 |
-| `POST /answer` | 标准 JSON 问答 |
-| `POST /answer/stream` | SSE 流式问答 |
-| `POST /kb/document` | PDF、Word、PPT、文本、图片统一多模态 ETL |
-| `POST /kb/pdf` | 兼容原 PDF 入库接口 |
-| `POST /kb/image-ocr` | 图片 OCR；允许手动文本兜底 |
-| `POST /kb/jsonl` | 结构化 JSONL 入库 |
-| `GET /kb/chunks` | 查看子块、父块关联与置信度 |
-| `POST /vector/ingest` | 按指定模式同步至 Milvus；默认追加 |
-| `POST /vector/search` | 调试 Milvus 候选召回 |
-
-统一文档入库请求示例：
-
-```json
-{
-  "filename": "高等数学课件.pptx",
-  "content_base64": "...",
-  "mode": "append"
-}
-```
-
-`append` 会保留其他文档；再次上传同名文档时只更新该文档。需要重建整库时显式传入 `"mode": "replace"`。
-
-上传后的活动知识库会保存到 `RAG_KB_RUNTIME_PATH`，服务重启后自动恢复；清空向量集合不会删除这份本地知识库。
-
-问答请求可以携带会话 ID：
-
-```json
-{"question":"极限的定义是什么？","session_id":"course-2026-user-001"}
-```
-
-## 数据约束
-
-- 子块负责高精度召回，精排后恢复父块上下文，避免切片导致语义断裂。
-- 原问题始终保留在 Multi-Query 召回列表中，改写/同义扩展结果通过 RRF 融合，避免改写丢失限定条件。
-- BM25、稀疏向量和稠密向量只按排名做 RRF，不直接比较不同通道的原始分数。
-- `RAG_BM25_WEIGHT`、`RAG_SPARSE_WEIGHT`、`RAG_DENSE_WEIGHT` 作为 RRF 路由权重使用。
-- PDF 文本提取疑似乱码时优先转 OCR；OCR 不可用的异常页面会降置信度并标记 `needs_review`。
-- 低于 `RAG_MIN_ETL_CONFIDENCE` 的内容保留并标记 `needs_review`，不会静默混入高质量语料。
-- 校园及知识库事实回答必须通过当前授权资料的来源与数值校验；主 Agent 自主决定是否检索、阅读原文或直接回复。只有确实缺少且无法从资料查明的必要用户信息时才追问，不因检索结果不完整而反复追问。事实正文通过校验后再按 SSE 分段发送；问候等普通交互可以直接回复。
-- 输出保留来源、页码、块号、模态、父块 ID 和相关性得分。
-- Token、API Key、Secret、密码及未授权数据请求会被拦截或脱敏。
-
-## 验证
-
-```
-powershell
+```bash
 pytest -q
-python scripts/evaluate_materials.py
-Set-Location frontend
+cd frontend
+npm ci
 npm run build
-npm run dev
 ```
 
-`evaluate_materials.py` 默认读取 `素材/*.pdf`，在离线确定性模式下逐条检查答案关键事实、来源页码/分数、幻觉校验和 JSON 响应字段；设置 `RAG_MATERIAL_EVAL_USE_RUNTIME=true` 可切换到当前运行时配置。
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
-调试日志默认写入 `logs/rag_debug.jsonl`，记录 ETL、候选召回、重排和充足度判定，但不会记录明文凭据。
+## Security and privacy
 
+Use HTTPS and explicit allowed origins when deploying outside a local development environment. Protect uploaded files, account data, and generated secrets with appropriate access controls and backups. See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
+## Limitations
 
-# Multimodal-knowledge-base
+OCR and model-generated descriptions can be wrong, especially for low-resolution, obscured, or complex diagrams. Verify extracted facts against the original material. Answer quality depends on the uploaded sources, model providers, and retrieval configuration.
 
+## License
+
+This project is licensed under the [MIT License](LICENSE). Third-party packages, model services, model weights, and user-provided materials remain subject to their own licenses and terms.
